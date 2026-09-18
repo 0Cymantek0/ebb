@@ -212,6 +212,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdRecover(args[1:], streams, deps)
 	case "forget":
 		return cmdForget(args[1:], streams, deps)
+	case "gc":
+		return cmdGc(args[1:], streams, deps)
 	case "verify":
 		return cmdVerify(args[1:], streams, deps)
 	case "status":
@@ -285,6 +287,7 @@ commands:
                              recover a parked/captured workspace (files-only in v1)
   recover <operation-id>     reconcile an interrupted operation from durable evidence
   forget <snapshot-id>       deliberately end a snapshot's recovery obligation (explicit confirmation)
+  gc <vault>                 reclaim vault storage no snapshot references anymore (backend prune; never removes snapshots)
   verify <snapshot-id>       refresh retained-snapshot evidence (coverage; --content adds full readback)
   status [workspace]         show local recorded state (workspaces, snapshots, operations)
   doctor                     report supported capabilities and configuration problems
@@ -323,6 +326,11 @@ recover flags:
 forget flags:
   --yes                      accept the typed-id confirmation (shows the obligation being ended)
   --last-of-parked           acknowledge forgetting the ONLY snapshot of a parked workspace
+
+gc flags:
+  --dry-run                  run the eligibility gate and the backend's prune estimate without reclaiming anything
+                            (gc uses the backend's prune defaults, which reclaim ALL unreferenced data; retention
+                            is ebb forget's explicit job, never a prune-side policy)
 
 verify flags:
   --content                  full per-file readback of every preserved byte (expensive; one backend call per file)

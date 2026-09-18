@@ -118,7 +118,29 @@ func (s *session) withVaultPassfile(ctx context.Context, fn func(repoDir, passfi
 	if err != nil {
 		return err
 	}
-	err = vault.WithPassfile(v.ID, func(passfilePath string) error {
+	return s.withVaultPassfileOf(ctx, v, fn)
+}
+
+// resolveVault resolves a vault by registry id or name (the same
+// resolution `ebb forget`'s session machinery uses for the default; gc
+// takes an explicit <vault> argument). An unknown name is a usage-class
+// argument mistake (exit 2), mirroring status/open unknown-name wording.
+func (s *session) resolveVault(idOrName string) (*vault.Vault, error) {
+	v, err := s.registry().Get(idOrName)
+	if err != nil {
+		if errors.Is(err, vault.ErrNotFound) {
+			return nil, usageError(fmt.Errorf("no vault named %q is registered (%s); run `ebb doctor` to inspect the registry",
+				idOrName, gcVaultNamesHint(s.registry())))
+		}
+		return nil, blockedError(fmt.Errorf("resolve vault %q: %v", idOrName, err))
+	}
+	return v, nil
+}
+
+// withVaultPassfileOf is withVaultPassfile for one explicitly resolved
+// vault (gc targets a named vault, not necessarily the default).
+func (s *session) withVaultPassfileOf(ctx context.Context, v *vault.Vault, fn func(repoDir, passfile string) error) error {
+	err := vault.WithPassfile(v.ID, func(passfilePath string) error {
 		return fn(v.RepoDir, passfilePath)
 	})
 	if err != nil {

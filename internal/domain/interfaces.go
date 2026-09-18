@@ -135,6 +135,45 @@ type SnapshotStore interface {
 	Forget(ctx context.Context, repoDir, passfile string, snapIDs []string) error
 }
 
+// RepoPruner is an OPTIONAL repository maintenance capability a
+// SnapshotStore may implement (interface-segregated like TreeTarDumper —
+// D007 precedent: existing fakes stay valid SnapshotStores and `ebb gc`
+// reports unsupported instead of silently skipping). Implemented by
+// internal/storage/restic on top of `restic prune` (Foundation §11.6:
+// Ebb never maintains blob reference counts or deletes packfiles itself;
+// it asks the backend and verifies).
+type RepoPruner interface {
+	// Prune asks the backend to reclaim ONLY storage no longer referenced
+	// by any snapshot in the repository (restic prune with default
+	// reclaim-everything semantics — no retention flags; retention is
+	// Ebb's explicit forget, never a prune-side policy). Prune must NEVER
+	// remove snapshots: implementations list the snapshot ids before and
+	// after and fail typed (integrity class) when the sets differ, the
+	// gc-side equivalent of forget's List verification (D015).
+	//
+	// With opts.DryRun the call mutates nothing and reports the backend's
+	// own reclaim estimate.
+	Prune(ctx context.Context, repoDir, passfile string, opts PruneOptions) (PruneStats, error)
+}
+
+// PruneOptions tunes one prune call.
+type PruneOptions struct {
+	// DryRun reports what the backend WOULD reclaim without mutating the
+	// repository (restic prune --dry-run; probe-verified to change
+	// nothing).
+	DryRun bool
+}
+
+// PruneStats reports what the backend said about one prune.
+type PruneStats struct {
+	// ReclaimableBytes is the backend's OWN estimate of the bytes the
+	// prune reclaims (would reclaim in dry-run), parsed from its summary;
+	// 0 when the backend reported nothing parseable.
+	ReclaimableBytes int64
+	// DryRun echoes the option: the call mutated nothing.
+	DryRun bool
+}
+
 // TreeTarDumper is an OPTIONAL bulk-readback capability a SnapshotStore
 // may implement (interface-segregated like VerifiedDirProbe above — D007
 // precedent: existing fakes stay valid SnapshotStores and simply keep the
@@ -191,6 +230,11 @@ const (
 	StoreErrAuth    StoreErrorClass = "auth"   // exit 12: wrong password/key
 	StoreErrUsage   StoreErrorClass = "usage"  // bad invocation of the backend
 	StoreErrUnknown StoreErrorClass = "unknown"
+	// StoreErrIntegrity: a backend-side verification failed AFTER a
+	// mutation ran — the outcome could not be proven safe (e.g. the
+	// snapshot set changed across a prune). Maps to Ebb exit 4
+	// (capture/integrity verification failed).
+	StoreErrIntegrity StoreErrorClass = "integrity"
 )
 
 func (e *StoreError) Error() string { return string(e.Class) + ": " + e.Err.Error() }

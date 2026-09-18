@@ -29,9 +29,15 @@ const (
 	CodeOpenNoDestination     = "EBB_E_OPEN_NO_DESTINATION"
 	CodeEscalationUnconfirmed = "EBB_E_ESCALATION_UNCONFIRMED"
 	CodeForgetLastOfParked    = "EBB_E_LAST_OF_PARKED"
-	CodeForgetUnconfirmed     = "EBB_E_FORGET_UNCONFIRMED"
+	CodeForgetUnconfirmed     = "EBB_E_FORGET_UNCONFIRM"
 	CodeForgetUnsealed        = "EBB_E_FORGET_UNSEALED"
 	CodeForgetNotForgettable  = "EBB_E_NOT_FORGETTABLE"
+	// gc eligibility blockers (Foundation §11.6/§16.6: maintenance is
+	// serialized against captures/opens/forgets and runs only after
+	// retention is fully resolved — F38).
+	CodeGcActiveOperation = "EBB_E_GC_ACTIVE_OPERATION"
+	CodeGcPendingIntent   = "EBB_E_GC_PENDING_INTENT"
+	CodeGcUnsupported     = "EBB_E_GC_UNSUPPORTED"
 	// Reconstruction-approval blockers (open's rebuild phase). The
 	// outcome is exit 6 either way: preserved files were recovered, the
 	// reconstruction is blocked (Foundation §17.5).
@@ -160,6 +166,11 @@ func classifyExitCode(err error) int {
 		case domain.StoreErrSource:
 			// A source read failed mid-capture: the capture failed; no
 			// removal is authorized.
+			return ExitCaptureVerify
+		case domain.StoreErrIntegrity:
+			// A backend-side outcome could not be proven safe AFTER a
+			// mutation ran (gc: the snapshot set changed or could not be
+			// re-listed across a prune): integrity verification failed.
 			return ExitCaptureVerify
 		case domain.StoreErrRepo, domain.StoreErrAuth:
 			return ExitVault
