@@ -200,6 +200,10 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdTrim(args[1:], streams, deps)
 	case "open":
 		return cmdOpen(args[1:], streams, deps)
+	case "recover":
+		return cmdRecover(args[1:], streams, deps)
+	case "status":
+		return cmdStatus(args[1:], streams, deps)
 	case "doctor":
 		return cmdDoctor(args[1:], streams)
 	case "help", "-h", "--help":
