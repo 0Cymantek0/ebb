@@ -89,7 +89,7 @@ func (linuxProbe) ProbeFile(path string) (domain.FileFacts, error) {
 	allocated := int64(st.Blocks) * 512
 	facts.AllocatedSize = &allocated
 	facts.LinkCount = int64(st.Nlink)
-	facts.FileIdentity = fmt.Sprintf("%x:%x", uint64(st.Dev), uint64(st.Ino))
+	facts.FileIdentity = devInoIdentity(*st)
 	// Sparse heuristic: st_blocks never counts holes, so an allocation
 	// below the logical size means the file carries holes (sparse).
 	facts.Sparse = allocated >= 0 && uint64(allocated) < uint64(st.Size)
