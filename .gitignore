@@ -1,0 +1,12 @@
+# research/artifacts
+research/delivery/
+.foundation-delivery/
+.video_agent/
+out/
+graphify-out/cache/
+
+# Go
+*.exe
+*.test
+*.out
+/dist/
