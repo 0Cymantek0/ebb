@@ -22,6 +22,7 @@ const (
 	CodeRestoreMismatch   = "EBB_E_RESTORE_MISMATCH"
 	CodePublishBlocked    = "EBB_E_PUBLISH_BLOCKED"
 	CodeInvalidOptions    = "EBB_E_INVALID_OPTIONS"
+	CodeLinksBlocked      = "EBB_E_LINK_BLOCKED"
 )
 
 // ErrNotOpenable reports that the selected snapshot cannot be opened at
@@ -142,3 +143,32 @@ type ErrInvalidOptions struct {
 func (e *ErrInvalidOptions) Error() string { return "restore: invalid options: " + e.Detail }
 
 func (e *ErrInvalidOptions) Code() string { return CodeInvalidOptions }
+
+// ErrLinksBlocked reports that one or more retained links could not be
+// recreated natively after staging, so the staged tree would differ
+// from the retained inventory — the open fails BEFORE publish (the
+// oracle would reject the tree anyway), staging is removed and the
+// operation is left at RESTORING. PrivilegeBlocked names the entries
+// whose TRUE SYMLINK recreation the OS refused for lack of
+// SeCreateSymbolicLinkPrivilege (unprivileged Windows; junctions — the
+// common pnpm/node_modules shape — never land here, their creation is
+// unprivileged). Failures carries other per-link errors verbatim.
+type ErrLinksBlocked struct {
+	PrivilegeBlocked []string
+	Failures         []string
+}
+
+func (e *ErrLinksBlocked) Error() string {
+	n := len(e.PrivilegeBlocked) + len(e.Failures)
+	msg := fmt.Sprintf("restore: %d retained link(s) could not be recreated; the restored tree would differ from the sealed inventory, so nothing was published", n)
+	if len(e.PrivilegeBlocked) > 0 {
+		msg += fmt.Sprintf("; privilege-blocked symlink(s): %s — recreating true symlinks requires SeCreateSymbolicLinkPrivilege: run elevated or enable Windows Developer Mode, then retry the open",
+			strings.Join(e.PrivilegeBlocked, ", "))
+	}
+	if len(e.Failures) > 0 {
+		msg += "; link failure(s): " + strings.Join(e.Failures, "; ")
+	}
+	return msg
+}
+
+func (e *ErrLinksBlocked) Code() string { return CodeLinksBlocked }

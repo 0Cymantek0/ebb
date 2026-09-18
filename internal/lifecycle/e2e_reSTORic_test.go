@@ -14,13 +14,14 @@ package lifecycle
 // the dev machine via scoop). Set EBB_TEST_RESTIC_BIN to a bogus name to
 // exercise the skip path deterministically.
 //
-// Known real-stack platform gap pinned here (first surfaced by this
-// suite): restic cannot materialize a reparse point (junction/symlink)
-// during `restic restore` without SeCreateSymbolicLinkPrivilege — the
-// link WORKSPACE parks perfectly (stored as a link node, never followed)
-// but its open fails with the adapter's typed content failure on an
-// unprivileged machine. TestE2EResticJunctionWorkspace asserts BOTH
-// outcomes honestly instead of faking coverage.
+// Wave F link handling: restic cannot materialize a reparse point during
+// `restic restore` without SeCreateSymbolicLinkPrivilege, so the open path
+// stages the tree with link nodes EXCLUDED and recreates each link
+// natively from the retained inventory's LinkTarget — junctions
+// UNPRIVILEGED (the Wave E acceptance gap, closed), true symlinks
+// privilege-gated with a typed blocker. TestE2EResticJunctionWorkspace
+// pins both: the unprivileged junction round trip succeeds, and a
+// privilege-refusing creator fails the open before publish.
 
 import (
 	"context"
@@ -139,10 +140,22 @@ func (e *e2eEnv) coord(probe domain.PlatformProbe) *Coordinator {
 }
 
 // opener builds a restore Opener over a fresh catalog view of the same
-// catalog database and the same real restic store.
+// catalog database and the same real restic store. The platform link
+// creator is wired EXACTLY as the CLI integration must wire it
+// (restore cannot import platform; see restore/links.go) — this is the
+// production link-recreation path under test.
 func (e *e2eEnv) opener() *restore.Opener {
 	e.t.Helper()
-	o, err := restore.New(restore.Dependencies{Store: e.store, Cat: e.newCat(), Probe: platform.New()})
+	return e.openerWithCreator(platform.CreateLink)
+}
+
+// openerWithCreator builds an Opener with an explicit link creator
+// (fault injection for the privilege-refusal path).
+func (e *e2eEnv) openerWithCreator(create restore.LinkCreator) *restore.Opener {
+	e.t.Helper()
+	o, err := restore.New(restore.Dependencies{
+		Store: e.store, Cat: e.newCat(), Probe: platform.New(), CreateLink: create,
+	})
 	if err != nil {
 		e.t.Fatalf("new opener: %v", err)
 	}
@@ -655,12 +668,33 @@ func TestE2EResticParkOpenRoundTrip(t *testing.T) {
 
 // ---- scenario 1b: link (junction) workspace ------------------------------
 
+// e2ePrivilegeRefusal is a link creator that simulates the unprivileged
+// Windows symlink refusal structurally (the contract restore detects
+// without importing platform).
+type e2ePrivilegeRefusal struct{}
+
+func (e2ePrivilegeRefusal) Create(kind domain.EntryKind, path, target string) error {
+	return &e2ePrivilegeRefusalError{path: path}
+}
+
+type e2ePrivilegeRefusalError struct{ path string }
+
+func (e *e2ePrivilegeRefusalError) Error() string {
+	return "e2e simulated refusal: SeCreateSymbolicLinkPrivilege not held"
+}
+
+func (e *e2ePrivilegeRefusalError) LinkPrivilegeBlocked() bool { return true }
+
 // TestE2EResticJunctionWorkspace parks a workspace containing a junction
-// (or true symlink where allowed) through the real backend and then opens
-// it. Capture side: the link is stored as a link node and NEVER followed.
-// Open side: environment-conditional, because restic cannot materialize
-// reparse points without SeCreateSymbolicLinkPrivilege (a real-stack gap
-// the filesystem fakes masked — the junction round-tripped fine there).
+// (or true symlink where the platform allows it) through the real
+// backend and then opens it. Capture side: the link is stored as a link
+// node and NEVER followed (pinned through the backend's own listing).
+// Open side (Wave F): the staging restore EXCLUDES the link node, the
+// opener recreates it natively from the retained inventory's LinkTarget
+// — junctions UNPRIVILEGED, which closes the Wave E acceptance gap —
+// and the full round trip must succeed on this machine class. A second
+// open whose creator refuses links pins the privilege-gated refusal:
+// typed blocker, nothing published, operation left RESTORING.
 func TestE2EResticJunctionWorkspace(t *testing.T) {
 	e := newE2EEnv(t)
 	parent := t.TempDir()
@@ -676,6 +710,30 @@ func TestE2EResticJunctionWorkspace(t *testing.T) {
 	linkText, err := os.Readlink(filepath.Join(root, "link-out"))
 	if err != nil {
 		t.Fatalf("capture fixture link text before park: %v", err)
+	}
+	// The fixture link's inventory kind decides the recreation route;
+	// probe it exactly as capture did.
+	linkFacts, err := e.probe.ProbeFile(filepath.Join(root, "link-out"))
+	if err != nil {
+		t.Fatalf("probe fixture link: %v", err)
+	}
+	switch linkFacts.Kind {
+	case domain.KindSymlink, domain.KindJunction, domain.KindMountPoint:
+	default:
+		t.Fatalf("fixture link classified %q; test wiring broken", linkFacts.Kind)
+	}
+	// Environment conditionality: if this machine cannot recreate a link
+	// of the fixture's kind at all (locked-down box, exotic volume), say
+	// so and skip — never fake the round trip.
+	{
+		scratch := t.TempDir()
+		probePath := filepath.Join(scratch, "probe-link")
+		if cerr := platform.CreateLink(linkFacts.Kind, probePath, target); cerr != nil {
+			t.Skipf("environment cannot natively recreate a %s (%v); link round trip skipped", linkFacts.Kind, cerr)
+		}
+		if rtext, rerr := os.Readlink(probePath); rerr != nil || rtext != linkText {
+			t.Fatalf("native creator text round trip = %q (%v), want %q — wiring broken", rtext, rerr, linkText)
+		}
 	}
 	ws := newWSID()
 
@@ -724,14 +782,12 @@ func TestE2EResticJunctionWorkspace(t *testing.T) {
 		}
 	}
 
-	// Open the parked link workspace to a fresh destination. Both outcomes
-	// are real, pinned behaviors of the stack on this machine class:
-	//
-	//   - privileged (admin / Developer Mode / linux): full round trip,
-	//     link text byte-equal;
-	//   - unprivileged Windows: restic restore cannot materialize the
-	//     reparse point; the adapter fails the restore as a CONTENT
-	//     failure, nothing is published, no staging remains.
+	// Open #1 — the Wave E acceptance gap, now closed: the junction
+	// workspace opens on an UNPRIVILEGED machine. The staging restore
+	// excludes the link node (restic never attempts reparse
+	// materialization, exit 0), the opener recreates the link natively
+	// with the exact retained text, the independent oracle verifies the
+	// whole tree, and the publish completes.
 	destParent := t.TempDir()
 	dest := filepath.Join(destParent, "ws-link-restored")
 	octx, ocancel := e.opCtx()
@@ -739,34 +795,78 @@ func TestE2EResticJunctionWorkspace(t *testing.T) {
 	ores, oerr := e.opener().Open(octx, e.rvault(), res.Snapshot.SnapshotID, restore.Options{
 		Destination: dest, FilesOnly: true,
 	})
-	switch {
-	case oerr == nil:
-		gotLink, lerr := os.Readlink(filepath.Join(dest, "link-out"))
-		if lerr != nil || gotLink != linkText {
-			t.Errorf("restored link text = %q (%v), want the captured %q", gotLink, lerr, linkText)
+	if oerr != nil {
+		t.Fatalf("open of a junction workspace must succeed unprivileged (links staged via exclusion + native recreation): %v", oerr)
+	}
+	gotLink, lerr := os.Readlink(filepath.Join(dest, "link-out"))
+	if lerr != nil || gotLink != linkText {
+		t.Errorf("restored link text = %q (%v), want the captured %q", gotLink, lerr, linkText)
+	}
+	e2eSameTree(t, before, e2eWalkTree(t, dest))
+	e2eNoScratch(t, destParent, "destination parent")
+	if ores.WorkspaceID != ws || ores.Destination != dest {
+		t.Errorf("open result identity fields wrong: %+v", ores)
+	}
+	cat := e.newCat()
+	op, gerr := cat.GetOperation(ores.OperationID)
+	if gerr != nil || op.Phase != catalog.PhaseFilesReady {
+		t.Errorf("open op phase: %v %q, want FILES_READY", gerr, op.Phase)
+	}
+	w, werr := cat.GetWorkspace(ws)
+	if werr != nil || w.Status != catalog.WorkspaceLive || w.RootPath != filepath.Clean(dest) {
+		t.Errorf("workspace after open = %+v (%v), want live at the destination", w, werr)
+	}
+	if snap, serr := cat.GetSnapshot(res.Snapshot.SnapshotID); serr != nil || !snap.Pinned {
+		t.Errorf("snapshot must stay pinned after opening (I07): %+v (%v)", snap, serr)
+	}
+	t.Logf("link round trip succeeded with a %s fixture (staged via exclusion, recreated natively)", linkFacts.Kind)
+
+	// Open #2 — the privilege-gated refusal: a creator that refuses every
+	// link structurally (the unprivileged true-symlink case) must fail
+	// the open BEFORE publish with the typed blocker, leave no staging,
+	// and journal the operation at RESTORING.
+	dest2Parent := t.TempDir()
+	dest2 := filepath.Join(dest2Parent, "ws-link-refused")
+	rctx, rcancel := e.opCtx()
+	defer rcancel()
+	refusing := e.openerWithCreator(e2ePrivilegeRefusal{}.Create)
+	_, rerr := refusing.Open(rctx, e.rvault(), res.Snapshot.SnapshotID, restore.Options{
+		Destination: dest2, FilesOnly: true,
+	})
+	var lb *restore.ErrLinksBlocked
+	if !errors.As(rerr, &lb) || lb.Code() != restore.CodeLinksBlocked {
+		t.Fatalf("refused open err = %v, want restore.ErrLinksBlocked", rerr)
+	}
+	if len(lb.PrivilegeBlocked) != 1 || lb.PrivilegeBlocked[0] != "link-out" {
+		t.Fatalf("PrivilegeBlocked = %v, want exactly [link-out]", lb.PrivilegeBlocked)
+	}
+	if !strings.Contains(lb.Error(), "SeCreateSymbolicLinkPrivilege") || !strings.Contains(lb.Error(), "Developer Mode") {
+		t.Fatalf("blocker must name the capability and both options: %v", lb)
+	}
+	if _, serr := os.Lstat(dest2); !os.IsNotExist(serr) {
+		t.Errorf("nothing may be published on a privilege-blocked open (stat err = %v)", serr)
+	}
+	e2eNoScratch(t, dest2Parent, "refusal destination parent")
+	// The failed open is journaled for recovery at RESTORING, never lost.
+	fresh := e.newCat()
+	active, aerr := fresh.ActiveOperations(ws)
+	if aerr != nil {
+		t.Fatalf("active operations: %v", aerr)
+	}
+	var restoring int
+	for _, op := range active {
+		if op.Phase == catalog.PhaseRestoring && op.SourceRoot == dest2 {
+			restoring++
+			if !strings.Contains(op.LastError, "link-out") {
+				t.Errorf("journal last error must name the blocked link: %q", op.LastError)
+			}
 		}
-		e2eSameTree(t, before, e2eWalkTree(t, dest))
-		e2eNoScratch(t, destParent, "destination parent")
-		t.Log("link materialization succeeded on this privileged environment")
-	default:
-		if !strings.Contains(oerr.Error(), "materialize") {
-			t.Fatalf("open failed for an unexpected reason (not the known link-materialization gap): %v", oerr)
-		}
-		if _, serr := os.Lstat(dest); !os.IsNotExist(serr) {
-			t.Errorf("nothing may be published on a failed materialization (stat err = %v)", serr)
-		}
-		e2eNoScratch(t, destParent, "destination parent")
-		// The failed open is journaled for recovery, never lost.
-		cat := e.newCat()
-		active, aerr := cat.ActiveOperations(ws)
-		if aerr != nil || len(active) != 1 || active[0].Phase != catalog.PhaseRestoring {
-			t.Errorf("failed materialization must leave one RESTORING op, got %d (%v)", len(active), aerr)
-		}
-		if snap, serr := cat.GetSnapshot(res.Snapshot.SnapshotID); serr != nil || !snap.Pinned {
-			t.Errorf("snapshot must stay pinned after a failed open: %+v (%v)", snap, serr)
-		}
-		_ = ores
-		t.Log("unprivileged environment: link materialization failed with the pinned typed error (nothing published)")
+	}
+	if restoring != 1 {
+		t.Errorf("refused open must leave exactly one RESTORING op bound to %s (found %d; active=%d)", dest2, restoring, len(active))
+	}
+	if snap, serr := fresh.GetSnapshot(res.Snapshot.SnapshotID); serr != nil || !snap.Pinned {
+		t.Errorf("snapshot must stay pinned after a refused open: %+v (%v)", snap, serr)
 	}
 }
 

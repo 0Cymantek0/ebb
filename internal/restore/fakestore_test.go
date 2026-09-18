@@ -17,9 +17,12 @@ package restore
 //   - lsHide:      hide one node from Ls
 //   - restoreErr:  fail Restore after creating dest + one file
 //     ("fails mid-way")
-//   - restoreHook: arbitrary callback at the top of Restore (used to
-//     create a racing destination occupant between preflight and
-//     publish — F35)
+//   - restoreHook: arbitrary callback at the top of Restore and
+//     RestoreExcluding (used to create a racing destination occupant
+//     between preflight and publish — F35)
+//   - RestoreExcluding (Wave F): the exclusion-based staging path; it
+//     records the excludes it received and never creates excluded
+//     link nodes (the restore layer recreates those natively).
 
 import (
 	"context"
@@ -28,6 +31,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -60,6 +64,14 @@ type fakeStore struct {
 	lsHide         map[string]bool
 	restoreErr     error
 	restoreHook    func() error
+
+	// excludeCalls records every excludes list passed to
+	// RestoreExcluding (the restore layer's exclusion contract).
+	excludeCalls [][]string
+	// linksMaterialized records link paths the STORE created itself
+	// (RestoreExcluding must never see link paths — they are excluded;
+	// this records the negative evidence).
+	linksMaterialized []string
 }
 
 func newFakeStore() *fakeStore {
@@ -297,6 +309,103 @@ func (s *fakeStore) Restore(ctx context.Context, repoDir, passfile, snapID, subt
 		if s.restoreDrop[p] {
 			continue
 		}
+		if err := createLink(filepath.Join(dest, filepath.FromSlash(p)), snap.links[p]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RestoreExcluding models the restic exclusion contract (Wave F):
+// materialize the FULL snapshot tree into dest, skipping exactly the
+// listed snapshot-relative paths (leading-slash-free) AND their
+// subtrees (restic prunes descent of an excluded directory). Link
+// nodes that were NOT excluded are created by the store itself —
+// mirroring real restic, which attempts (and, unprivileged, fails on)
+// every link node it is not told to skip. The exclusion calls are
+// recorded so tests can assert exactly what the restore layer asked
+// the backend to skip.
+func (s *fakeStore) RestoreExcluding(ctx context.Context, repoDir, passfile, snapID, dest string, excludes []string) error {
+	s.mu.Lock()
+	snap, ok := s.snaps[snapID]
+	s.excludeCalls = append(s.excludeCalls, append([]string(nil), excludes...))
+	s.mu.Unlock()
+	if !ok {
+		return &domain.StoreError{Class: domain.StoreErrUsage, Err: fmt.Errorf("fakeStore: snapshot %q not found", snapID)}
+	}
+	if s.restoreHook != nil {
+		if err := s.restoreHook(); err != nil {
+			return err
+		}
+	}
+	excluded := map[string]bool{}
+	for _, ex := range excludes {
+		excluded["/"+ex] = true
+	}
+	pruned := func(p string) bool { // p is a "/a/b" tree path
+		for cur := p; ; {
+			if excluded[cur] {
+				return true
+			}
+			cur = path.Dir(cur)
+			if cur == "/" || cur == "." {
+				return false
+			}
+		}
+	}
+
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		return err
+	}
+	if s.restoreErr != nil {
+		var first string
+		for _, p := range s.sortedFileKeys(snap) {
+			if !pruned(p) {
+				first = p
+				break
+			}
+		}
+		if first != "" {
+			_ = os.MkdirAll(filepath.Join(dest, filepath.FromSlash(filepath.Dir(first))), 0o700)
+			_ = os.WriteFile(filepath.Join(dest, filepath.FromSlash(first)), snap.files[first], 0o600)
+		}
+		return s.restoreErr
+	}
+
+	for p := range snap.dirs {
+		if pruned(p) {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Join(dest, filepath.FromSlash(p)), 0o700); err != nil {
+			return err
+		}
+	}
+	for _, p := range s.sortedFileKeys(snap) {
+		if pruned(p) {
+			continue
+		}
+		if s.restoreDrop[p] {
+			continue // the silent E10 drop
+		}
+		content := snap.files[p]
+		if repl, ok := s.restoreCorrupt[p]; ok {
+			content = []byte(repl)
+		}
+		abs := filepath.Join(dest, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+			return err
+		}
+		if err := os.WriteFile(abs, content, 0o600); err != nil {
+			return err
+		}
+	}
+	for _, p := range s.sortedLinkKeys(snap) {
+		if pruned(p) {
+			continue
+		}
+		s.mu.Lock()
+		s.linksMaterialized = append(s.linksMaterialized, p)
+		s.mu.Unlock()
 		if err := createLink(filepath.Join(dest, filepath.FromSlash(p)), snap.links[p]); err != nil {
 			return err
 		}
