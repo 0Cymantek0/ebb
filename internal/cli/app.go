@@ -7,24 +7,37 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
+	"ebb/internal/adapters/ecosystem"
 	gitadapter "ebb/internal/adapters/git"
+	"ebb/internal/catalog"
 	"ebb/internal/domain"
 	"ebb/internal/inventory"
+	"ebb/internal/lifecycle"
 	"ebb/internal/platform"
 	"ebb/internal/policy"
+	"ebb/internal/restore"
+	resticstore "ebb/internal/storage/restic"
+	"ebb/internal/vault"
 )
 
 // RealDeps wires the production dependency set: the native platform
-// probe, the hardened Git observer and tracked-files adapter, and the
-// real metadata-first inventory scanner.
+// probe, the hardened Git observer and tracked-files adapter, the real
+// metadata-first inventory scanner, the Wave E durable-state seams
+// (vault.EnsureConfigDir state dir, SQLite catalog, restic store,
+// lifecycle/restore constructors, ecosystem detection) and the terminal
+// environment (stdin-tty detection, line reading, SIGINT/SIGTERM
+// context).
 func RealDeps() Deps {
 	return Deps{
 		NewProbe:   platform.New,
@@ -35,6 +48,34 @@ func RealDeps() Deps {
 			// (Foundation §8.1 two passes).
 			res := inventory.Scan(ctx, probe, root, inventory.Options{Hash: false})
 			return res.Summary, res.Entries, res.Err
+		},
+		StateDir:    vault.EnsureConfigDir,
+		OpenCatalog: catalog.Open,
+		NewStore: func() (domain.SnapshotStore, func(), error) {
+			s := resticstore.New("")
+			return s, s.Close, nil
+		},
+		NewLifecycle: lifecycle.New,
+		NewRestoreOp: restore.New,
+		DetectEcosystem: func(root string) (ecosystem.Detection, error) {
+			return ecosystem.Detect(root)
+		},
+		StdinIsTerminal: statModelessTTY,
+		ReadLine: func() (string, error) {
+			// One bounded line from stdin; interactive callers have
+			// already verified stdin is a terminal.
+			r := bufio.NewReader(io.LimitReader(os.Stdin, 4096))
+			line, err := r.ReadString('\n')
+			if err != nil && line == "" {
+				return "", err
+			}
+			return strings.TrimRight(line, "\r\n"), nil
+		},
+		NewSignalContext: func() (context.Context, func()) {
+			// SIGINT (Ctrl+C, both platforms) and SIGTERM cancel the
+			// command context; coordinators keep the last durable phase
+			// and the CLI maps the cancellation to exit 130 (§17.5).
+			return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		},
 	}
 }

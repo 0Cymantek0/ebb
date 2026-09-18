@@ -1,0 +1,271 @@
+// session.go is the Wave E state bridge: the one place the CLI opens
+// Ebb's per-user state (config dir + catalog + snapshot store + vault
+// registry) and hands a resolved vault to the lifecycle/restore
+// coordinators through vault.WithPassfile (Foundation §13.1: the vault
+// password reaches the backend only via an ephemeral passfile, never
+// argv, never a variable this package would hold).
+
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"ebb/internal/catalog"
+	"ebb/internal/domain"
+	"ebb/internal/lifecycle"
+	"ebb/internal/policy"
+	"ebb/internal/vault"
+)
+
+// session is one command's opened durable state.
+type session struct {
+	deps   Deps
+	cfgDir string
+	cat    *catalog.Catalog
+	store  domain.SnapshotStore
+	// closeStore releases the store's private resources (restic cache
+	// dir); nil-safe via closeSession.
+	closeStore func()
+}
+
+// openSession resolves the state dir, opens the catalog and constructs
+// the snapshot store. It does NOT require a registered vault — commands
+// that need one call session.vault() afterwards (so `ebb status`, a pure
+// catalog view, works before any enrollment).
+func openSession(deps Deps) (*session, error) {
+	if deps.StateDir == nil {
+		return nil, usageError(fmt.Errorf("state dir %w", ErrNotIntegrated))
+	}
+	cfgDir, err := deps.StateDir()
+	if err != nil {
+		return nil, blockedError(fmt.Errorf("ebb state directory: %v", err))
+	}
+	if deps.OpenCatalog == nil {
+		return nil, usageError(fmt.Errorf("catalog %w", ErrNotIntegrated))
+	}
+	cat, err := deps.OpenCatalog(filepath.Join(cfgDir, vault.CatalogFile))
+	if err != nil {
+		return nil, blockedError(fmt.Errorf("open catalog: %v", err))
+	}
+	if deps.NewStore == nil {
+		cat.Close()
+		return nil, usageError(fmt.Errorf("snapshot store %w", ErrNotIntegrated))
+	}
+	store, closeStore, err := deps.NewStore()
+	if err != nil {
+		cat.Close()
+		return nil, blockedError(fmt.Errorf("snapshot store: %v", err))
+	}
+	return &session{deps: deps, cfgDir: cfgDir, cat: cat, store: store, closeStore: closeStore}, nil
+}
+
+// close releases the catalog handle and the store's private resources.
+// Safe to call on a nil session.
+func (s *session) close() {
+	if s == nil {
+		return
+	}
+	if s.closeStore != nil {
+		s.closeStore()
+	}
+	_ = s.cat.Close()
+}
+
+// registry returns the vault registry in the state dir.
+func (s *session) registry() *vault.Registry {
+	return vault.New(filepath.Join(s.cfgDir, vault.RegistryFile))
+}
+
+// defaultVault returns the registry's default vault, or a §5.5-worded
+// vault blocker when none is registered.
+func (s *session) defaultVault() (*vault.Vault, error) {
+	v, err := s.registry().Default()
+	if err != nil {
+		return nil, blockedError(fmt.Errorf("%s: no default vault is registered in %s; capture, park, trim, open and recover all need one. Safe action: run `ebb init` to enroll a vault (source: %v)",
+			CodeNoVault, s.cfgDir, err))
+	}
+	return v, nil
+}
+
+// withVaultPassfile resolves the default vault's unlock secret and runs
+// fn with the ephemeral passfile path (vault.WithPassfile owns the
+// create/remove contract; Foundation §13.1). Password-source failures
+// surface with the §5.5 vault wording so commands map them to exit 7.
+func (s *session) withVaultPassfile(ctx context.Context, fn func(repoDir, passfile string) error) error {
+	v, err := s.defaultVault()
+	if err != nil {
+		return err
+	}
+	err = vault.WithPassfile(v.ID, func(passfilePath string) error {
+		return fn(v.RepoDir, passfilePath)
+	})
+	if err != nil {
+		var noSource *vault.NoSourceError
+		if errors.As(err, &noSource) {
+			return blockedError(fmt.Errorf("%s: vault %s (%s) could not be unlocked: %v. Safe action: set %s, store the password in the OS credential store via `ebb init`, or run in a terminal to be prompted",
+				CodeUnlockRejected, v.Name, v.ID, err, vault.EnvPassword))
+		}
+		return err
+	}
+	return nil
+}
+
+// lifecycleVaultRef adapts withVaultPassfile's strings to the lifecycle
+// VaultRef shape.
+func lifecycleVaultRef(repoDir, passfile string) lifecycle.VaultRef {
+	return lifecycle.VaultRef{RepoDir: repoDir, Passfile: passfile}
+}
+
+// newLifecycle builds the lifecycle coordinator over this session. The
+// returned error is already a cliError (usage-class when the seam is
+// unwired; blocked-class on construction failure).
+func (s *session) newLifecycle(probe domain.PlatformProbe) (*lifecycle.Coordinator, error) {
+	if s.deps.NewLifecycle == nil {
+		return nil, usageError(fmt.Errorf("lifecycle coordinator %w", ErrNotIntegrated))
+	}
+	c, err := s.deps.NewLifecycle(lifecycle.Dependencies{
+		Store: s.store,
+		Cat:   s.cat,
+		Probe: probe,
+	})
+	if err != nil {
+		return nil, blockedError(err)
+	}
+	return c, nil
+}
+
+// resolveWorkspaceID implements the CLI-owned workspace-name binding
+// documented on lifecycle.CaptureOptions: re-capturing the same root
+// under the same name rebinds the SAME workspace id (stable identity
+// across captures). Match order: exact name AND recorded root path;
+// then exact name AND live status; otherwise a fresh workspace is
+// created (empty id).
+func (s *session) resolveWorkspaceID(name, rootAbs string) domain.WorkspaceID {
+	list, err := s.cat.ListWorkspaces()
+	if err != nil {
+		return ""
+	}
+	var byLiveName domain.WorkspaceID
+	for _, w := range list {
+		if w.Name != name {
+			continue
+		}
+		if w.RootPath != "" && filepath.Clean(w.RootPath) == filepath.Clean(rootAbs) {
+			return w.ID
+		}
+		if w.Status == catalog.WorkspaceLive && byLiveName == "" {
+			byLiveName = w.ID
+		}
+	}
+	return byLiveName
+}
+
+// ---- writer assertion (Foundation §17.2) --------------------------------
+//
+// Unattended destructive operation requires --assert-writers-stopped,
+// and --yes never supplies it. On a terminal the interactive
+// confirmation is the assertion and records source
+// "interactive-confirm"; the flag records "flag:--assert-writers-stopped".
+
+const (
+	assertionFlagSource        = "flag:--assert-writers-stopped"
+	assertionInteractiveSource = "interactive-confirm"
+)
+
+// writerAssertion resolves the recorded writer-assertion source for a
+// park, or returns a §5.5-worded blocker (exit 3) when neither an
+// explicit assertion nor an interactive confirmation is available.
+// assertStopped is the parsed --assert-writers-stopped flag value;
+// --yes is accepted for ordinary prompts but deliberately NEVER
+// supplies this assertion (Foundation §17.2).
+func writerAssertion(deps Deps, assertStopped bool, out io.Writer) (string, error) {
+	if assertStopped {
+		return assertionFlagSource, nil
+	}
+	if deps.StdinIsTerminal != nil && deps.StdinIsTerminal() {
+		prompt := "workspace will be REMOVED after a verified capture; assert all writers are stopped? type 'yes': "
+		if confirmYes(deps, out, prompt) {
+			return assertionInteractiveSource, nil
+		}
+		return "", blockedError(fmt.Errorf("%s: the interactive writer assertion was declined; the workspace was NOT removed. Safe action: stop all processes writing to the workspace and run `ebb park` again",
+			CodeWritersUnasserted))
+	}
+	return "", blockedError(fmt.Errorf("%s: park removes the workspace after a verified capture, and no writer assertion is available (stdin is not a terminal and --assert-writers-stopped was not given; --yes never supplies it). Safe action: verify no process is writing to the workspace, then rerun with --assert-writers-stopped, or run in a terminal and confirm interactively",
+		CodeWritersUnasserted))
+}
+
+// confirmYes prompts on out and reads one line through the ReadLine
+// seam, accepting "yes"/"y" (case-insensitive). The prompt text is
+// caller-supplied; this helper owns only the reading.
+func confirmYes(deps Deps, out io.Writer, prompt string) bool {
+	if deps.ReadLine == nil {
+		return false
+	}
+	fmt.Fprint(out, prompt)
+	line, err := deps.ReadLine()
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "yes", "y":
+		return true
+	default:
+		return false
+	}
+}
+
+// reclaimCommandForDisplay mirrors lifecycle's policy-derived recreate
+// argv (internal/lifecycle reclaimCommand): a declared command wins,
+// ecosystem adapters carry the pinned per-adapter recipe. Duplicated
+// deliberately at the presentation layer — the authoritative value in
+// results is lifecycle.TrimResult.ReclaimCommands.
+func reclaimCommandForDisplay(g policy.Regenerate) []string {
+	if len(g.Command) > 0 {
+		return g.Command
+	}
+	switch g.Adapter {
+	case policy.AdapterPNPM:
+		return []string{"pnpm", "install", "--frozen-lockfile"}
+	case policy.AdapterNPM:
+		return []string{"npm", "ci"}
+	case policy.AdapterUV:
+		return []string{"uv", "sync", "--locked"}
+	case policy.AdapterPip:
+		return []string{"python", "-m", "pip", "install", "-r", firstInputOf(g)}
+	}
+	return nil
+}
+
+func firstInputOf(g policy.Regenerate) string {
+	if len(g.Inputs) > 0 {
+		return g.Inputs[0]
+	}
+	return "requirements.txt"
+}
+
+// commandContext returns the cancellable command context from the
+// signal seam (tests inject their own; production installs
+// SIGINT/SIGTERM notification so a Ctrl+C maps to exit 130 with the
+// journal keeping the last durable phase).
+func commandContext(deps Deps) (ctx context.Context, stop func()) {
+	if deps.NewSignalContext == nil {
+		return context.Background(), func() {}
+	}
+	return deps.NewSignalContext()
+}
+
+// statModelessTTY reports whether stdin is a character device (a
+// terminal) via os.Stdin.Stat — the production StdinIsTerminal seam.
+func statModelessTTY() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}

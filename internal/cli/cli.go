@@ -16,7 +16,11 @@ import (
 	"fmt"
 	"io"
 
+	"ebb/internal/adapters/ecosystem"
+	"ebb/internal/catalog"
 	"ebb/internal/domain"
+	"ebb/internal/lifecycle"
+	"ebb/internal/restore"
 )
 
 // Exit codes are Ebb's public process contract (Foundation §17.5).
@@ -41,8 +45,10 @@ const ResticTarget = "0.19.1"
 
 // Deps carries the integration seams. RealDeps wires the production
 // implementations (platform probe, hardened git observer, tracked-files
-// adapter, metadata-first inventory scanner); the CLI layer itself
-// never touches the filesystem for scanning.
+// adapter, metadata-first inventory scanner, restic store, lifecycle and
+// restore coordinators, catalog/registry openers over the state dir, and
+// the terminal/signal environment); the CLI layer itself never touches
+// the filesystem for scanning or business logic.
 type Deps struct {
 	// NewProbe returns the native platform probe used for root
 	// identity, volume usage and per-entry facts.
@@ -57,6 +63,44 @@ type Deps struct {
 	// project code (Foundation §8.1); the real implementation scans
 	// metadata-first (Hash=false).
 	ScanInventory func(ctx context.Context, probe domain.PlatformProbe, root string) (domain.InventorySummary, []domain.Entry, error)
+
+	// ---- durable-state / lifecycle seams (Wave E) ----
+
+	// StateDir returns Ebb's per-user state directory, creating it when
+	// absent (production: vault.EnsureConfigDir — os.UserConfigDir()/ebb;
+	// the catalog and vaults.json live there).
+	StateDir func() (string, error)
+	// OpenCatalog opens (creating if necessary) the SQLite catalog at
+	// path (production: catalog.Open).
+	OpenCatalog func(path string) (*catalog.Catalog, error)
+	// NewStore constructs the snapshot-store backend plus its release
+	// function (production: resticstore.New("restic") and its Close).
+	NewStore func() (domain.SnapshotStore, func(), error)
+	// NewLifecycle constructs the lifecycle coordinator (production:
+	// lifecycle.New). The lifecycle.Dependencies arrive fully wired by
+	// the CLI; the seam exists so tests can intercept construction
+	// failures and future wrappers.
+	NewLifecycle func(lifecycle.Dependencies) (*lifecycle.Coordinator, error)
+	// NewRestoreOp constructs the restore opener (production:
+	// restore.New).
+	NewRestoreOp func(restore.Dependencies) (*restore.Opener, error)
+	// DetectEcosystem runs existence-only regenerate-group detection
+	// over a workspace root (production: ecosystem.Detect). Used by
+	// `ebb init` for SUGGESTIONS; never writes an Ebbfile.
+	DetectEcosystem func(root string) (ecosystem.Detection, error)
+	// StdinIsTerminal reports whether stdin is an interactive terminal
+	// (production: os.Stdin.Stat() mode check). Interactive prompts are
+	// gated on it; a non-terminal stdin NEVER blocks on reading.
+	StdinIsTerminal func() bool
+	// ReadLine reads one line from stdin (production: bufio over
+	// os.Stdin). Used by the interactive confirmations; tests inject a
+	// fake reader.
+	ReadLine func() (string, error)
+	// NewSignalContext returns the command context plus its stop
+	// function (production: signal.NotifyContext for SIGINT/SIGTERM).
+	// A cancellation maps to exit 130 with the journal keeping the last
+	// durable phase (Foundation §17.5).
+	NewSignalContext func() (context.Context, func())
 }
 
 // ErrNotIntegrated marks seams that are not wired (a zero-value Deps);
@@ -79,14 +123,32 @@ type Streams struct {
 }
 
 // Envelope is the machine result object (Foundation §17.2). Warnings
-// and Errors are always present as arrays, never null.
+// and Errors are always present as arrays, never null. The Wave E fields
+// (Phase, WorkspaceID, SnapshotID, Conditions, Bytes) carry the §17.2
+// operation facts; each is omitted when the command produced no value
+// for it.
 type Envelope struct {
 	OperationID string   `json:"operation_id,omitempty"`
 	Command     string   `json:"command"`
+	Phase       string   `json:"phase,omitempty"`
+	WorkspaceID string   `json:"workspace_id,omitempty"`
+	SnapshotID  string   `json:"snapshot_id,omitempty"`
 	Outcome     string   `json:"outcome"`
+	Conditions  []string `json:"conditions,omitempty"`
+	Bytes       *BytesSummary `json:"bytes,omitempty"`
 	Details     any      `json:"details,omitempty"`
 	Warnings    []string `json:"warnings"`
 	Errors      []string `json:"errors"`
+}
+
+// BytesSummary carries the §17.2 byte counters, one field per meaning
+// the command actually measured (omitted at zero).
+type BytesSummary struct {
+	Preserved      int64 `json:"preserved,omitempty"`
+	Omitted        int64 `json:"omitted,omitempty"`
+	Restored       int64 `json:"restored,omitempty"`
+	FreedObserved  int64 `json:"freed_observed,omitempty"`
+	FreedEstimated int64 `json:"freed_estimated,omitempty"`
 }
 
 // newEnvelope builds an envelope with non-nil warning/error arrays.
@@ -124,6 +186,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 	switch args[0] {
 	case "version", "VERSION":
 		return cmdVersion(args[1:], streams)
+	case "init":
+		return cmdInit(args[1:], streams, deps)
 	case "inspect":
 		return cmdInspect(args[1:], streams, deps)
 	case "plan":
@@ -145,16 +209,38 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `usage: ebb <command> [flags] [path]
 
 commands:
-  version            print ebb version, restic conformance target and go version
-  inspect <path>     explain scope, costs and blockers without running project code
-  plan <path>        compute a reclaim plan (preview only; grants no removal authority)
-  doctor             report supported capabilities and configuration problems
+  version                    print ebb version, restic conformance target and go version
+  init [path]                enroll a vault and show detected recovery groups (suggestions only)
+  inspect [path]             explain scope, costs and blockers without running project code
+  plan [path]                compute a reclaim plan (preview only; grants no removal authority)
+  snapshot [path]            capture and verify without removing workspace entries
+  park [path]                capture, verify and remove the workspace (requires a writer assertion)
+  trim [path] --groups a,b   remove explicitly approved generated groups from a live workspace
+  open <name-or-snapshot-id> [--to dir]
+                             recover a parked/captured workspace (files-only in v1)
+  recover <operation-id>     reconcile an interrupted operation from durable evidence
+  status [workspace]         show local recorded state (workspaces, snapshots, operations)
+  doctor                     report supported capabilities and configuration problems
 
-inspect/plan flags:
-  --json                    emit the machine result envelope on stdout
+common flags:
+  --json                     emit the machine result envelope on stdout
 
 plan flags:
-  --from-inventory <file>   load a saved inventory JSON instead of scanning
-  --target <bytes>          space goal, e.g. 25GiB (default: release as much as safely possible)
+  --from-inventory <file>    load a saved inventory JSON instead of scanning
+  --target <bytes>           space goal, e.g. 25GiB (default: release as much as safely possible)
+
+park flags:
+  --assert-writers-stopped   unattended writer assertion (recorded in the operation journal)
+  --yes                      accept ordinary prompts (NEVER supplies the writer assertion)
+
+trim flags:
+  --groups <ids>             comma-separated regenerate group ids declared by the policy (required)
+  --yes                      accept the removal confirmation without a prompt
+
+open flags:
+  --to <dir>                 destination directory (default: the workspace's recorded root)
+
+recover flags:
+  --resume-removal           explicitly resume a blocked/interrupted removal walk
 `)
 }
