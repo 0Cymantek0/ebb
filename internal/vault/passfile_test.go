@@ -20,7 +20,9 @@ func TestWithPassfileLifecycle(t *testing.T) {
 
 	var observed string
 	var stat os.FileInfo
+	var mine string
 	err := WithPassfile("vid", func(path string) error {
+		mine = path
 		b, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("passfile must exist during fn: %v", err)
@@ -41,19 +43,15 @@ func TestWithPassfileLifecycle(t *testing.T) {
 			t.Fatalf("passfile mode must be 0600, got %o", perm)
 		}
 	}
-	// Directory-scan proof of removal (not just stat: the name is
-	// random so a stat miss would prove it, but scanning is stricter).
-	leftovers := 0
-	entries, err2 := os.ReadDir(os.TempDir())
-	if err2 == nil {
-		for _, e := range entries {
-			if len(e.Name()) > len("ebb-vault-pass-") && e.Name()[:len("ebb-vault-pass-")] == "ebb-vault-pass-" {
-				leftovers++
-			}
-		}
+	// Removal proof for THIS passfile (the random name makes a stat miss
+	// conclusive). A whole-directory scan would race other packages'
+	// legitimately in-flight passfiles under parallel `go test ./...` —
+	// %TEMP% is shared global state, not this test's.
+	if mine == "" {
+		t.Fatal("fn never ran")
 	}
-	if leftovers != 0 {
-		t.Fatalf("%d ebb passfiles left in temp dir", leftovers)
+	if _, serr := os.Stat(mine); !os.IsNotExist(serr) {
+		t.Fatalf("passfile %s must be removed after fn, stat: %v", mine, serr)
 	}
 }
 
