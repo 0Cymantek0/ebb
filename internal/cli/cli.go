@@ -199,10 +199,16 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdPark(args[1:], streams, deps)
 	case "trim":
 		return cmdTrim(args[1:], streams, deps)
+	case "reclaim":
+		return cmdReclaim(args[1:], streams, deps)
 	case "open":
 		return cmdOpen(args[1:], streams, deps)
 	case "recover":
 		return cmdRecover(args[1:], streams, deps)
+	case "forget":
+		return cmdForget(args[1:], streams, deps)
+	case "verify":
+		return cmdVerify(args[1:], streams, deps)
 	case "status":
 		return cmdStatus(args[1:], streams, deps)
 	case "doctor":
@@ -269,9 +275,12 @@ commands:
   snapshot [path]            capture and verify without removing workspace entries
   park [path]                capture, verify and remove the workspace (requires a writer assertion)
   trim [path] --groups a,b   remove explicitly approved generated groups from a live workspace
+  reclaim [path] --target N  plan and execute the least disruptive sufficient release: trim, then park only if needed
   open <name-or-snapshot-id> [--to dir]
                              recover a parked/captured workspace (files-only in v1)
   recover <operation-id>     reconcile an interrupted operation from durable evidence
+  forget <snapshot-id>       deliberately end a snapshot's recovery obligation (explicit confirmation)
+  verify <snapshot-id>       refresh retained-snapshot evidence (coverage; --content adds full readback)
   status [workspace]         show local recorded state (workspaces, snapshots, operations)
   doctor                     report supported capabilities and configuration problems
 
@@ -290,10 +299,23 @@ trim flags:
   --groups <ids>             comma-separated regenerate group ids declared by the policy (required)
   --yes                      accept the removal confirmation without a prompt
 
+reclaim flags:
+  --target <bytes>           space goal, e.g. 25GiB (default: release as much as safely possible)
+  --dry-run                  print the staged plan without effects
+  --yes                      accept the trim confirmations (NEVER answers the park escalation)
+  --assert-writers-stopped   writer assertion for the park escalation (does not answer its confirmation)
+
 open flags:
   --to <dir>                 destination directory (default: the workspace's recorded root)
 
 recover flags:
   --resume-removal           explicitly resume a blocked/interrupted removal walk
+
+forget flags:
+  --yes                      accept the typed-id confirmation (shows the obligation being ended)
+  --last-of-parked           acknowledge forgetting the ONLY snapshot of a parked workspace
+
+verify flags:
+  --content                  full per-file readback of every preserved byte (expensive; one backend call per file)
 `)
 }

@@ -101,20 +101,7 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 			approved[id] = true
 		}
 	} else if deps.StdinIsTerminal != nil && deps.StdinIsTerminal() {
-		var b strings.Builder
-		fmt.Fprintf(&b, "The following generated groups will be REMOVED from %s\n", disc.Root)
-		fmt.Fprintf(&b, "(a removal plan is captured and sealed first; recreate commands are recorded):\n")
-		for _, id := range groups {
-			g := declared[id]
-			cmdLine := strings.Join(reclaimCommandForDisplay(g), " ")
-			if cmdLine == "" {
-				cmdLine = "(no recreate command declared for adapter " + string(g.Adapter) + ")"
-			}
-			fmt.Fprintf(&b, "  - %s [%s] outputs: %s\n", id, g.Adapter, strings.Join(g.Outputs, ", "))
-			fmt.Fprintf(&b, "      recreate: %s\n", cmdLine)
-		}
-		fmt.Fprint(&b, "Remove these groups? type 'yes': ")
-		fmt.Fprint(streams.Err, b.String())
+		fmt.Fprint(streams.Err, trimApprovalText(disc.Root, groups, declared))
 		if !confirmYes(deps, streams.Err, "") {
 			return emitFailure(env, *jsonOut, streams, ExitBlocked, fmt.Sprintf(
 				"%s [trim]: the removal confirmation was declined; nothing was removed. Safe action: review the listed outputs and rerun `ebb trim --groups %s`, or run with --yes after verifying the policy",
@@ -175,6 +162,27 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 	env.Warnings = append(env.Warnings, res.Snapshot.Warnings...)
 	emit(env, *jsonOut, streams, renderTrimHuman(details))
 	return ExitOK
+}
+
+// trimApprovalText builds the grouped-removal confirmation shared by
+// `ebb trim` and `ebb reclaim`'s trim stages (§17.3/§17.4: each group's
+// outputs and the policy-derived recreate command, then the typed
+// confirmation).
+func trimApprovalText(root string, groups []string, declared map[string]policy.Regenerate) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "The following generated groups will be REMOVED from %s\n", root)
+	fmt.Fprintf(&b, "(a removal plan is captured and sealed first; recreate commands are recorded):\n")
+	for _, id := range groups {
+		g := declared[id]
+		cmdLine := strings.Join(reclaimCommandForDisplay(g), " ")
+		if cmdLine == "" {
+			cmdLine = "(no recreate command declared for adapter " + string(g.Adapter) + ")"
+		}
+		fmt.Fprintf(&b, "  - %s [%s] outputs: %s\n", id, g.Adapter, strings.Join(g.Outputs, ", "))
+		fmt.Fprintf(&b, "      recreate: %s\n", cmdLine)
+	}
+	fmt.Fprint(&b, "Remove these groups? type 'yes': ")
+	return b.String()
 }
 
 // declaredGroupList renders the policy's regenerate group ids ("" when

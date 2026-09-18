@@ -214,6 +214,47 @@ func parentSlash(p string) string {
 	return ""
 }
 
+// ---- exported expected-tree derivation (§11.4) -------------------------
+//
+// ExpectedTreeFor is the thin exported window onto expectedTreeAndReadback
+// for callers outside this package that re-derive capture evidence from a
+// retained inventory (`ebb verify`): sharing the exact rules is the point
+// — a re-verification that disagreed with the capture's own derivation
+// would be vacuous (Learnings, Wave D).
+
+// ExpectedNode is one expected snapshot-tree node in tree-normalized form
+// (junctions/mount points appear as symlink nodes in the backend tree).
+type ExpectedNode struct {
+	Kind domain.EntryKind
+	Size int64
+}
+
+// ReadbackFile is one file whose authoritative preserved bytes must be
+// deep-read through the backend and compared to the independent digest.
+type ReadbackFile struct {
+	// SnapPath is the tree path ("/<prefix>/..."); Digest is the
+	// independent inventory digest to compare against.
+	SnapPath string
+	Digest   string
+}
+
+// ExpectedTreeFor derives the §11.4 coverage expectation and readback set
+// for the entries a capture under prefix placed in the snapshot tree. It
+// is pure: no I/O, no clocks; the same entries and prefix always yield
+// the same expectation.
+func ExpectedTreeFor(entries []domain.Entry, prefix string) (map[string]ExpectedNode, []ReadbackFile) {
+	expected, readback := expectedTreeAndReadback(entries, prefix)
+	out := make(map[string]ExpectedNode, len(expected))
+	for p, n := range expected {
+		out[p] = ExpectedNode{Kind: n.Kind, Size: n.Size}
+	}
+	files := make([]ReadbackFile, len(readback))
+	for i, f := range readback {
+		files[i] = ReadbackFile{SnapPath: f.SnapPath, Digest: f.Digest}
+	}
+	return out, files
+}
+
 // walkLocalTree returns every file (path relative to root, forward
 // slashes, plus size and digest) under dir. Used to (a) enumerate the op
 // dir's expected tree for coverage, and (b) build readback sets for
