@@ -23,6 +23,7 @@ var (
 
 	pFindFirstStreamW       = modKernel32.NewProc("FindFirstStreamW")
 	pFindNextStreamW        = modKernel32.NewProc("FindNextStreamW")
+	pFindClose              = modKernel32.NewProc("FindClose")
 	pGetCompressedFileSizeW = modKernel32.NewProc("GetCompressedFileSizeW")
 
 	auxProcsOnce sync.Once
@@ -43,6 +44,10 @@ func resolveAuxProcs() error {
 		}
 		if err := pFindNextStreamW.Find(); err != nil {
 			auxProcsErr = fmt.Errorf("kernel32.FindNextStreamW: %w", err)
+			return
+		}
+		if err := pFindClose.Find(); err != nil {
+			auxProcsErr = fmt.Errorf("kernel32.FindClose: %w", err)
 			return
 		}
 		if err := pGetCompressedFileSizeW.Find(); err != nil {
@@ -96,7 +101,13 @@ func listNamedStreams(path string) []domain.NamedStream {
 		_ = callErr
 		return nil
 	}
-	defer windows.CloseHandle(windows.Handle(h))
+	// FindFirstStreamW handles MUST be released with FindClose.
+	// CloseHandle appears to succeed on them but does NOT release the
+	// enumeration handle: the leaked handle then blocks renaming (and
+	// deleting) the containing directory FOREVER — measured on Win11
+	// 26200 (lifecycle wave: every park's quarantine rename failed after
+	// the scan hashed files). FindClose is the documented deallocator.
+	defer pFindClose.Call(h)
 
 	var streams []domain.NamedStream
 	for {

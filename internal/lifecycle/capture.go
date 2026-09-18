@@ -66,6 +66,9 @@ type captureState struct {
 	payload   domain.SnapshotRef
 	seal      domain.SnapshotRef
 
+	// trimPlan is non-nil only for trim operations (built by Trim).
+	trimPlan []trimGroupPlan
+
 	warnings []string
 
 	// Volume observation for the park tail (§12.2 step 9).
@@ -94,6 +97,9 @@ func (c *Coordinator) Snapshot(ctx context.Context, vault VaultRef, root string,
 	// kind — package doc) while the retained snapshot is kind
 	// "snapshot".
 	st, err := c.capture(ctx, vault, root, opts, catalog.OpKindPark, catalog.SnapshotKindSnapshot)
+	if st != nil {
+		defer st.journal.close() // no sequence end may leave the file held open
+	}
 	if err != nil {
 		return SnapshotResult{}, err
 	}
@@ -160,7 +166,7 @@ func (c *Coordinator) capture(ctx context.Context, vault VaultRef, root string, 
 	}
 
 	// ---- §12.2 step 4: coverage + full readback ---------------------
-	if err := c.verifyPayload(ctx, st); err != nil {
+	if err := c.verifyPayload(ctx, st, []string{st.wsPrefix, st.opDirName}); err != nil {
 		// §11.3: a payload with no valid seal is an incomplete
 		// operation, not garbage to erase. It can still contain useful
 		// captured work: P is retained (recorded unsealed + pinned),
@@ -191,7 +197,7 @@ func (c *Coordinator) capture(ctx context.Context, vault VaultRef, root string, 
 	}
 
 	// ---- §12.2 step 5: seal S, read it back, commit SEALED ----------
-	if err := c.sealPayload(ctx, st); err != nil {
+	if err := c.sealPayload(ctx, st, catalog.PhasePayloadCommitted, catalog.PhaseSealed); err != nil {
 		// P is verified but unsealed; the operation stays
 		// PAYLOAD_COMMITTED so Recover can resume sealing from evidence.
 		c.failOperation(st.opID, catalog.PhasePayloadCommitted, err.Error())
@@ -386,18 +392,23 @@ func groupIDs(r policy.Resolved) []string {
 //   - every symlink/junction/mount-point entry;
 //   - every EMPTY directory;
 //   - one sanctioned exception: a directory whose entire recursive
-//     content is preserved, with zero boundary links inside, may be
-//     listed as the directory (verified against the scan; when in doubt
-//     files are listed individually);
+//     content is preserved, with zero omitted entries and zero boundary
+//     links inside, may be listed as the directory (verified against the
+//     scan; when in doubt files are listed individually);
 //   - plus the whole op dir (Ebb-authored, link-free by construction).
 //
 // No cap: large selections stream into the store's list file; restic
 // handles arbitrary lengths.
+//
+// The listing and the expected/readback evidence are deliberately
+// separate computations: every entry that ends up captured — individually
+// listed or implicitly via a shorthand ancestor's recursion — must appear
+// in the coverage expectation and (for files) the readback set (§11.4).
+// expectedTreeAndReadback derives that set purely from the resolved
+// inventory; Recover reuses it to re-verify P from P's own documents.
 func (c *Coordinator) buildSelection(st *captureState) error {
-	byPath := make(map[string]domain.Entry, len(st.entries))
 	omitted := make(map[string]bool)
 	for _, e := range st.entries {
-		byPath[e.Path] = e
 		if e.Route != domain.RoutePreserve {
 			omitted[e.Path] = true
 		}
@@ -414,6 +425,11 @@ func (c *Coordinator) buildSelection(st *captureState) error {
 					return false // omitted or unhashed (placeholder): never shorthand
 				}
 			case domain.KindDir:
+				if e.Route != domain.RoutePreserve {
+					// Listing the parent recurses into this directory:
+					// omitted content must never ride along implicitly.
+					return false
+				}
 			default:
 				return false // any link/special inside disqualifies
 			}
@@ -421,16 +437,8 @@ func (c *Coordinator) buildSelection(st *captureState) error {
 		return true
 	}
 
-	plan := selectionPlan{expected: map[string]expectedNode{}}
+	plan := selectionPlan{}
 	covered := map[string]bool{}
-	addWS := func(e domain.Entry) {
-		rel := st.wsPrefix + "/" + e.Path
-		plan.relPaths = append(plan.relPaths, rel)
-		addExpectedPath(plan.expected, "/"+rel, expectedNode{Kind: treeKindOf(e.Kind), Size: e.LogicalSize})
-		if e.Kind == domain.KindFile && e.Digest != "" {
-			plan.readback = append(plan.readback, readbackFile{SnapPath: "/" + rel, Digest: e.Digest})
-		}
-	}
 
 	for _, e := range st.entries {
 		if covered[e.Path] || omitted[e.Path] {
@@ -439,7 +447,7 @@ func (c *Coordinator) buildSelection(st *captureState) error {
 		switch e.Kind {
 		case domain.KindDir:
 			if shorthandOK(e.Path) {
-				addWS(e)
+				plan.relPaths = append(plan.relPaths, st.wsPrefix+"/"+e.Path)
 				prefix := e.Path + "/"
 				for _, other := range st.entries {
 					if strings.HasPrefix(other.Path, prefix) {
@@ -460,9 +468,9 @@ func (c *Coordinator) buildSelection(st *captureState) error {
 					"preserved file %s not captured: unhashed (cloud-placeholder suspicion); content must never be opened (Foundation §8.1)", e.Path))
 				continue
 			}
-			addWS(e)
+			plan.relPaths = append(plan.relPaths, st.wsPrefix+"/"+e.Path)
 		case domain.KindSymlink, domain.KindJunction, domain.KindMountPoint:
-			addWS(e)
+			plan.relPaths = append(plan.relPaths, st.wsPrefix+"/"+e.Path)
 		default:
 			// Blocking special kinds reach here only for plain
 			// snapshots (destructive preflight refused them).
@@ -470,6 +478,12 @@ func (c *Coordinator) buildSelection(st *captureState) error {
 				"entry %s of kind %s not captured (v1 backend cannot represent it losslessly)", e.Path, e.Kind))
 		}
 	}
+
+	// Expected tree + readback from every captured entry (shared with
+	// Recover's P re-verification).
+	expected, readback := expectedTreeAndReadback(st.entries, st.wsPrefix)
+	plan.expected = expected
+	plan.readback = append(plan.readback, readback...)
 
 	// The op dir: fully preserved by construction; listed as one entry.
 	opFiles, err := walkLocalTree(st.opDir)
@@ -501,13 +515,15 @@ func (c *Coordinator) assertD003(st *captureState) error {
 	return nil
 }
 
-// verifyPayload performs step 4's two §11.4 checks against P.
-func (c *Coordinator) verifyPayload(ctx context.Context, st *captureState) error {
+// verifyPayload performs step 4's two §11.4 checks against P. prefixes are
+// the declared tree prefixes of this capture (park/snapshot: workspace root
+// + op dir; trim: op dir only — §11.4 readback scope follows authority).
+func (c *Coordinator) verifyPayload(ctx context.Context, st *captureState, prefixes []string) error {
 	ls, err := c.store.Ls(ctx, st.vault.RepoDir, st.vault.Passfile, st.payload.BackendID)
 	if err != nil {
 		return fmt.Errorf("lifecycle: listing payload: %w", err)
 	}
-	if err := verifyCoverage(ls, st.selection.expected, []string{st.wsPrefix, st.opDirName}); err != nil {
+	if err := verifyCoverage(ls, st.selection.expected, prefixes); err != nil {
 		return err
 	}
 	if err := verifyReadback(ctx, c.store, st.vault.RepoDir, st.vault.Passfile, st.payload.BackendID, st.selection.readback); err != nil {
@@ -519,17 +535,26 @@ func (c *Coordinator) verifyPayload(ctx context.Context, st *captureState) error
 
 // sealPayload performs step 5: write the receipt (P now read back and
 // checked), capture the small seal snapshot S, read S back byte-exactly,
-// then commit the retained P/S pair (§11.3) to the catalog and commit
-// SEALED.
-func (c *Coordinator) sealPayload(ctx context.Context, st *captureState) error {
+// then commit the retained P/S pair (§11.3) to the catalog and commit the
+// seal-complete phase. fromPhase/toPhase carry the caller's phase
+// vocabulary: park/snapshot seal PAYLOAD_COMMITTED→SEALED; a trim seals
+// TRIM_PLANNED→TRIM_SEALING (its seal commit IS the TRIM_SEALING gate
+// that authorizes removal).
+func (c *Coordinator) sealPayload(ctx context.Context, st *captureState, fromPhase, toPhase string) error {
 	if err := os.MkdirAll(st.sealDir, 0o700); err != nil {
 		return fmt.Errorf("lifecycle: seal dir: %w", err)
+	}
+	checks := []string{checkCoverageComplete, checkPayloadReadback}
+	if st.snapKind == catalog.SnapshotKindTrim {
+		// §11.4: a trim's authoritative material is the removal plan;
+		// its readback is named on the receipt.
+		checks = append(checks, checkRemovalPlanReadback)
 	}
 	receipt := buildReceipt(
 		st.snapID, st.wsID, st.repoID, st.payload.BackendID,
 		st.manifestDigest, st.inventoryDigest, st.opID,
 		manifestScope(st), domain.FormatTime(c.now()),
-		[]string{checkCoverageComplete, checkPayloadReadback},
+		checks,
 	)
 	receiptBytes, err := writeJSONDoc(filepath.Join(st.sealDir, receiptName), receipt)
 	if err != nil {
@@ -568,7 +593,7 @@ func (c *Coordinator) sealPayload(ctx context.Context, st *captureState) error {
 				len(receiptBytes), digestBytes(receiptBytes), len(got), digestBytes(got))}}
 	}
 
-	// Commit the retained pair, then the SEALED phase.
+	// Commit the retained pair, then the seal-complete phase.
 	if _, err := c.cat.RecordSnapshot(catalog.Snapshot{
 		ID: st.snapID, WorkspaceID: st.wsID, CreatedAt: domain.FormatTime(c.now()),
 		PayloadBackendID: st.payload.BackendID, SealBackendID: S.BackendID,
@@ -580,7 +605,7 @@ func (c *Coordinator) sealPayload(ctx context.Context, st *captureState) error {
 	if err := c.cat.SetBackendRefs(st.opID, st.payload.BackendID, S.BackendID); err != nil {
 		return fmt.Errorf("lifecycle: record seal ref: %w", err)
 	}
-	if err := c.advance(st.opID, catalog.PhasePayloadCommitted, catalog.PhaseSealed, st.journal); err != nil {
+	if err := c.advance(st.opID, fromPhase, toPhase, st.journal); err != nil {
 		return err
 	}
 	st.journal.step("sealed", st.payload.BackendID+"/"+S.BackendID)
@@ -609,8 +634,12 @@ func (c *Coordinator) advance(opID domain.OperationID, from, to string, j *opJou
 
 // cleanupScratch removes the captured op/seal dirs and the journal after
 // the seal verified and the sequence completed (their content lives in
-// the retained snapshots; the live copies are redundant).
+// the retained snapshots; the live copies are redundant). The journal is
+// closed before its file is removed.
 func (c *Coordinator) cleanupScratch(st *captureState) {
+	if err := st.journal.close(); err != nil {
+		st.warnings = append(st.warnings, fmt.Sprintf("close journal failed: %v", err))
+	}
 	for _, p := range []string{st.opDir, st.sealDir} {
 		if err := removeEbbOwned(p); err != nil {
 			st.warnings = append(st.warnings, fmt.Sprintf("cleanup %s failed: %v", p, err))

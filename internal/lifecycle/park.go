@@ -11,6 +11,7 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"ebb/internal/catalog"
@@ -23,6 +24,9 @@ import (
 // pair stays pinned and whatever remains of the source stays on disk.
 func (c *Coordinator) Park(ctx context.Context, vault VaultRef, root string, opts CaptureOptions) (ParkResult, error) {
 	st, err := c.capture(ctx, vault, root, opts, catalog.OpKindPark, catalog.SnapshotKindPark)
+	if st != nil {
+		defer st.journal.close() // no sequence end may leave the file held open
+	}
 	if err != nil {
 		return ParkResult{}, err
 	}
@@ -81,9 +85,17 @@ func (c *Coordinator) revertQuarantine(st *captureState, quar string, cause erro
 }
 
 // removeQuarantinedRoot runs the removal walk (step 8) and the finish
-// (step 9). Shared by parkTail and ResumeRemoval (the permit machinery
-// is identical; resume skips entries a prior authorized walk removed).
+// (step 9). Shared by parkTail and Recover/ResumeRemoval (the permit
+// machinery is identical; resume skips entries a prior authorized walk
+// removed).
 func (c *Coordinator) removeQuarantinedRoot(ctx context.Context, st *captureState, quar string) (ParkResult, error) {
+	// Never begin destructive work under a canceled context (§12.2: the
+	// stopped-writers window must be the coordinator's own choice).
+	if err := ctx.Err(); err != nil {
+		err = fmt.Errorf("lifecycle: removal not started: %w", err)
+		c.failOperation(st.opID, catalog.PhaseQuarantined, err.Error())
+		return ParkResult{}, err
+	}
 	allowed := make(map[string]domain.Entry, len(st.entries))
 	for _, e := range st.entries {
 		allowed[e.Path] = e
@@ -96,26 +108,25 @@ func (c *Coordinator) removeQuarantinedRoot(ctx context.Context, st *captureStat
 	if err := c.advance(st.opID, catalog.PhaseQuarantined, catalog.PhaseRemoving, st.journal); err != nil {
 		return ParkResult{}, err
 	}
+	return c.finishParkRemoval(ctx, st, permit)
+}
+
+// finishParkRemoval runs the authorized walk from REMOVING through the
+// park completion. Shared by the park tail and resume (Recover/
+// ResumeRemoval), which enter with the journal already at REMOVING.
+func (c *Coordinator) finishParkRemoval(ctx context.Context, st *captureState, permit *removalPermit) (ParkResult, error) {
 	stats, err := permit.execute(ctx, c.probe, st.journal, func(removed int, last string) {
 		// Removal progress is journaled per entry by the permit; this
 		// callback marks the 256-entry cadence for observers.
 		st.journal.step("removal-progress", fmt.Sprintf("%d removed; last %s", removed, last))
 	})
 	if err != nil {
-		if berr := c.cat.AdvanceOperation(st.opID, catalog.PhaseRemoving, catalog.PhaseRemovalBlocked); berr == nil {
-			st.journal.step("phase:"+catalog.PhaseRemovalBlocked, err.Error())
-		}
-		c.failOperation(st.opID, catalog.PhaseRemovalBlocked, err.Error())
-		return ParkResult{}, err
+		return c.parkRemovalFailed(st, err)
 	}
 
 	// ---- §12.2 step 9: quarantine root gone; commit PARKED ----------
 	if err := permit.removeRoot(st.journal); err != nil {
-		if berr := c.cat.AdvanceOperation(st.opID, catalog.PhaseRemoving, catalog.PhaseRemovalBlocked); berr == nil {
-			st.journal.step("phase:"+catalog.PhaseRemovalBlocked, err.Error())
-		}
-		c.failOperation(st.opID, catalog.PhaseRemovalBlocked, err.Error())
-		return ParkResult{}, err
+		return c.parkRemovalFailed(st, err)
 	}
 	if err := c.advance(st.opID, catalog.PhaseRemoving, catalog.PhaseParked, st.journal); err != nil {
 		return ParkResult{}, err
@@ -127,6 +138,14 @@ func (c *Coordinator) removeQuarantinedRoot(ctx context.Context, st *captureStat
 	}); err != nil {
 		return ParkResult{}, fmt.Errorf("lifecycle: mark workspace parked: %w", err)
 	}
+	// PARKED is not in the catalog's terminal set, and ActiveOperations
+	// therefore still reports a parked-complete operation as active —
+	// which would block the workspace forever. The completed park's
+	// final step is the PARKED→DONE transition (workspace status, not
+	// the operation row, carries "this root is gone").
+	if err := c.advance(st.opID, catalog.PhaseParked, catalog.PhaseDone, st.journal); err != nil {
+		return ParkResult{}, err
+	}
 
 	observed := int64(0)
 	if st.beforeVolume != "" {
@@ -134,10 +153,28 @@ func (c *Coordinator) removeQuarantinedRoot(ctx context.Context, st *captureStat
 			observed = after.FreeToCaller - st.beforeFree
 		}
 	}
-	c.cleanupScratch(st)
 	st.journal.step("parked", fmt.Sprintf("removed=%d skipped-gone=%d freed~%d", stats.Removed, stats.SkippedGone, observed))
+	c.cleanupScratch(st)
 
 	return ParkResult{Snapshot: st.result(), VolumeDeltaObserved: observed, VolumeDeltaEstimated: st.expectedLogicalBytes()}, nil
+}
+
+// parkRemovalFailed records a stopped removal walk. A context cancellation
+// is an interruption, not a block: the journal keeps the last durable
+// phase REMOVING (§17.5 exit 130). Any other failure transitions to
+// REMOVAL_BLOCKED with the exact blocker recorded; whatever remains stays
+// and P/S stay pinned.
+func (c *Coordinator) parkRemovalFailed(st *captureState, err error) (ParkResult, error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		c.failOperation(st.opID, catalog.PhaseRemoving, err.Error())
+		st.journal.step("removal-interrupted", err.Error())
+		return ParkResult{}, err
+	}
+	if berr := c.cat.AdvanceOperation(st.opID, catalog.PhaseRemoving, catalog.PhaseRemovalBlocked); berr == nil {
+		st.journal.step("phase:"+catalog.PhaseRemovalBlocked, err.Error())
+	}
+	c.failOperation(st.opID, catalog.PhaseRemovalBlocked, err.Error())
+	return ParkResult{}, err
 }
 
 // revalidateSource compares a fresh scan (with hashing) of the live
