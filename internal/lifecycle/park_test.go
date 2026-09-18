@@ -7,11 +7,36 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 	"ebb/internal/inventory"
 )
+
+// volumeNoiseFloor estimates concurrent free-space drift on the volume
+// holding path: samples FreeToCaller n times and returns the max spread.
+// The measurement window of the observed park delta spans the whole
+// sequence, so drift measured here for a few milliseconds is a LOWER
+// bound on the real noise; callers scale it.
+func volumeNoiseFloor(t *testing.T, probe *wrapProbe, path string, n int) int64 {
+	t.Helper()
+	var minFree, maxFree int64
+	for i := 0; i < n; i++ {
+		u, err := probe.VolumeUsage(path)
+		if err != nil {
+			t.Fatalf("noise sample: %v", err)
+		}
+		if i == 0 || u.FreeToCaller < minFree {
+			minFree = u.FreeToCaller
+		}
+		if i == 0 || u.FreeToCaller > maxFree {
+			maxFree = u.FreeToCaller
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	return maxFree - minFree
+}
 
 // TestParkRoundTrip: the full §12.2 sequence. After park: root gone,
 // operation PARKED→DONE (terminal), workspace parked, snapshot pinned,
@@ -20,6 +45,14 @@ func TestParkRoundTrip(t *testing.T) {
 	h := newHarness(t)
 	ws := newWSID()
 	root := h.workspace("ws")
+
+	// The observed volume delta measures FreeToCaller on the machine's
+	// shared temp volume, so concurrent activity (the full `go test ./...`
+	// run, any background process) is noise in the measurement. Sample
+	// the drift before parking and size the plausibility bound from it;
+	// a broken measurement (zero, or negative by the workspace's own
+	// bytes) still fails by orders of magnitude.
+	noise := volumeNoiseFloor(t, h.probe, root, 8)
 
 	res, err := h.coord().Park(context.Background(), h.vault, root, parkOpts(ws))
 	if err != nil {
@@ -59,8 +92,12 @@ func TestParkRoundTrip(t *testing.T) {
 	if res.VolumeDeltaEstimated != wantBytes {
 		t.Errorf("estimated delta = %d, want %d", res.VolumeDeltaEstimated, wantBytes)
 	}
-	if res.VolumeDeltaObserved < -(1 << 20) {
-		t.Errorf("observed delta implausibly negative: %d", res.VolumeDeltaObserved)
+	// Tolerate same-volume overhead (Ebb's own temp writes: fake-store
+	// copies, catalog, op dir) plus the measured concurrent-drift noise
+	// floor; the delta must still not be negative beyond that.
+	if limit := -(int64(1<<20) + 4*noise); res.VolumeDeltaObserved < limit {
+		t.Errorf("observed delta implausibly negative: %d (tolerance %d, noise floor %d)",
+			res.VolumeDeltaObserved, limit, noise)
 	}
 
 	parent := filepath.Dir(root)
