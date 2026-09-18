@@ -43,7 +43,7 @@ func cmdRecover(args []string, streams Streams, deps Deps) int {
 	fs.SetOutput(streams.Err)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
 	resume := fs.Bool("resume-removal", false, "explicitly resume a blocked/interrupted removal walk")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderFlags(args)); err != nil {
 		return ExitUsage
 	}
 	if fs.NArg() != 1 {
@@ -60,9 +60,7 @@ func cmdRecover(args []string, streams Streams, deps Deps) int {
 	env := newEnvelope("recover", "error")
 	sess, err := openSession(deps)
 	if err != nil {
-		env.Errors = []string{err.Error()}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err), err.Error())
 	}
 	defer sess.close()
 	ctx, stop := commandContext(deps)
@@ -70,15 +68,13 @@ func cmdRecover(args []string, streams Streams, deps Deps) int {
 
 	probe := deps.NewProbe()
 	if probe == nil {
-		env.Errors = []string{fmt.Sprintf("platform probe %v", ErrNotIntegrated)}
-		emit(env, *jsonOut, streams, "")
-		return ExitUsage
+		return emitFailure(env, *jsonOut, streams, ExitUsage,
+			fmt.Sprintf("platform probe %v", ErrNotIntegrated))
 	}
 	coord, err := sess.newLifecycle(probe)
 	if err != nil {
-		env.Errors = []string{fmt.Sprintf("recover %s: %v", opArg, err)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
+			fmt.Sprintf("recover %s: %v", opArg, err))
 	}
 
 	var rep lifecycle.RecoveryReport
@@ -92,9 +88,8 @@ func cmdRecover(args []string, streams Streams, deps Deps) int {
 		return rErr
 	})
 	if cErr != nil {
-		env.Errors = []string{fmt.Sprintf("recover %s: %v", opArg, cErr)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(cErr)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(cErr),
+			fmt.Sprintf("recover %s: %s", opArg, codedWithSafeAction(cErr)))
 	}
 
 	details := recoverDetails{

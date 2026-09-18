@@ -83,11 +83,11 @@ func (s *session) registry() *vault.Registry {
 }
 
 // defaultVault returns the registry's default vault, or a §5.5-worded
-// vault blocker when none is registered.
+// vault blocker (exit 7) when none is registered.
 func (s *session) defaultVault() (*vault.Vault, error) {
 	v, err := s.registry().Default()
 	if err != nil {
-		return nil, blockedError(fmt.Errorf("%s: no default vault is registered in %s; capture, park, trim, open and recover all need one. Safe action: run `ebb init` to enroll a vault (source: %v)",
+		return nil, vaultError(fmt.Errorf("%s: no default vault is registered in %s; capture, park, trim, open and recover all need one. Safe action: run `ebb init` to enroll a vault (source: %v)",
 			CodeNoVault, s.cfgDir, err))
 	}
 	return v, nil
@@ -108,7 +108,7 @@ func (s *session) withVaultPassfile(ctx context.Context, fn func(repoDir, passfi
 	if err != nil {
 		var noSource *vault.NoSourceError
 		if errors.As(err, &noSource) {
-			return blockedError(fmt.Errorf("%s: vault %s (%s) could not be unlocked: %v. Safe action: set %s, store the password in the OS credential store via `ebb init`, or run in a terminal to be prompted",
+			return vaultError(fmt.Errorf("%s: vault %s (%s) could not be unlocked: %v. Safe action: set %s, store the password in the OS credential store via `ebb init`, or run in a terminal to be prompted",
 				CodeUnlockRejected, v.Name, v.ID, err, vault.EnvPassword))
 		}
 		return err

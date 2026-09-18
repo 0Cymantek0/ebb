@@ -78,7 +78,7 @@ func cmdSnapshot(args []string, streams Streams, deps Deps) int {
 	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
 	fs.SetOutput(streams.Err)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderFlags(args)); err != nil {
 		return ExitUsage
 	}
 	root := "."
@@ -93,18 +93,16 @@ func cmdSnapshot(args []string, streams Streams, deps Deps) int {
 	env := newEnvelope("snapshot", "error")
 	sess, disc, probe, opts, ctx, stop, err := openCaptureCommand(deps, streams, root)
 	if err != nil {
-		env.Errors = []string{fmt.Sprintf("snapshot %s: %v", root, err)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
+			fmt.Sprintf("snapshot %s: %v", root, err))
 	}
 	defer stop()
 	defer sess.close()
 
 	coord, err := sess.newLifecycle(probe)
 	if err != nil {
-		env.Errors = []string{fmt.Sprintf("snapshot %s: %v", root, err)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
+			fmt.Sprintf("snapshot %s: %v", root, err))
 	}
 
 	var res lifecycle.SnapshotResult
@@ -114,14 +112,13 @@ func cmdSnapshot(args []string, streams Streams, deps Deps) int {
 		return rErr
 	})
 	if cErr != nil {
-		env.Errors = []string{fmt.Sprintf("snapshot %s: %v", disc.Root, cErr)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(cErr)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(cErr),
+			fmt.Sprintf("snapshot %s: %s", disc.Root, codedWithSafeAction(cErr)))
 	}
 
 	details := snapshotDetailsFrom(opts.WorkspaceName, disc.Root, res)
 	env.Outcome = "ok"
-	env.WorkspaceID = string(opts.WorkspaceID)
+	env.WorkspaceID = string(sess.resolveWorkspaceID(opts.WorkspaceName, disc.Root))
 	env.SnapshotID = details.SnapshotID
 	env.Bytes = &BytesSummary{Preserved: res.PreservedBytes}
 	env.Details = details

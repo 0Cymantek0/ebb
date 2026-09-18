@@ -44,7 +44,7 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
 	groupsFlag := fs.String("groups", "", "comma-separated regenerate group ids to remove (declared by the Ebbfile; required)")
 	yes := fs.Bool("yes", false, "accept the removal confirmation without a prompt")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderFlags(args, "groups")); err != nil {
 		return ExitUsage
 	}
 	root := "."
@@ -58,9 +58,8 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 
 	env := newEnvelope("trim", "error")
 	if strings.TrimSpace(*groupsFlag) == "" {
-		env.Errors = []string{"--groups is required: the regenerate group ids to remove, e.g. --groups node-dependencies"}
-		emit(env, *jsonOut, streams, "")
-		return ExitUsage
+		return emitFailure(env, *jsonOut, streams, ExitUsage,
+			"--groups is required: the regenerate group ids to remove, e.g. --groups node-dependencies")
 	}
 	var groups []string
 	for _, g := range strings.Split(*groupsFlag, ",") {
@@ -72,9 +71,8 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 
 	sess, disc, probe, opts, ctx, stop, err := openCaptureCommand(deps, streams, root)
 	if err != nil {
-		env.Errors = []string{fmt.Sprintf("trim %s: %v", root, err)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
+			fmt.Sprintf("trim %s: %v", root, err))
 	}
 	defer stop()
 	defer sess.close()
@@ -91,11 +89,9 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 		}
 	}
 	if len(unknown) > 0 {
-		env.Errors = []string{fmt.Sprintf(
+		return emitFailure(env, *jsonOut, streams, ExitUsage, fmt.Sprintf(
 			"--groups names %s, which the policy does not declare; declared regenerate groups: %s (declare them in Ebbfile.toml before trimming)",
-			strings.Join(unknown, ", "), declaredGroupList(disc.Policy))}
-		emit(env, *jsonOut, streams, "")
-		return ExitUsage
+			strings.Join(unknown, ", "), declaredGroupList(disc.Policy)))
 	}
 
 	// ---- the v1 approval: the grouped confirmation --------------------
@@ -120,21 +116,17 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 		fmt.Fprint(&b, "Remove these groups? type 'yes': ")
 		fmt.Fprint(streams.Err, b.String())
 		if !confirmYes(deps, streams.Err, "") {
-			env.Errors = []string{fmt.Sprintf(
+			return emitFailure(env, *jsonOut, streams, ExitBlocked, fmt.Sprintf(
 				"%s [trim]: the removal confirmation was declined; nothing was removed. Safe action: review the listed outputs and rerun `ebb trim --groups %s`, or run with --yes after verifying the policy",
-				CodeWritersUnasserted, strings.Join(groups, ","))}
-			emit(env, *jsonOut, streams, "")
-			return ExitBlocked
+				CodeWritersUnasserted, strings.Join(groups, ",")))
 		}
 		for _, id := range groups {
 			approved[id] = true
 		}
 	} else {
-		env.Errors = []string{fmt.Sprintf(
+		return emitFailure(env, *jsonOut, streams, ExitBlocked, fmt.Sprintf(
 			"%s [trim]: stdin is not a terminal and --yes was not given, so the removal approval cannot be recorded. Safe action: rerun with --yes after verifying the policy declares exactly these groups: %s",
-			CodeWritersUnasserted, strings.Join(groups, ", "))}
-		emit(env, *jsonOut, streams, "")
-		return ExitBlocked
+			CodeWritersUnasserted, strings.Join(groups, ", ")))
 	}
 
 	opts.DoTrim = groups
@@ -150,9 +142,8 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 
 	coord, err := sess.newLifecycle(probe)
 	if err != nil {
-		env.Errors = []string{fmt.Sprintf("trim %s: %v", disc.Root, err)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
+			fmt.Sprintf("trim %s: %v", disc.Root, err))
 	}
 
 	var res lifecycle.TrimResult
@@ -162,9 +153,8 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 		return rErr
 	})
 	if cErr != nil {
-		env.Errors = []string{fmt.Sprintf("trim %s: %v", disc.Root, cErr)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(cErr)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(cErr),
+			fmt.Sprintf("trim %s: %s", disc.Root, codedWithSafeAction(cErr)))
 	}
 
 	details := trimDetails{
@@ -177,7 +167,7 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 	}
 	env.Outcome = "ok"
 	env.Phase = catalog.PhaseTrimDone
-	env.WorkspaceID = string(opts.WorkspaceID)
+	env.WorkspaceID = string(sess.resolveWorkspaceID(opts.WorkspaceName, disc.Root))
 	env.SnapshotID = details.SnapshotID
 	env.Conditions = []string{"trim-approval:" + strings.Join(groups, ",")}
 	env.Bytes = &BytesSummary{Preserved: res.Snapshot.PreservedBytes}

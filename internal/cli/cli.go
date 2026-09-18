@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	"ebb/internal/adapters/ecosystem"
 	"ebb/internal/catalog"
@@ -214,6 +215,46 @@ func Main(args []string, streams Streams, deps Deps) int {
 		usage(streams.Err)
 		return ExitUsage
 	}
+}
+
+// reorderFlags moves flag tokens (and the value of each name listed in
+// valueFlags) before the positional arguments, so the stdlib flag
+// package accepts the documented shapes `ebb open <name> --to <dir>`
+// and `ebb trim <path> --groups a,b` (stdlib parsing stops at the first
+// positional). Only the flags the command itself declares may be listed
+// in valueFlags; unknown tokens keep their position and fail normally
+// inside flag.Parse.
+func reorderFlags(args []string, valueFlags ...string) []string {
+	takesValue := func(tok string) bool {
+		name := tok
+		if eq := strings.IndexByte(tok, '='); eq >= 0 {
+			return false // --flag=value is self-contained
+		}
+		for _, vf := range valueFlags {
+			if name == "--"+vf || name == "-"+vf {
+				return true
+			}
+		}
+		return false
+	}
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			pos = append(pos, args[i:]...)
+			break
+		}
+		if strings.HasPrefix(a, "-") && a != "-" {
+			flags = append(flags, a)
+			if takesValue(a) && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		pos = append(pos, a)
+	}
+	return append(flags, pos...)
 }
 
 // usage prints the command summary (to stderr; it is human output).

@@ -92,6 +92,7 @@ func (e *cliError) Unwrap() error { return e.err }
 
 func usageError(err error) error   { return &cliError{code: ExitUsage, err: err} }
 func blockedError(err error) error { return &cliError{code: ExitBlocked, err: err} }
+func vaultError(err error) error   { return &cliError{code: ExitVault, err: err} }
 
 // discovery is everything the shared pipeline produced for one root.
 type discovery struct {

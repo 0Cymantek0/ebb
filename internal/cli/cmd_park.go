@@ -41,7 +41,7 @@ func cmdPark(args []string, streams Streams, deps Deps) int {
 	assertStopped := fs.Bool("assert-writers-stopped", false,
 		"assert all writers on the workspace are stopped (required for unattended park; recorded in the operation journal)")
 	yes := fs.Bool("yes", false, "accept ordinary prompts (NEVER supplies the writer assertion)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderFlags(args)); err != nil {
 		return ExitUsage
 	}
 	root := "."
@@ -57,9 +57,8 @@ func cmdPark(args []string, streams Streams, deps Deps) int {
 	env := newEnvelope("park", "error")
 	sess, disc, probe, opts, ctx, stop, err := openCaptureCommand(deps, streams, root)
 	if err != nil {
-		env.Errors = []string{fmt.Sprintf("park %s: %v", root, err)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
+			fmt.Sprintf("park %s: %v", root, err))
 	}
 	defer stop()
 	defer sess.close()
@@ -70,18 +69,16 @@ func cmdPark(args []string, streams Streams, deps Deps) int {
 	parkPrompt(deps, streams.Err, disc)
 	assertion, aerr := writerAssertion(deps, *assertStopped, streams.Err)
 	if aerr != nil {
-		env.Errors = []string{fmt.Sprintf("park %s: %v", disc.Root, aerr)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(aerr)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(aerr),
+			fmt.Sprintf("park %s: %v", disc.Root, aerr))
 	}
 	opts.Park = true
 	opts.WriterAssertion = assertion
 
 	coord, err := sess.newLifecycle(probe)
 	if err != nil {
-		env.Errors = []string{fmt.Sprintf("park %s: %v", disc.Root, err)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
+			fmt.Sprintf("park %s: %v", disc.Root, err))
 	}
 
 	var res lifecycle.ParkResult
@@ -91,9 +88,8 @@ func cmdPark(args []string, streams Streams, deps Deps) int {
 		return rErr
 	})
 	if cErr != nil {
-		env.Errors = []string{fmt.Sprintf("park %s: %v", disc.Root, cErr)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(cErr)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(cErr),
+			fmt.Sprintf("park %s: %s", disc.Root, codedWithSafeAction(cErr)))
 	}
 
 	details := parkDetails{
@@ -104,7 +100,7 @@ func cmdPark(args []string, streams Streams, deps Deps) int {
 	}
 	env.Outcome = "ok"
 	env.Phase = catalog.PhaseDone
-	env.WorkspaceID = string(opts.WorkspaceID)
+	env.WorkspaceID = string(sess.resolveWorkspaceID(opts.WorkspaceName, disc.Root))
 	env.SnapshotID = details.SnapshotID
 	env.Conditions = []string{"writer-assertion:" + assertion, "workspace-parked"}
 	env.Bytes = &BytesSummary{

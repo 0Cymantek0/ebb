@@ -182,3 +182,78 @@ func outcomeForExit(code int) string {
 		return fmt.Sprintf("exit-%d", code)
 	}
 }
+
+// codedMessage renders err prefixed with its stable EBB_E_ code when
+// the typed error exposes one (restore's errors implement Code();
+// lifecycle removal blockers already carry their code in the text).
+// This is the §5.5 "stable code" half of every human blocker.
+func codedMessage(err error) string {
+	var c interface{ Code() string }
+	if errors.As(err, &c) {
+		return c.Code() + ": " + err.Error()
+	}
+	return err.Error()
+}
+
+// safeActionFor appends the §5.5 safe action for the restore/lifecycle
+// typed blockers whose own text carries only code+reason ("" when the
+// error already includes one or none applies).
+func safeActionFor(err error) string {
+	var occupied *restore.ErrDestinationOccupied
+	if errors.As(err, &occupied) {
+		return ". Safe action: choose a different --to destination or move the occupant aside; nothing was overwritten"
+	}
+	var space *restore.ErrInsufficientSpace
+	if errors.As(err, &space) {
+		return ". Safe action: free space on the destination volume or choose another --to destination"
+	}
+	var notOpenable *restore.ErrNotOpenable
+	if errors.As(err, &notOpenable) {
+		return ". Safe action: pick a park- or snapshot-kind snapshot (see `ebb status`)"
+	}
+	var sealInvalid *restore.ErrSealInvalid
+	if errors.As(err, &sealInvalid) {
+		return ". Safe action: keep the snapshot pinned and inspect the vault (`ebb doctor`); nothing was staged"
+	}
+	var rver *restore.ErrVerification
+	if errors.As(err, &rver) {
+		return ". Safe action: keep the snapshot pinned and retry the open; staged content was discarded"
+	}
+	var publish *restore.ErrPublishBlocked
+	if errors.As(err, &publish) {
+		return ". Safe action: clear the destination, then `ebb recover <operation-id>` to reconcile the RESTORING operation"
+	}
+	var removal *lifecycle.ErrRemovalBlocked
+	if errors.As(err, &removal) {
+		return ". Safe action: resolve the blocker (close handles, fix permissions), then `ebb recover <operation-id> --resume-removal`"
+	}
+	var inProgress *lifecycle.ErrOpInProgress
+	if errors.As(err, &inProgress) {
+		return fmt.Sprintf(". Safe action: reconcile the active operation first: `ebb recover %s`", inProgress.Operations[0])
+	}
+	var sourceChanged *lifecycle.ErrSourceChanged
+	if errors.As(err, &sourceChanged) {
+		return ". Safe action: the sealed snapshot stays retained and the source is intact; resolve the change and run a fresh capture"
+	}
+	return ""
+}
+
+// codedWithSafeAction renders err as codedMessage plus its safe action.
+func codedWithSafeAction(err error) string {
+	msg := codedMessage(err)
+	if a := safeActionFor(err); a != "" {
+		return msg + a
+	}
+	return msg
+}
+
+// emitFailure stamps the §17.2 outcome for code, records the error
+// lines, emits the terminal envelope and returns the exit code. The
+// Wave E commands route every failure through it so the machine outcome
+// always matches the process exit.
+func emitFailure(env Envelope, jsonOut bool, streams Streams, code int, msgs ...string) int {
+	env.Outcome = outcomeForExit(code)
+	env.Errors = msgs
+	emit(env, jsonOut, streams, "")
+	return code
+}

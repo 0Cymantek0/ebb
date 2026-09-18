@@ -58,7 +58,7 @@ func cmdInit(args []string, streams Streams, deps Deps) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(streams.Err)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderFlags(args)); err != nil {
 		return ExitUsage
 	}
 	root := "."
@@ -73,9 +73,7 @@ func cmdInit(args []string, streams Streams, deps Deps) int {
 	env := newEnvelope("init", "error")
 	sess, err := openSession(deps)
 	if err != nil {
-		env.Errors = []string{err.Error()}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err), err.Error())
 	}
 	defer sess.close()
 	ctx, stop := commandContext(deps)
@@ -97,9 +95,7 @@ func cmdInit(args []string, streams Streams, deps Deps) int {
 		if uerr != nil || !ok {
 			msg := fmt.Sprintf("%s: default vault %s (%s) could not be unlocked: %v. Safe action: fix the credential source (%s env, OS credential store) or re-enroll in a terminal with `ebb init`",
 				CodeUnlockRejected, existing.Name, existing.ID, uerr, vault.EnvPassword)
-			env.Errors = []string{msg}
-			emit(env, *jsonOut, streams, "")
-			return ExitVault
+			return emitFailure(env, *jsonOut, streams, ExitVault, msg)
 		}
 		details.Vault = &initVault{ID: existing.ID, Name: existing.Name,
 			RepoDir: existing.RepoDir, RepoID: existing.RepoID, UnlockVerified: true}
@@ -108,17 +104,14 @@ func cmdInit(args []string, streams Streams, deps Deps) int {
 		if deps.StdinIsTerminal == nil || !deps.StdinIsTerminal() {
 			msg := fmt.Sprintf("%s: no vault is registered in %s and stdin is not a terminal, so interactive enrollment cannot run. Safe action: run `ebb init` in a terminal (or set %s for CI enrollment)",
 				CodeNoVault, sess.cfgDir, vault.EnvPassword)
-			env.Errors = []string{msg}
-			emit(env, *jsonOut, streams, "")
-			return ExitVault
+			return emitFailure(env, *jsonOut, streams, ExitVault, msg)
 		}
 		defaultRepo := filepath.Join(sess.cfgDir, "vault")
 		fmt.Fprintf(streams.Err, "no vault registered. vault repository directory (Enter for %s): ", defaultRepo)
 		line, rerr := deps.ReadLine()
 		if rerr != nil {
-			env.Errors = []string{fmt.Sprintf("reading repository directory: %v", rerr)}
-			emit(env, *jsonOut, streams, "")
-			return ExitUsage
+			return emitFailure(env, *jsonOut, streams, ExitUsage,
+				fmt.Sprintf("reading repository directory: %v", rerr))
 		}
 		repoDir := strings.TrimSpace(line)
 		if repoDir == "" {
@@ -126,17 +119,15 @@ func cmdInit(args []string, streams Streams, deps Deps) int {
 		}
 		v, eerr := vault.Enroll(ctx, sess.cfgDir, "main", repoDir, sess.store, streams.Err)
 		if eerr != nil {
-			env.Errors = []string{fmt.Sprintf("enroll vault at %s: %v", repoDir, eerr)}
-			emit(env, *jsonOut, streams, "")
-			return classifyExitCode(eerr)
+			return emitFailure(env, *jsonOut, streams, classifyExitCode(eerr),
+				fmt.Sprintf("enroll vault at %s: %v", repoDir, eerr))
 		}
 		details.Vault = &initVault{ID: v.ID, Name: v.Name, RepoDir: v.RepoDir,
 			RepoID: v.RepoID, Enrolled: true}
 
 	default:
-		env.Errors = []string{fmt.Sprintf("vault registry: %v", regErr)}
-		emit(env, *jsonOut, streams, "")
-		return ExitBlocked
+		return emitFailure(env, *jsonOut, streams, ExitBlocked,
+			fmt.Sprintf("vault registry: %v", regErr))
 	}
 
 	// ---- Ecosystem suggestions over the path ---------------------------
@@ -145,15 +136,13 @@ func cmdInit(args []string, streams Streams, deps Deps) int {
 		absRoot = filepath.Clean(root)
 	}
 	if deps.DetectEcosystem == nil {
-		env.Errors = []string{fmt.Sprintf("ecosystem detection %v", ErrNotIntegrated)}
-		emit(env, *jsonOut, streams, "")
-		return ExitUsage
+		return emitFailure(env, *jsonOut, streams, ExitUsage,
+			fmt.Sprintf("ecosystem detection %v", ErrNotIntegrated))
 	}
 	det, derr := deps.DetectEcosystem(absRoot)
 	if derr != nil {
-		env.Errors = []string{fmt.Sprintf("ecosystem detection over %s: %v", root, derr)}
-		emit(env, *jsonOut, streams, "")
-		return ExitBlocked
+		return emitFailure(env, *jsonOut, streams, ExitBlocked,
+			fmt.Sprintf("ecosystem detection over %s: %v", root, derr))
 	}
 	for _, g := range det.Suggestions {
 		details.Groups = append(details.Groups, initGroup{

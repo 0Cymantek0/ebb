@@ -60,7 +60,7 @@ func cmdStatus(args []string, streams Streams, deps Deps) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(streams.Err)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderFlags(args)); err != nil {
 		return ExitUsage
 	}
 	filter := ""
@@ -75,17 +75,14 @@ func cmdStatus(args []string, streams Streams, deps Deps) int {
 	env := newEnvelope("status", "error")
 	sess, err := openSession(deps)
 	if err != nil {
-		env.Errors = []string{err.Error()}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err), err.Error())
 	}
 	defer sess.close()
 
 	workspaces, lerr := sess.cat.ListWorkspaces()
 	if lerr != nil {
-		env.Errors = []string{fmt.Sprintf("status: %v", lerr)}
-		emit(env, *jsonOut, streams, "")
-		return ExitBlocked
+		return emitFailure(env, *jsonOut, streams, ExitBlocked,
+			fmt.Sprintf("status: %v", lerr))
 	}
 	matched := 0
 	details := statusDetails{Workspaces: []statusWorkspace{}}
@@ -122,9 +119,8 @@ func cmdStatus(args []string, streams Streams, deps Deps) int {
 		details.Workspaces = append(details.Workspaces, sw)
 	}
 	if filter != "" && matched == 0 {
-		env.Errors = []string{fmt.Sprintf("status: no workspace named %q is recorded; run `ebb status` without a filter to list all", filter)}
-		emit(env, *jsonOut, streams, "")
-		return ExitUsage
+		return emitFailure(env, *jsonOut, streams, ExitUsage,
+			fmt.Sprintf("status: no workspace named %q is recorded; run `ebb status` without a filter to list all", filter))
 	}
 
 	env.Outcome = "ok"

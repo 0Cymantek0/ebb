@@ -55,7 +55,7 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 	fs.SetOutput(streams.Err)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
 	to := fs.String("to", "", "destination directory (default: the workspace's recorded original root)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderFlags(args, "to")); err != nil {
 		return ExitUsage
 	}
 	if fs.NArg() != 1 {
@@ -67,9 +67,7 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 	env := newEnvelope("open", "error")
 	sess, err := openSession(deps)
 	if err != nil {
-		env.Errors = []string{err.Error()}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err), err.Error())
 	}
 	defer sess.close()
 	ctx, stop := commandContext(deps)
@@ -78,39 +76,33 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 	// ---- resolve the target to one sealed snapshot ---------------------
 	snapID, wsRow, rerr := resolveOpenTarget(sess, target)
 	if rerr != nil {
-		env.Errors = []string{fmt.Sprintf("open %s: %v", target, rerr)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(rerr)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(rerr),
+			fmt.Sprintf("open %s: %v", target, rerr))
 	}
 
 	// ---- destination: --to, else the recorded root ---------------------
 	dest := strings.TrimSpace(*to)
 	if dest == "" {
 		if wsRow.RootPath == "" {
-			env.Errors = []string{fmt.Sprintf(
+			return emitFailure(env, *jsonOut, streams, ExitUsage, fmt.Sprintf(
 				"%s: workspace %q has no recorded root path (parked or unbound) and --to was not given. Safe action: pass --to <dir> with the destination directory",
-				CodeOpenNoDestination, wsRow.Name)}
-			emit(env, *jsonOut, streams, "")
-			return ExitUsage
+				CodeOpenNoDestination, wsRow.Name))
 		}
 		dest = wsRow.RootPath
 	}
 	absDest, aerr := filepath.Abs(dest)
 	if aerr != nil {
-		env.Errors = []string{fmt.Sprintf("--to %s: %v", dest, aerr)}
-		emit(env, *jsonOut, streams, "")
-		return ExitUsage
+		return emitFailure(env, *jsonOut, streams, ExitUsage,
+			fmt.Sprintf("--to %s: %v", dest, aerr))
 	}
 
 	if deps.NewRestoreOp == nil {
-		env.Errors = []string{fmt.Sprintf("restore opener %v", ErrNotIntegrated)}
-		emit(env, *jsonOut, streams, "")
-		return ExitUsage
+		return emitFailure(env, *jsonOut, streams, ExitUsage,
+			fmt.Sprintf("restore opener %v", ErrNotIntegrated))
 	}
 	if deps.NewProbe == nil {
-		env.Errors = []string{fmt.Sprintf("platform probe %v", ErrNotIntegrated)}
-		emit(env, *jsonOut, streams, "")
-		return ExitUsage
+		return emitFailure(env, *jsonOut, streams, ExitUsage,
+			fmt.Sprintf("platform probe %v", ErrNotIntegrated))
 	}
 	opener, err := deps.NewRestoreOp(restore.Dependencies{
 		Store: sess.store,
@@ -118,9 +110,8 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 		Probe: deps.NewProbe(),
 	})
 	if err != nil {
-		env.Errors = []string{fmt.Sprintf("open %s: %v", target, err)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(err)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
+			fmt.Sprintf("open %s: %v", target, err))
 	}
 
 	var res restore.Result
@@ -131,9 +122,8 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 		return rErr
 	})
 	if cErr != nil {
-		env.Errors = []string{fmt.Sprintf("open %s: %v", target, cErr)}
-		emit(env, *jsonOut, streams, "")
-		return classifyExitCode(cErr)
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(cErr),
+			fmt.Sprintf("open %s: %s", target, codedWithSafeAction(cErr)))
 	}
 
 	snap, _ := sess.cat.GetSnapshot(snapID)
