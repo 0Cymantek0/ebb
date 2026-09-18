@@ -196,6 +196,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdSnapshot(args[1:], streams, deps)
 	case "park":
 		return cmdPark(args[1:], streams, deps)
+	case "trim":
+		return cmdTrim(args[1:], streams, deps)
 	case "doctor":
 		return cmdDoctor(args[1:], streams)
 	case "help", "-h", "--help":
