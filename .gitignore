@@ -10,3 +10,6 @@ graphify-out/cache/
 *.test
 *.out
 /dist/
+
+# probe scratch (regenerable fixtures)
+lab/git-probe/scratch/
