@@ -8,6 +8,14 @@
 // actions). The recorded decision becomes the lifecycle
 // ApprovalReady callback.
 //
+// §17.3 requires the same stopped-writer discipline park uses ("an
+// active process using that group requires the same stopped-writer
+// discipline"), so trim carries the §17.2 flag as a passthrough:
+// --assert-writers-stopped records "flag:--assert-writers-stopped" as
+// the trim manifest's consistency source when supplied; without it the
+// manifest honestly records best-effort-live. --yes NEVER supplies the
+// assertion (it acknowledges the group approval only).
+//
 // Exit contract: 0 trimmed; 2 usage (missing --groups, groups not
 // declared by the policy, bad Ebbfile); 3 blocked (group not applicable
 // for removal, scan blockers inside outputs, declined confirmation); 4
@@ -43,7 +51,9 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 	fs.SetOutput(streams.Err)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
 	groupsFlag := fs.String("groups", "", "comma-separated regenerate group ids to remove (declared by the Ebbfile; required)")
-	yes := fs.Bool("yes", false, "accept the removal confirmation without a prompt")
+	yes := fs.Bool("yes", false, "accept the removal confirmation without a prompt (NEVER supplies the writer assertion)")
+	assertStopped := fs.Bool("assert-writers-stopped", false,
+		"assert all writers of the trimmed groups are stopped (Foundation §17.3 via §17.2; recorded in the trim manifest's consistency source)")
 	if err := fs.Parse(reorderFlags(args, "groups")); err != nil {
 		return ExitUsage
 	}
@@ -117,6 +127,13 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 	}
 
 	opts.DoTrim = groups
+	// §17.2/§17.3 writer-assertion passthrough: recorded truthfully in
+	// the trim manifest's consistency source when the explicit flag is
+	// supplied; never sourced from --yes (group approval is not a writer
+	// assertion), and omitted (best-effort-live) otherwise.
+	if *assertStopped {
+		opts.WriterAssertion = assertionFlagSource
+	}
 	// ApprovalReady is the recorded decision: the confirmed group set.
 	// A group outside it is refused (defense in depth — lifecycle also
 	// validates the policy and the resolved applicability).
@@ -157,6 +174,9 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 	env.WorkspaceID = string(sess.resolveWorkspaceID(opts.WorkspaceName, disc.Root))
 	env.SnapshotID = details.SnapshotID
 	env.Conditions = []string{"trim-approval:" + strings.Join(groups, ",")}
+	if opts.WriterAssertion != "" {
+		env.Conditions = append(env.Conditions, "writer-assertion:"+opts.WriterAssertion)
+	}
 	env.Bytes = &BytesSummary{Preserved: res.Snapshot.PreservedBytes}
 	env.Details = details
 	env.Warnings = append(env.Warnings, res.Snapshot.Warnings...)

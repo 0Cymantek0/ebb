@@ -83,8 +83,15 @@ func (c *Coordinator) Recover(ctx context.Context, vault VaultRef, opID domain.O
 	case catalog.PhaseSealed:
 		return c.recoverSealed(ctx, vault, op, rep)
 
-	case catalog.PhaseQuarantined, catalog.PhaseRemoving, catalog.PhaseRemovalBlocked:
+	case catalog.PhaseQuarantined, catalog.PhaseRemoving:
 		return c.resumeParkRemoval(ctx, vault, op, rep)
+
+	case catalog.PhaseRemovalBlocked:
+		// Writer-condition discipline (Wave F review F7): plain Recover
+		// is REPORT-ONLY for a blocked removal walk — resuming re-opens
+		// the §12.3 digest->remove race window, so it belongs to the
+		// explicit verb (ResumeRemoval / --resume-removal).
+		return c.reportRemovalBlocked(op, rep)
 
 	case catalog.PhaseParked:
 		// Nonterminal legacy rows (pre-PARKED→DONE completions): the
@@ -139,6 +146,70 @@ func (c *Coordinator) ResumeRemoval(ctx context.Context, vault VaultRef, opID do
 		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
 			"operation %s is %s; ResumeRemoval applies to QUARANTINED/REMOVING/REMOVAL_BLOCKED (park) or TRIM_SEALING (trim)", opID, op.Phase)}
 	}
+}
+
+// CancelOperation is the explicit verb for abandoning an interrupted
+// operation WITHOUT performing its remaining reconciliation (Wave F
+// review F5: without it, a SEALED operation whose root is intact and
+// present permanently blocks its workspace — Recover is report-only
+// there by design, and a rerun hits the single-active-operation lock).
+// It applies only to phases where Ebb removal never started (PLANNED,
+// CAPTURING, PAYLOAD_COMMITTED, SEALED, TRIM_PLANNED); a mid-removal
+// operation (QUARANTINED/REMOVING/REMOVAL_BLOCKED/TRIM_SEALING) must be
+// reconciled (Recover/ResumeRemoval), never abandoned mid-walk.
+//
+// Cancel never releases recovery obligations (I07): a sealed P/S pair
+// stays pinned — deliberate release is `ebb forget`, never cancel.
+func (c *Coordinator) CancelOperation(ctx context.Context, vault VaultRef, opID domain.OperationID) (RecoveryReport, error) {
+	if err := ctx.Err(); err != nil {
+		return RecoveryReport{}, err
+	}
+	op, err := c.cat.GetOperation(opID)
+	if err != nil {
+		return RecoveryReport{}, fmt.Errorf("lifecycle: cancel: %w", err)
+	}
+	rep := RecoveryReport{
+		OperationID: op.ID, WorkspaceID: op.WorkspaceID,
+		Kind: op.Kind, PhaseBefore: op.Phase,
+	}
+	rep.PhaseAfter = op.Phase
+	switch op.Phase {
+	case catalog.PhasePlanned, catalog.PhaseCapturing, catalog.PhasePayloadCommitted, catalog.PhaseTrimPlanned:
+		// Pre-seal territory: the existing cancel path (records any
+		// recorded payload as an unsealed, pinned snapshot per §11.3).
+		return c.recoverCancelCapture(ctx, vault, op, rep)
+	case catalog.PhaseSealed:
+		return c.cancelSealed(op, rep)
+	default:
+		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+			"operation %s is %s; cancel applies to phases before removal starts (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED) — mid-removal phases require reconciliation (Recover/ResumeRemoval)", opID, op.Phase)}
+	}
+}
+
+// cancelSealed abandons a SEALED operation with its live root intact:
+// the retained P/S pair was already committed to the catalog at seal
+// time and stays pinned untouched (no second, unsealed row is recorded
+// for it); the Ebb-owned local scratch (op/seal dirs, journal) is
+// cleaned because its content lives in the retained snapshots.
+func (c *Coordinator) cancelSealed(op catalog.Operation, rep RecoveryReport) (RecoveryReport, error) {
+	if err := c.cat.AdvanceOperation(op.ID, catalog.PhaseSealed, catalog.PhaseCanceled); err != nil {
+		return rep, fmt.Errorf("lifecycle: cancel %s: %w", op.ID, err)
+	}
+	rep.PhaseAfter = catalog.PhaseCanceled
+	rep.Actions = append(rep.Actions, "canceled the sealed operation (live root intact; removal never started)")
+	rep.Actions = append(rep.Actions, "retained P/S pair stays pinned (I07 — deliberate release is `ebb forget`, never cancel)")
+	rep.Remaining = append(rep.Remaining, fmt.Sprintf(
+		"sealed pair (payload %s) remains retained and pinned; end it deliberately with ebb forget when no longer needed", op.PayloadSnap))
+	parent := filepath.Dir(filepath.Clean(op.SourceRoot))
+	if err := removeEbbOwned(filepath.Join(parent, opDirName(op.ID))); err != nil {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("cleanup op dir failed: %v", err))
+	}
+	if err := removeEbbOwned(filepath.Join(parent, sealDirName(op.ID))); err != nil {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("cleanup seal dir failed: %v", err))
+	}
+	_ = removeEbbOwned(journalPath(parent, op.ID))
+	rep.NextAction = "operation canceled; the workspace accepts new operations (rerun the original command for a fresh capture)"
+	return rep, nil
 }
 
 // ---- shared evidence loaders -----------------------------------------
@@ -477,6 +548,18 @@ func (c *Coordinator) recoverPayloadCommitted(ctx context.Context, vault VaultRe
 // sealed inventory and report. Recovery never auto-continues into
 // removal (§12.4: a changed source invalidates removal; an unchanged one
 // still requires a deliberate act).
+//
+// Crash-window reconciliation (Wave F review F5): §12.2 step 7 renames
+// the owned root to the quarantine sibling BEFORE the SEALED→QUARANTINED
+// CAS commits. A crash between the two leaves phase SEALED with the live
+// root ABSENT and the sibling present — previously reported as "source
+// changed", leaving an unreconcilable operation that blocked the
+// workspace forever. When the root is absent, the deterministic sibling
+// (the same quarantinePath construction park uses) is probed FIRST: a
+// sibling carrying the operation's recorded root identity IS the durable
+// rename intent, so SEALED→QUARANTINED is committed and the existing
+// QUARANTINED reconciliation governs. A sibling with the wrong identity
+// (or an unreadable one) is reported and never adopted (I13).
 func (c *Coordinator) recoverSealed(ctx context.Context, vault VaultRef, op catalog.Operation, rep RecoveryReport) (RecoveryReport, error) {
 	ev, err := c.loadPayloadEvidence(ctx, vault, op)
 	if err != nil {
@@ -486,6 +569,52 @@ func (c *Coordinator) recoverSealed(ctx context.Context, vault VaultRef, op cata
 	if perr != nil {
 		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf("operation %s: %v", op.ID, perr)}
 	}
+
+	// ---- F5: the quarantine-rename crash window ----------------------
+	parent := filepath.Dir(filepath.Clean(op.SourceRoot))
+	quar := quarantinePath(parent, op.ID)
+	_, rootStatErr := os.Lstat(op.SourceRoot)
+	if rootStatErr != nil && !os.IsNotExist(rootStatErr) {
+		return rep, fmt.Errorf("lifecycle: probe source root %s: %w", op.SourceRoot, rootStatErr)
+	}
+	rootPresent := rootStatErr == nil
+	siblingPresent := false
+	if !rootPresent {
+		qinfo, qerr := os.Lstat(quar)
+		switch {
+		case qerr != nil && os.IsNotExist(qerr):
+			// No sibling: the root disappeared without Ebb's rename —
+			// the source-changed report below governs (unchanged).
+		case qerr != nil:
+			return rep, fmt.Errorf("lifecycle: probe quarantine sibling %s: %w", quar, qerr)
+		case !qinfo.IsDir():
+			return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+				"quarantine sibling %s exists but is not a directory; refusing to touch it — inspect manually", quar)}
+		default:
+			siblingPresent = true
+			qid, ierr := c.probe.RootIdentity(quar)
+			if ierr != nil {
+				return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+					"quarantine sibling %s is unreadable (%v); refusing to touch it — inspect manually", quar, ierr)}
+			}
+			if qid != ident {
+				return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+					"quarantine sibling %s identity %s does not match the recorded source identity %s; refusing to adopt it (I13) — inspect manually", quar, qid, op.SourceIdentity)}
+			}
+			// The rename intent was durable (park.go performed step 7's
+			// rename before the CAS); commit it and let the QUARANTINED
+			// reconciliation govern (reconfirm → resume removal).
+			if aerr := c.advance(op.ID, catalog.PhaseSealed, catalog.PhaseQuarantined, nil); aerr != nil {
+				return rep, aerr
+			}
+			rep.PhaseAfter = catalog.PhaseQuarantined
+			rep.Actions = append(rep.Actions, fmt.Sprintf(
+				"detected the crash window between the quarantine rename and its journal commit: %s carries the sealed root identity; committed SEALED -> QUARANTINED", quar))
+			op.Phase = catalog.PhaseQuarantined
+			return c.resumeParkRemoval(ctx, vault, op, rep)
+		}
+	}
+
 	if err := c.revalidateSource(ctx, op.SourceRoot, ident, ev.entries, nil); err != nil {
 		var sc *ErrSourceChanged
 		if errors.As(err, &sc) {
@@ -495,12 +624,17 @@ func (c *Coordinator) recoverSealed(ctx context.Context, vault VaultRef, op cata
 			rep.Warnings = append(rep.Warnings, fmt.Sprintf("revalidation failed: %v", err))
 		}
 		rep.Remaining = append(rep.Remaining, "sealed P/S pair remains pinned; the live root is intact")
-		rep.NextAction = "resolve the source change, then rerun the command for a fresh capture"
+		rep.NextAction = "resolve the source change, then cancel this operation (`ebb recover <op> --cancel`) and rerun the command for a fresh capture"
 		return rep, nil
 	}
 	rep.Actions = append(rep.Actions, "revalidated the live source against the sealed inventory: exact match")
-	rep.Remaining = append(rep.Remaining, "removal was never started (no quarantine exists)")
-	rep.NextAction = "removal is not assumed authorized by recovery: rerun the command, which will re-capture and re-seal before removing"
+	if siblingPresent {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+			"both the live root %s and a quarantine sibling %s exist while the journal says SEALED; durable state diverged — inspect manually", op.SourceRoot, quar))
+	} else {
+		rep.Remaining = append(rep.Remaining, "removal was never started (no quarantine exists)")
+	}
+	rep.NextAction = "removal is not assumed authorized by recovery: cancel this operation to unblock the workspace (`ebb recover <op> --cancel`), then rerun the command for a fresh capture; the retained pair stays pinned"
 	return rep, nil
 }
 
@@ -580,6 +714,10 @@ func (c *Coordinator) resumeParkRemoval(ctx context.Context, vault VaultRef, op 
 	}
 	defer st.journal.close()
 	st.rootIdent = ident
+
+	// F7: record the writer-assertion source of this destructive resume
+	// (both Recover's idempotent completions and the explicit verb).
+	c.recordResumeAssertion(op, st.journal)
 
 	if op.Phase == catalog.PhaseQuarantined {
 		_, perr := c.removeQuarantinedRoot(ctx, st, quar)
@@ -680,6 +818,9 @@ func (c *Coordinator) resumeTrimRemoval(ctx context.Context, vault VaultRef, op 
 	st.rootIdent = ident
 	j := st.journal
 
+	// F7: record the writer-assertion source of this destructive resume.
+	c.recordResumeAssertion(op, j)
+
 	permit, err := newRemovalPermit(op.ID, domain.SnapshotID(ev.manifest.SnapshotID), op.SourceRoot, ident, allowed)
 	if err != nil {
 		return rep, err
@@ -707,6 +848,40 @@ func (c *Coordinator) resumeTrimRemoval(ctx context.Context, vault VaultRef, op 
 	c.cleanupScratch(st)
 	rep.NextAction = "trim complete; the workspace remains live"
 	return rep, nil
+}
+
+// reportRemovalBlocked (Wave F review F7): plain Recover is REPORT-ONLY
+// for a REMOVAL_BLOCKED park — the §12.4 REMOVAL_BLOCKED row says
+// "report exact location; never mark parked", and resuming the walk
+// re-opens the §12.3 digest->remove race window, so the destructive
+// resume belongs to the explicit verb (ResumeRemoval /
+// `ebb recover <op> --resume-removal`) after the user resolved the
+// blocker and re-established the stopped-writers condition.
+func (c *Coordinator) reportRemovalBlocked(op catalog.Operation, rep RecoveryReport) (RecoveryReport, error) {
+	rep.Actions = append(rep.Actions, "reported the blocked removal walk (report-only; the destructive resume requires the explicit verb)")
+	if op.LastError != "" {
+		rep.Remaining = append(rep.Remaining, "blocker: "+op.LastError)
+	}
+	rep.Remaining = append(rep.Remaining,
+		"remaining authorized entries stay retained in the quarantine; the P/S pair stays pinned")
+	rep.NextAction = fmt.Sprintf(
+		"resolve the blocker (e.g. close open handles), then resume with `ebb recover %s --resume-removal` after re-establishing the stopped-writers condition", op.ID)
+	return rep, nil
+}
+
+// recordResumeAssertion durably names the writer-assertion source of a
+// destructive resume (Wave F review F7, §12.4 QUARANTINED row: "reconfirm
+// identities and writer condition"). A resumed walk re-enters the §12.3
+// digest->remove window under the coordinator's own authority, so the
+// journal records where the stopped-writers condition now comes from:
+// "resume:<phase>", the interrupted phase the walk resumed from. No new
+// tables — the note rides the progress journal and the operation row's
+// last_error/updated_at fields (best effort; the catalog phase remains
+// the authority).
+func (c *Coordinator) recordResumeAssertion(op catalog.Operation, j *opJournal) {
+	const note = "writer assertion source: resume:"
+	j.step("writer-assertion", note+op.Phase)
+	_ = c.cat.FailOperation(op.ID, op.Phase, note+op.Phase)
 }
 
 // resumeRemovalFailed folds a failed resume attempt into a report.

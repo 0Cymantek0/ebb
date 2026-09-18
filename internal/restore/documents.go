@@ -292,6 +292,30 @@ func (o *Opener) loadSeal(ctx context.Context, vault VaultRef, snapID domain.Sna
 	if receipt.ManifestDigest == "" || receipt.InventoryDigest == "" {
 		problems = append(problems, "receipt carries an empty manifest/inventory digest; documents cannot be verified (I12)")
 	}
+	// Security (Wave F review F4, D017's witness-binding principle): the
+	// receipt, the manifest and the inventory all come from the SAME
+	// vault, so their mutual agreement proves nothing against an attacker
+	// who can write the vault (a shared/synced-vault peer with the
+	// password — Foundation §13's threat space). The catalog row's
+	// seal-time digests are the independent witness: they were written
+	// by the local seal path and cannot be rewritten with vault access
+	// alone. A row without seal-time digests (legacy/pre-repair catalog)
+	// cannot witness anything and refuses — the same posture D017
+	// applies to lifecycle's retained-document re-reads.
+	if snap.ManifestDigest == "" || snap.InventoryDigest == "" {
+		problems = append(problems, "catalog snapshot row carries no seal-time manifest/inventory digests (legacy row); the seal cannot be witnessed (D017)")
+	} else {
+		if receipt.ManifestDigest != snap.ManifestDigest {
+			problems = append(problems, fmt.Sprintf(
+				"receipt manifest_digest %s differs from the catalog's seal-time record %s — vault tampering suspected (D017)",
+				receipt.ManifestDigest, snap.ManifestDigest))
+		}
+		if receipt.InventoryDigest != snap.InventoryDigest {
+			problems = append(problems, fmt.Sprintf(
+				"receipt inventory_digest %s differs from the catalog's seal-time record %s — vault tampering suspected (D017)",
+				receipt.InventoryDigest, snap.InventoryDigest))
+		}
+	}
 	if len(problems) > 0 {
 		return receiptDoc{}, &ErrSealInvalid{Details: problems}
 	}

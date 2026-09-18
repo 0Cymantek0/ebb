@@ -331,12 +331,13 @@ func TestPoCAncestorWalkFollowsJunction(t *testing.T) {
 
 // ---- F5 -----------------------------------------------------------------
 
-// TestPoCSealedQuarantineCrashWindow: durable state SEALED + quarantine
-// present + root absent (crash between the quarantine rename and the
-// QUARANTINED CAS commit — reproduced by driving capture() and performing
-// only the rename). Recover reports "source changed", leaves the operation
-// SEALED, never considers its own quarantine sibling, and the workspace
-// stays locked against every future park.
+// TestPoCSealedQuarantineCrashWindow (FIXED, regression form): durable
+// state SEALED + quarantine present + root absent (crash between the
+// quarantine rename and the QUARANTINED CAS commit — reproduced by
+// driving capture() and performing only the rename). Recover must probe
+// its own quarantine sibling, verify its identity, commit SEALED ->
+// QUARANTINED and reconcile the walk to completion — the workspace is
+// never left locked by a dead operation.
 func TestPoCSealedQuarantineCrashWindow(t *testing.T) {
 	h := newHarness(t)
 	root := h.workspace("ws")
@@ -361,44 +362,35 @@ func TestPoCSealedQuarantineCrashWindow(t *testing.T) {
 	if rerr != nil {
 		t.Fatalf("Recover errored: %v", rerr)
 	}
-	if rep.PhaseAfter != catalog.PhaseSealed {
-		t.Fatalf("phase after recover = %s, want SEALED (report-only)", rep.PhaseAfter)
+	if rep.PhaseAfter != catalog.PhaseDone {
+		t.Fatalf("F5 REGRESSION: phase after recover = %s, want DONE (the crash window must reconcile; report %+v)", rep.PhaseAfter, rep)
 	}
 	foundQuarantine := false
 	for _, a := range rep.Actions {
-		if strings.Contains(a, "quarantine") {
+		if strings.Contains(a, quarantinePrefix) {
 			foundQuarantine = true
 		}
 	}
-	if foundQuarantine {
-		t.Fatalf("unexpected: recover noticed the quarantine")
+	if !foundQuarantine {
+		t.Fatalf("F5 REGRESSION: recover never mentions the quarantine sibling:\n%v", rep.Actions)
 	}
-	if !strings.Contains(strings.Join(rep.Remaining, " "), "source") {
-		t.Logf("remaining: %v", rep.Remaining)
+	mustLstatErrNotExist(t, quar)
+	mustLstatErrNotExist(t, root)
+	if got := h.phaseOf(t, st.opID); got != catalog.PhaseDone {
+		t.Fatalf("F5 REGRESSION: op phase = %s, want DONE", got)
 	}
-
-	// Even after the user manually restores the original name, the SEALED
-	// operation permanently blocks the workspace (F37 single-op lock).
-	if err := os.Rename(quar, root); err != nil {
-		t.Fatal(err)
+	// The workspace is unlocked: the dead operation no longer blocks it.
+	if n := activeCount(t, h.coord(), ws); n != 0 {
+		t.Fatalf("F5 REGRESSION: workspace still carries %d active operation(s) after reconciliation", n)
 	}
-	if _, perr := h.coord().Park(context.Background(), h.vault, root, parkOpts(ws)); perr == nil {
-		t.Fatal("re-park unexpectedly succeeded")
-	} else {
-		var inProgress *ErrOpInProgress
-		if !errors.As(perr, &inProgress) {
-			t.Fatalf("re-park failed with %v, want ErrOpInProgress", perr)
-		}
-	}
-	t.Errorf("F5 CONFIRMED: SEALED+quarantine crash window is unreconcilable — Recover never inspects the quarantine sibling and the workspace is locked by the dead operation until manual catalog surgery")
 }
 
 // ---- F6 (Windows: junction) ----------------------------------------------
 
-// TestPoCPreflightJunctionAliasMissesVaultOverlap: a workspace root that
-// lives INSIDE the vault repository is blocked when spelled directly, but
-// passes preflight when spelled through a junction alias — the lexical
-// comparison never resolves the alias (I06).
+// TestPoCPreflightJunctionAliasMissesVaultOverlap (FIXED, regression
+// form): a workspace root that lives INSIDE the vault repository must be
+// refused in BOTH the direct spelling and a junction-alias spelling —
+// preflight canonicalizes both sides and checks both directions (I06).
 func TestPoCPreflightJunctionAliasMissesVaultOverlap(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("junction fixture is windows-only")
@@ -414,22 +406,25 @@ func TestPoCPreflightJunctionAliasMissesVaultOverlap(t *testing.T) {
 	}
 	ref := VaultRef{RepoDir: vaultDir, Passfile: filepath.Join(base, "pass")}
 
-	// Root-inside-vault: preflight checks only the OTHER direction
-	// (vault inside root), so even the DIRECT spelling passes.
-	if err := preflight(ws, ref); err != nil {
-		t.Fatalf("direct spelling of a root inside the vault was blocked: %v (unexpected — the gap is narrower than thought)", err)
+	// Root-inside-vault, direct spelling: refused.
+	if err := preflight(ws, ref); err == nil {
+		t.Fatalf("F6 REGRESSION: the direct spelling of a root inside the vault passed preflight")
+	} else {
+		var blocked *ErrDestructiveBlocked
+		if !errors.As(err, &blocked) {
+			t.Fatalf("refusal is not ErrDestructiveBlocked: %v", err)
+		}
 	}
-	t.Logf("direct spelling %s INSIDE the vault repository passed preflight (only vault-inside-root is checked)", ws)
 
-	// Alias spelling: junction base/link -> base/vault, root via the link.
+	// Alias spelling: junction base/link -> base/vault, root via the
+	// link: refused (canonicalPath resolves the junction).
 	link := filepath.Join(base, "link")
 	if out, jerr := exec.Command("cmd", "/c", "mklink", "/J", link, vaultDir).CombinedOutput(); jerr != nil {
 		t.Fatalf("mklink /J: %v\n%s", jerr, out)
 	}
-	if err := preflight(filepath.Join(link, "ws"), ref); err != nil {
-		t.Fatalf("alias spelling was blocked: %v (unexpected — gap closed?)", err)
+	if err := preflight(filepath.Join(link, "ws"), ref); err == nil {
+		t.Fatalf("F6 REGRESSION: the junction-alias spelling of a root inside the vault passed preflight (I06: aliases must not go unnoticed)")
 	}
-	t.Errorf("F6 CONFIRMED: preflight accepted a workspace root that lives INSIDE the vault repository, in both the direct spelling and a junction-alias spelling — the overlap check covers only vault-inside-root and is lexical (I06: aliases go unnoticed)")
 }
 
 // ---- helpers -------------------------------------------------------------

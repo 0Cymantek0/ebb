@@ -1,16 +1,34 @@
-// cmdRecover implements `ebb recover <operation-id> [--resume-removal]`
-// (Foundation §12.4, §17.1): reconcile an interrupted operation from
-// durable evidence. Recover performs only the safe reconciliation per
-// the §12.4 table and never auto-continues from SEALED into removal;
-// --resume-removal is the explicit verb for a blocked/interrupted
-// removal walk (REMOVAL_BLOCKED / REMOVING / QUARANTINED park, or a
-// TRIM_SEALING trim).
+// cmdRecover implements `ebb recover <operation-id> [--resume-removal]
+// [--cancel]` (Foundation §12.4, §17.1): reconcile an interrupted
+// operation from durable evidence.
+//
+// Plain Recover performs only the safe reconciliation per the §12.4
+// table: PLANNED/CAPTURING (and TRIM_PLANNED) cancel, PAYLOAD_COMMITTED
+// re-verifies and seals, SEALED revalidates and reports — including
+// adopting the quarantine-rename crash window (committing SEALED ->
+// QUARANTINED and completing the walk) — and QUARANTINED/REMOVING/
+// TRIM_SEALING finish their idempotent removal completion, recording
+// the writer-assertion source "resume:<phase>" in the journal.
+//
+// --resume-removal is the explicit verb for a BLOCKED removal walk
+// (REMOVAL_BLOCKED): plain Recover is REPORT-ONLY for that phase
+// because resuming re-opens the §12.3 digest->remove race window; the
+// user resolves the blocker, re-establishes the stopped-writers
+// condition, and asks for the destructive resume explicitly (the flag
+// also accepts the interrupted phases plain Recover completes anyway).
+//
+// --cancel abandons an operation whose removal never started
+// (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED) without
+// performing its reconciliation — the escape hatch for a SEALED
+// operation whose live root is intact, which would otherwise block the
+// workspace. Retained snapshots stay pinned (I07); deliberate release
+// is `ebb forget`, never cancel.
 //
 // Exit contract: 0 reconciliation completed (report-only outcomes
 // included — a terminal operation IS a completed reconciliation); 2
-// usage (unknown operation id); 5 journal/evidence mismatch or a
-// reconciliation that itself got blocked mid-removal; 7 vault; 130
-// cancelled.
+// usage (unknown operation id, contradictory flags); 5 journal/evidence
+// mismatch or a reconciliation that itself got blocked mid-removal; 7
+// vault; 130 cancelled.
 
 package cli
 
@@ -42,8 +60,15 @@ func cmdRecover(args []string, streams Streams, deps Deps) int {
 	fs := flag.NewFlagSet("recover", flag.ContinueOnError)
 	fs.SetOutput(streams.Err)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
-	resume := fs.Bool("resume-removal", false, "explicitly resume a blocked/interrupted removal walk")
+	resume := fs.Bool("resume-removal", false,
+		"explicitly resume a blocked/interrupted removal walk (required for REMOVAL_BLOCKED after the blocker is resolved and writers are stopped again; QUARANTINED/REMOVING/TRIM_SEALING also complete under plain recover)")
+	cancel := fs.Bool("cancel", false,
+		"abandon an operation whose removal never started (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED); retained snapshots stay pinned (I07)")
 	if err := fs.Parse(reorderFlags(args)); err != nil {
+		return ExitUsage
+	}
+	if *resume && *cancel {
+		fmt.Fprintln(streams.Err, "ebb recover: --resume-removal and --cancel are contradictory verbs")
 		return ExitUsage
 	}
 	if fs.NArg() != 1 {
@@ -80,9 +105,12 @@ func cmdRecover(args []string, streams Streams, deps Deps) int {
 	var rep lifecycle.RecoveryReport
 	cErr := sess.withVaultPassfile(ctx, func(repoDir, passfile string) error {
 		var rErr error
-		if *resume {
+		switch {
+		case *cancel:
+			rep, rErr = coord.CancelOperation(ctx, lifecycleVaultRef(repoDir, passfile), opID)
+		case *resume:
 			rep, rErr = coord.ResumeRemoval(ctx, lifecycleVaultRef(repoDir, passfile), opID)
-		} else {
+		default:
 			rep, rErr = coord.Recover(ctx, lifecycleVaultRef(repoDir, passfile), opID)
 		}
 		return rErr
