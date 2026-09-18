@@ -210,6 +210,20 @@ func (c *Catalog) ImportDiscoveredSnapshot(wsID domain.WorkspaceID, wsName strin
 	})
 }
 
+// Counts returns the number of workspace and snapshot rows. It is the
+// cheap emptiness probe the rebuild-catalog path (`ebb init
+// --rebuild-catalog`, Foundation §11.5) and `ebb doctor` use to tell a
+// lost/empty catalog from one holding live records.
+func (c *Catalog) Counts() (workspaces, snapshots int64, err error) {
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM workspaces`).Scan(&workspaces); err != nil {
+		return 0, 0, fmt.Errorf("catalog: count workspaces: %w", err)
+	}
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM snapshots`).Scan(&snapshots); err != nil {
+		return 0, 0, fmt.Errorf("catalog: count snapshots: %w", err)
+	}
+	return workspaces, snapshots, nil
+}
+
 // rowScanner is satisfied by both *sql.Row and *sql.Rows.
 type rowScanner interface{ Scan(dest ...any) error }
 

@@ -88,6 +88,11 @@ func (s *session) registry() *vault.Registry {
 	return vault.New(filepath.Join(s.cfgDir, vault.RegistryFile))
 }
 
+// catalogPath is the session catalog's file location (report wording).
+func (s *session) catalogPath() string {
+	return filepath.Join(s.cfgDir, vault.CatalogFile)
+}
+
 // approvalsFile is the durable local approval store's document name in
 // the state dir (approvalstore backs it; Foundation §7.3 local trust
 // never transfers).

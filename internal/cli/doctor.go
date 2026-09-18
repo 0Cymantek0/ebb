@@ -19,7 +19,9 @@ import (
 	"strings"
 	"time"
 
+	"ebb/internal/catalog"
 	"ebb/internal/platform"
+	"ebb/internal/vault"
 )
 
 // doctorCheck is one capability/configuration observation.
@@ -232,9 +234,61 @@ func runDoctorChecks() []doctorCheck {
 			checks = append(checks, doctorCheck{Name: "config-dir", Status: "pass",
 				Detail: "writable: " + cfgDir})
 		}
+		// Catalog vs vault registry (cheap local reads only — no backend
+		// calls, no unlock): a registered vault whose catalog is missing,
+		// unreadable or empty is the F39 signature (the catalog was lost
+		// or corrupt while the vault and its secret remain). Doctor only
+		// reports; the rebuild command is the user's explicit action.
+		checks = append(checks, catalogCheck(cfgDir))
 	}
 
 	return checks
+}
+
+// catalogCheck compares vaults.json registrations with the catalog
+// (Foundation §11.5). Fresh installations legitimately hold a registered
+// vault and an empty catalog, so the warn wording names the loss
+// hypothesis explicitly instead of asserting one.
+func catalogCheck(cfgDir string) doctorCheck {
+	vaults, verr := vault.New(filepath.Join(cfgDir, vault.RegistryFile)).List()
+	if verr != nil {
+		return doctorCheck{Name: "catalog", Status: "warn",
+			Detail: "vault registry unreadable: " + verr.Error()}
+	}
+	catFile := filepath.Join(cfgDir, vault.CatalogFile)
+	fi, serr := os.Stat(catFile)
+	if serr != nil && !errors.Is(serr, os.ErrNotExist) {
+		return doctorCheck{Name: "catalog", Status: "warn",
+			Detail: "cannot stat " + catFile + ": " + serr.Error()}
+	}
+	if errors.Is(serr, os.ErrNotExist) || fi.Size() == 0 {
+		if len(vaults) == 0 {
+			return doctorCheck{Name: "catalog", Status: "pass",
+				Detail: "no catalog yet (no vault enrolled; it is created by the first command)"}
+		}
+		return doctorCheck{Name: "catalog", Status: "warn",
+			Detail: fmt.Sprintf("catalog missing/empty while %d vault(s) are registered — if workspaces were captured on this machine, the catalog was lost or corrupt; rebuild with `ebb init --rebuild-catalog`", len(vaults))}
+	}
+	// The file exists and is non-empty: open it read-path-only to count
+	// rows (a zero-byte file is a valid empty SQLite db, hence the guard
+	// above; opening an existing file applies pending migrations only).
+	cat, oerr := catalog.Open(catFile)
+	if oerr != nil {
+		return doctorCheck{Name: "catalog", Status: "warn",
+			Detail: fmt.Sprintf("catalog %s is unreadable/corrupt (%v); if a vault holds captured workspaces, rebuild with `ebb init --rebuild-catalog`", catFile, oerr)}
+	}
+	defer cat.Close()
+	ws, snaps, qerr := cat.Counts()
+	if qerr != nil {
+		return doctorCheck{Name: "catalog", Status: "warn",
+			Detail: fmt.Sprintf("catalog %s did not answer a row count (%v); it may be corrupt — `ebb init --rebuild-catalog` can rebuild from the vault", catFile, qerr)}
+	}
+	if ws == 0 && snaps == 0 && len(vaults) > 0 {
+		return doctorCheck{Name: "catalog", Status: "warn",
+			Detail: fmt.Sprintf("catalog holds no workspaces while %d vault(s) are registered — if workspaces were captured on this machine, the catalog was lost; rebuild with `ebb init --rebuild-catalog`", len(vaults))}
+	}
+	return doctorCheck{Name: "catalog", Status: "pass",
+		Detail: fmt.Sprintf("%d workspace(s), %d snapshot(s)", ws, snaps)}
 }
 
 // toolVersion runs `<bin> <args...>` and returns the first
