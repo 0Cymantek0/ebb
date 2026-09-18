@@ -45,6 +45,15 @@ type fixtureSpec struct {
 	extraInvLine    bool     // inject an unknown field into inventory line 1
 	recipeGroup     bool     // add a reconstruct action + scope exclusion
 	customCommand   []string // action command override (recipeGroup)
+	// defArgv attaches the optional `definition` extension object to the
+	// recipe group's action with this literal argv (rebuild tests). The
+	// definition owns the group's declared outputs and inputs.
+	defArgv []string
+	// defDependsOn adds DependsOn entries to the definition extension.
+	defDependsOn []string
+	// extraDefField injects an unknown field into the definition
+	// extension JSON (strict-reader negative).
+	extraDefField bool
 }
 
 type fixture struct {
@@ -96,6 +105,11 @@ func buildFixture(t *testing.T, spec fixtureSpec) *fixture {
 	writeFile(t, filepath.Join(f.srcRoot, "sub", "b.txt"), bytes.Repeat([]byte("beta-"), 64))
 	writeFile(t, filepath.Join(f.srcRoot, "sub", "nested", "c.txt"), []byte("gamma"))
 	mustMkdir(t, filepath.Join(f.srcRoot, "emptydir"))
+	// Rebuild fixtures carry the definition's declared input so the
+	// approval pre-pass can digest it at the destination.
+	if spec.defArgv != nil {
+		writeFile(t, filepath.Join(f.srcRoot, "package.json"), []byte(`{"name":"fixture"}`+"\n"))
+	}
 	// Link fixture: real symlink where the platform allows; junction via
 	// the unprivileged mklink /J on Windows; otherwise the test is
 	// skipped with a clear reason (no faked coverage).
@@ -145,6 +159,11 @@ func buildFixture(t *testing.T, spec fixtureSpec) *fixture {
 	mb, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if spec.extraDefField {
+		// Valid JSON carrying a field inside the definition extension the
+		// strict reader must reject (digests recompute below).
+		mb = bytes.Replace(mb, []byte(`"depends_on": []`), []byte(`"depends_on": [], "unexpected": true`), 1)
 	}
 	f.manifestBytes = append(mb, '\n')
 	f.manifestDigest = digestBytes(f.manifestBytes)
@@ -275,12 +294,29 @@ func (f *fixture) buildManifestDoc(spec fixtureSpec) manifestDoc {
 		RequiredFeatures: []string{},
 	}
 	if spec.recipeGroup {
-		m.Actions = []manifestAction{{
+		action := manifestAction{
 			ID: "node-dependencies", Adapter: "pnpm", Root: ".",
 			Outputs: []string{"node_modules"},
 			Inputs:  []string{"package.json", "pnpm-lock.yaml"},
 			Network: "allowed", Command: spec.customCommand, Ownership: "owned",
-		}}
+		}
+		if spec.defArgv != nil {
+			depends := spec.defDependsOn
+			if depends == nil {
+				depends = []string{} // marshals as [], not null
+			}
+			action.Definition = &actionDefinitionDoc{
+				ID: "node-dependencies", Argv: spec.defArgv,
+				WorkingRoot: ".",
+				Inputs:      []string{"package.json"},
+				Outputs:     []string{"node_modules"},
+				EnvAllow:    []string{},
+				Network:     "none",
+				TimeoutNS:   int64(30 * time.Second),
+				DependsOn:   depends,
+			}
+		}
+		m.Actions = []manifestAction{action}
 		m.ScopeExclusions = []manifestExclusion{{
 			Path: "node_modules", Route: "reconstruct", Group: "node-dependencies",
 			Note: "omitted with recorded route (I02)",

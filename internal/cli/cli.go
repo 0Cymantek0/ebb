@@ -85,6 +85,11 @@ type Deps struct {
 	// NewRestoreOp constructs the restore opener (production:
 	// restore.New).
 	NewRestoreOp func(restore.Dependencies) (*restore.Opener, error)
+	// NewActionRunner constructs the reconstruction-action runner used
+	// by `ebb open`'s rebuild phase (production: actions.New; the seam
+	// exists so CLI tests drive the rebuild through a fake runner).
+	// nil defaults to the production runner.
+	NewActionRunner func() restore.ActionRunner
 	// DetectEcosystem runs existence-only regenerate-group detection
 	// over a workspace root (production: ecosystem.Detect). Used by
 	// `ebb init` for SUGGESTIONS; never writes an Ebbfile.
@@ -307,6 +312,10 @@ reclaim flags:
 
 open flags:
   --to <dir>                 destination directory (default: the workspace's recorded root)
+  --files-only               stop after publishing the preserved files (no reconstruction)
+  --yes                      record approvals for not-yet-approved reconstruction actions without a prompt (never covers approval drift)
+  --resume <op-or-workspace> resume the rebuild of an interrupted open (reruns only actions without a recorded success)
+  --cancel <op-or-workspace> cancel a REBUILD_FAILED/REBUILDING open operation (files stay; snapshot stays pinned)
 
 recover flags:
   --resume-removal           explicitly resume a blocked/interrupted removal walk

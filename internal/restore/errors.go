@@ -23,6 +23,8 @@ const (
 	CodePublishBlocked    = "EBB_E_PUBLISH_BLOCKED"
 	CodeInvalidOptions    = "EBB_E_INVALID_OPTIONS"
 	CodeLinksBlocked      = "EBB_E_LINK_BLOCKED"
+	CodeRebuildFailed     = "EBB_E_REBUILD_FAILED"
+	CodeProtectedChanged  = "EBB_E_PROTECTED_CHANGED"
 )
 
 // ErrNotOpenable reports that the selected snapshot cannot be opened at
@@ -172,3 +174,59 @@ func (e *ErrLinksBlocked) Error() string {
 }
 
 func (e *ErrLinksBlocked) Code() string { return CodeLinksBlocked }
+
+// ErrRebuildFailed reports that the reconstruction phase of an open
+// operation failed or was blocked (Foundation §12.5, §17.5 exit 6): a
+// non-zero action exit, timeout, missing outputs, an unresolvable tool
+// (F14), a declined or stale approval, a protected-file change (F36), or
+// a cancellation at a safe point. The operation lands at REBUILD_FAILED
+// — non-terminal, resolvable by `ebb open --resume`; the published files
+// are NEVER removed (they may be user work) and the snapshot stays
+// pinned (I07, I08).
+type ErrRebuildFailed struct {
+	OperationID domain.OperationID
+	// FailedActions names the action ids that failed or were blocked.
+	FailedActions []string
+	// Reason is the human summary naming the first cause.
+	Reason string
+	// Err is the primary cause (may wrap *ErrProtectedChanged,
+	// *actions.ErrTimeout, *actions.ErrOutputMissing, context.Canceled...).
+	Err error
+}
+
+func (e *ErrRebuildFailed) Error() string {
+	msg := fmt.Sprintf("restore: rebuild of operation %s failed", e.OperationID)
+	if len(e.FailedActions) > 0 {
+		msg += " (action(s): " + strings.Join(e.FailedActions, ", ") + ")"
+	}
+	if e.Reason != "" {
+		msg += ": " + e.Reason
+	}
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg + "; recovered files are intact at the destination, the snapshot stays pinned, and the operation is resumable with `ebb open --resume`"
+}
+
+func (e *ErrRebuildFailed) Unwrap() error { return e.Err }
+
+func (e *ErrRebuildFailed) Code() string { return CodeRebuildFailed }
+
+// ErrProtectedChanged is the F36 gate: an approved action modified,
+// removed or replaced a protected entry (a retained inventory entry NOT
+// under any action's declared Outputs). The new files are NEVER modified
+// or removed by Ebb (they may be user work — Foundation §12.5); the
+// difference is reported, the operation lands at REBUILD_FAILED and the
+// snapshot stays pinned.
+type ErrProtectedChanged struct {
+	// Changes names each protected entry with what differs.
+	Changes []string
+}
+
+func (e *ErrProtectedChanged) Error() string {
+	return "restore: approved action(s) changed protected preserved content: " +
+		strings.Join(e.Changes, "; ") +
+		"; the new files were kept untouched (Foundation §12.5, F36) and the original snapshot stays pinned"
+}
+
+func (e *ErrProtectedChanged) Code() string { return CodeProtectedChanged }

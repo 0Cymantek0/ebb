@@ -178,6 +178,38 @@ func (c *Catalog) ActiveOperations(ws domain.WorkspaceID) ([]Operation, error) {
 	return out, nil
 }
 
+// ListOperations returns every operation row of one workspace in any
+// phase (terminal included), ordered by recency then id. An empty
+// workspace id lists the operations of all workspaces (mirroring
+// ActiveOperations). Preflight uses it to recognize destinations a
+// completed open already published at.
+func (c *Catalog) ListOperations(ws domain.WorkspaceID) ([]Operation, error) {
+	q := operationSelect
+	var args []any
+	if ws != "" {
+		q += ` WHERE workspace_id = ?`
+		args = append(args, string(ws))
+	}
+	q += ` ORDER BY updated_at, id`
+	rows, err := c.db.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: list operations of %s: %w", ws, err)
+	}
+	defer rows.Close()
+	var out []Operation
+	for rows.Next() {
+		op, err := scanOperation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("catalog: list operations of %s: %w", ws, err)
+		}
+		out = append(out, op)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: list operations of %s: %w", ws, err)
+	}
+	return out, nil
+}
+
 const operationSelect = `SELECT id, workspace_id, kind, phase, generation, source_root, source_identity,
 	dest_path, payload_snap, seal_snap, intent_digest, last_error, next_action, started_at, updated_at
 	FROM operations`

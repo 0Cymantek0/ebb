@@ -44,6 +44,7 @@ import (
 
 	toml "github.com/pelletier/go-toml/v2"
 
+	"ebb/internal/actions"
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 	"ebb/internal/policy"
@@ -97,6 +98,14 @@ type CaptureOptions struct {
 	WriterAssertion string
 	// Git carries the CLI's hardened git observation (§9.1, D004).
 	Git domain.GitObservation
+	// ActionDefs carries the exact captured action definitions (§16.2)
+	// derived by the CLI at capture time (ecosystem recipes and custom
+	// commands). The manifest freezes them in each action's optional
+	// `definition` extension object; a graph that cannot run (cycles,
+	// invalid definitions) fails the capture. lifecycle imports
+	// internal/actions — a core package with no removal authority —
+	// solely for this validation and wire form.
+	ActionDefs []actions.Definition
 	// ApprovalReady is invoked per trim group; a non-nil error blocks
 	// that group's removal (lifecycle never runs actions).
 	ApprovalReady func(groupID string) error
