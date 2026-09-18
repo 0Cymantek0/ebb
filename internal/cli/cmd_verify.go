@@ -2,8 +2,10 @@
 // §11.4, §4.1): refresh the evidence of one sealed retained snapshot
 // with an EXPLICIT scope. Default scope = seal/document readback +
 // coverage re-derivation (cheap: one listing plus two document dumps);
-// `--content` adds the full per-file readback of every preserved byte
-// (expensive: one backend call per file — warned before it runs).
+// `--content` adds the full readback of every preserved byte (expensive:
+// the whole payload is re-read and digest-checked — one streaming tar
+// dump when the backend supports it, one backend call per file
+// otherwise).
 //
 // Checks are NAMED and individually pass/fail (§4.1: a verification
 // result names its checks; it is never a free-form "safe=true"):
@@ -26,8 +28,7 @@
 package cli
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -88,7 +89,7 @@ func cmdVerify(args []string, streams Streams, deps Deps) int {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	fs.SetOutput(streams.Err)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
-	content := fs.Bool("content", false, "full per-file readback of every preserved byte (expensive: one backend call per file)")
+	content := fs.Bool("content", false, "full readback of every preserved byte (expensive: the whole payload is re-read and digest-checked)")
 	if err := fs.Parse(reorderFlags(args)); err != nil {
 		return ExitUsage
 	}
@@ -206,30 +207,28 @@ func cmdVerify(args []string, streams Streams, deps Deps) int {
 		}
 		rep.pass("coverage-complete")
 
-		// ---- check 4 (--content): full per-file readback --------------
+		// ---- check 4 (--content): full content readback ---------------
 		if *content {
-			fmt.Fprintf(streams.Err, "content scope: full per-file readback of %d preserved file(s) through the backend — one backend call per file, this can take a while\n",
+			fmt.Fprintf(streams.Err, "content scope: full readback of %d preserved file(s) through the backend (every preserved byte is re-read and digest-checked; this can take a while)\n",
 				len(readbackFiles))
-			var problems []string
-			for _, f := range readbackFiles {
-				if cerr := ctx.Err(); cerr != nil {
-					return cerr
+			// Shared executor: the SAME transport and derivation the
+			// capture's own §11.4 gate and crash-recovery re-verification
+			// use (lifecycle.VerifyReadback) — a re-verification that
+			// disagreed with the capture's own evidence would be vacuous.
+			// It streams the whole tree as ONE tar archive when the
+			// backend supports it (domain.TreeTarDumper), else one
+			// DumpFile per file.
+			verr := lifecycle.VerifyReadback(ctx, sess.store, repoDir, passfile, snap.PayloadBackendID, readbackFiles)
+			if verr != nil {
+				if errors.Is(verr, context.Canceled) || errors.Is(verr, context.DeadlineExceeded) {
+					return verr
 				}
-				got, derr := sess.store.DumpFile(ctx, repoDir, passfile, snap.PayloadBackendID, f.SnapPath)
-				if derr != nil {
-					problems = append(problems, fmt.Sprintf("dump %s: %v", f.SnapPath, derr))
-					continue
+				var ev *lifecycle.ErrVerification
+				if errors.As(verr, &ev) {
+					rep.fail("content-readback", strings.Join(ev.Details, "; "))
+					return errVerifyFailed
 				}
-				h := sha256.Sum256(got)
-				if hex.EncodeToString(h[:]) != f.Digest {
-					problems = append(problems, fmt.Sprintf("%s: readback digest %s, expected %s",
-						f.SnapPath, hex.EncodeToString(h[:]), f.Digest))
-				}
-			}
-			if len(problems) > 0 {
-				sort.Strings(problems)
-				rep.fail("content-readback", strings.Join(problems, "; "))
-				return errVerifyFailed
+				return verr // infra failure (store/vault) — classified below
 			}
 			rep.pass("content-readback")
 		}

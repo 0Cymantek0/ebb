@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"archive/tar"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -118,12 +119,30 @@ type readbackFile struct {
 	Digest   string
 }
 
-// verifyReadback dumps every listed file through the backend, hashes the
-// returned bytes and compares to the independent digest (Foundation
-// §11.4 "Readback"). A truncated or missing dump fails (the store
-// already checks producer exit status; I12). The files map may be large;
-// entries are processed one at a time, never buffered wholesale.
+// verifyReadback deep-reads every listed file through the backend and
+// compares to the independent digest (Foundation §11.4 "Readback").
+//
+// Transport selection: when the store implements domain.TreeTarDumper
+// (the real restic backend), the whole snapshot tree is consumed as ONE
+// streaming tar archive — §14.3 "avoid one subprocess per file"; park
+// latency then scales with bytes, not file count. Otherwise (every fake)
+// the original per-file DumpFile loop runs unchanged. The two transports
+// verify the SAME readback set against the SAME digests, fail the same
+// named check ("readback") on the same conditions (dump/transport
+// failure, digest mismatch, expected file missing, truncated stream,
+// non-zero producer exit, cancellation), and are held equivalent by
+// TestE2EResticTarReadbackEquivalence (real backend).
 func verifyReadback(ctx context.Context, store domain.SnapshotStore, repoDir, passfile, snapID string, files []readbackFile) error {
+	if dumper, ok := store.(domain.TreeTarDumper); ok {
+		return verifyReadbackTar(ctx, dumper, repoDir, passfile, snapID, files)
+	}
+	return verifyReadbackPerFile(ctx, store, repoDir, passfile, snapID, files)
+}
+
+// verifyReadbackPerFile is the original §11.4 readback loop: one
+// DumpFile subprocess per expected file. The files map may be large;
+// entries are processed one at a time, never buffered wholesale.
+func verifyReadbackPerFile(ctx context.Context, store domain.SnapshotStore, repoDir, passfile, snapID string, files []readbackFile) error {
 	var details []string
 	for _, f := range files {
 		if err := ctx.Err(); err != nil {
@@ -144,6 +163,154 @@ func verifyReadback(ctx context.Context, store domain.SnapshotStore, repoDir, pa
 		return &ErrVerification{Check: "readback", Details: details}
 	}
 	return nil
+}
+
+// maxTarTrailingZeros bounds the all-zero padding that may follow the tar
+// end-of-archive marker: restic 0.19.1 writes exactly two zero blocks and
+// a parser may stop one block early, so ≤1024 zero bytes are legal tail
+// (lab/restic-probe/tar-dump). Anything longer or nonzero is malformed.
+const maxTarTrailingZeros = 1024
+
+// verifyReadbackTar is the streaming whole-tree §11.4 readback: ONE
+// `dump --archive tar` subprocess for the entire snapshot (workspace
+// prefix AND op-dir prefix), hashed member by member with bounded memory.
+//
+// Equivalence contract with verifyReadbackPerFile (this is a TRANSPORT
+// change only — no gate may be weaker or stricter):
+//
+//   - only REGULAR members are content-hashed; dir and link members
+//     (junctions/symlinks) are skipped — their fidelity is coverage's
+//     check, unchanged (verifyCoverage runs first at every call site,
+//     over the same immutable snapshot);
+//   - each expected file must appear with the exact independent digest;
+//     a missing expected file fails exactly as a failed per-file dump
+//     does;
+//   - regular members OUTSIDE the expected readback set are ignored: the
+//     per-file transport cannot observe extras either, and extras are
+//     coverage's gate (I04) — a stricter rule here would not be
+//     equivalent. The one parser-hardening exception §11.4 explicitly
+//     demands is DUPLICATE names: a duplicated expected member fails;
+//   - truncation fails twice over, as §11.4 requires: the tar parser's
+//     unexpected EOF at read time AND the producer-exit/complete-
+//     consumption gates in the stream's Close (probe: a killed producer
+//     leaves a clean EOF, exit 1, empty stderr — either gate alone is
+//     blind to a case the other catches).
+func verifyReadbackTar(ctx context.Context, dumper domain.TreeTarDumper, repoDir, passfile, snapID string, files []readbackFile) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		// The per-file loop runs zero subprocesses for an empty set.
+		return nil
+	}
+	expected := make(map[string]string, len(files)) // tree path -> digest
+	for _, f := range files {
+		expected[f.SnapPath] = f.Digest
+	}
+	seen := make(map[string]bool, len(files))
+
+	stream, err := dumper.DumpTreeTar(ctx, repoDir, passfile, snapID, "/")
+	if err != nil {
+		// Same shape as a failing first DumpFile: a named-check failure,
+		// not an infra error (the per-file loop turns dump errors into
+		// readback details too).
+		return &ErrVerification{Check: "readback", Details: []string{
+			fmt.Sprintf("tar dump transport: %v", err)}}
+	}
+	var details []string
+
+	tr := tar.NewReader(stream)
+	for {
+		if cerr := ctx.Err(); cerr != nil {
+			_ = stream.Close()
+			return cerr
+		}
+		hdr, nerr := tr.Next()
+		if nerr == io.EOF {
+			break // clean end of archive
+		}
+		if nerr != nil {
+			details = append(details, fmt.Sprintf(
+				"tar dump stream ended before the end-of-archive marker (truncated or malformed archive): %v", nerr))
+			break
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue // dirs/links/etc: content fidelity is coverage's job
+		}
+		// Probe-pinned member form: snapshot-rooted WITHOUT the leading
+		// slash ("ws/f.txt", ".ebb-op-…/manifest.json"); directory
+		// members carry a trailing slash ("ws/") — normalized away here
+		// for robustness (restic never gives regular members one).
+		path := "/" + strings.Trim(strings.TrimPrefix(hdr.Name, "/"), "/")
+		want, ok := expected[path]
+		if !ok {
+			continue // extras are coverage's gate (I04), not readback's
+		}
+		if seen[path] {
+			details = append(details, fmt.Sprintf(
+				"%s: duplicate tar member (Foundation §11.4 rejects duplicate names)", path))
+			continue
+		}
+		seen[path] = true
+		h := sha256.New()
+		if _, cerr := io.Copy(h, tr); cerr != nil {
+			details = append(details, fmt.Sprintf(
+				"%s: reading tar member content failed (truncated stream?): %v", path, cerr))
+			continue
+		}
+		if hex := fmt.Sprintf("%x", h.Sum(nil)); hex != want {
+			details = append(details, fmt.Sprintf("%s: readback digest %s, expected %s", path, hex, want))
+		}
+	}
+
+	// Drain past the end-of-archive marker to the producer's EOF: only
+	// zero padding may follow (≤ maxTarTrailingZeros). This is the
+	// parser-completion half of §11.4's "fully consumed" requirement; the
+	// producer-exit half is enforced by Close below.
+	trailing, allZero := drainTarTail(stream)
+	if !allZero || trailing > maxTarTrailingZeros {
+		details = append(details, fmt.Sprintf(
+			"tar dump stream carries %d bytes (all-zero: %v) after the end-of-archive marker; only zero padding up to %d bytes is legal",
+			trailing, allZero, maxTarTrailingZeros))
+	}
+	for _, f := range files {
+		if !seen[f.SnapPath] {
+			details = append(details, fmt.Sprintf(
+				"expected %s missing from the tar dump", f.SnapPath))
+		}
+	}
+	if cerr := stream.Close(); cerr != nil {
+		details = append(details, fmt.Sprintf("tar dump stream closed dirty: %v", cerr))
+	}
+	if len(details) > 0 {
+		sort.Strings(details) // deterministic failure text
+		return &ErrVerification{Check: "readback", Details: details}
+	}
+	return nil
+}
+
+// drainTarTail reads the stream through EOF and reports how many bytes
+// followed and whether they were all zero. A read error before EOF is
+// reported as a nonzero tail (the stream did not end cleanly).
+func drainTarTail(stream io.Reader) (int64, bool) {
+	var n int64
+	allZero := true
+	buf := make([]byte, 4096)
+	for {
+		m, err := stream.Read(buf)
+		for i := 0; i < m; i++ {
+			if buf[i] != 0 {
+				allZero = false
+			}
+		}
+		n += int64(m)
+		if err == io.EOF {
+			return n, allZero
+		}
+		if err != nil {
+			return n, false
+		}
+	}
 }
 
 // expectedTreeAndReadback derives the §11.4 coverage expectation and
@@ -253,6 +420,23 @@ func ExpectedTreeFor(entries []domain.Entry, prefix string) (map[string]Expected
 		files[i] = ReadbackFile{SnapPath: f.SnapPath, Digest: f.Digest}
 	}
 	return out, files
+}
+
+// VerifyReadback is the exported §11.4 readback executor behind
+// `ebb verify --content`: the SAME transport verifyPayload (capture) and
+// reverifyPayload (crash recovery) run, over sets derived by the same
+// pure functions. Crash-recovery re-verification and verify must derive
+// identical evidence — sharing the executor is what keeps the transports
+// and failure classes identical (Learnings, Wave D reimplementation-drift
+// warning). The returned error is either a raw context error (cancelled)
+// or *ErrVerification{Check: "readback"}; infra failures surface as
+// readback details, exactly as the per-file loop always reported them.
+func VerifyReadback(ctx context.Context, store domain.SnapshotStore, repoDir, passfile, snapID string, files []ReadbackFile) error {
+	rb := make([]readbackFile, len(files))
+	for i, f := range files {
+		rb[i] = readbackFile{SnapPath: f.SnapPath, Digest: f.Digest}
+	}
+	return verifyReadback(ctx, store, repoDir, passfile, snapID, rb)
 }
 
 // walkLocalTree returns every file (path relative to root, forward

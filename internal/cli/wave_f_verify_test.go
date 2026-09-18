@@ -175,7 +175,7 @@ func TestVerifyContentScopeCatchesSameLengthTamper(t *testing.T) {
 		t.Fatalf("content scope code = %d, want %d (stderr %s)", code, ExitCaptureVerify, stderr)
 	}
 	for _, want := range []string{
-		"content scope: full per-file readback",
+		"content scope: full readback",
 		"check content-readback: FAIL",
 		"readback digest",
 	} {
@@ -195,7 +195,7 @@ func TestVerifyContentScopeFreshPass(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("code = %d, stderr = %s", code, stderr)
 	}
-	for _, want := range []string{"content scope: full per-file readback", "check content-readback: pass"} {
+	for _, want := range []string{"content scope: full readback", "check content-readback: pass"} {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("stderr lacks %q:\n%s", want, stderr)
 		}

@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"io"
 	"os"
 )
 
@@ -132,6 +133,26 @@ type SnapshotStore interface {
 
 	// Forget removes explicit backend snapshot IDs (never auto policy).
 	Forget(ctx context.Context, repoDir, passfile string, snapIDs []string) error
+}
+
+// TreeTarDumper is an OPTIONAL bulk-readback capability a SnapshotStore
+// may implement (interface-segregated like VerifiedDirProbe above — D007
+// precedent: existing fakes stay valid SnapshotStores and simply keep the
+// per-file DumpFile transport). Implemented by internal/storage/restic:
+// it streams a whole snapshot tree as a tar archive from ONE subprocess
+// so §11.4 readback latency scales with bytes, not file count (§14.3
+// "avoid one subprocess per file").
+type TreeTarDumper interface {
+	// DumpTreeTar streams the tree at treePath (snapshot tree path,
+	// forward slashes, rooted with a leading "/" — "/" dumps the whole
+	// snapshot, every top-level prefix) as a tar archive without
+	// buffering it. Member names are rooted at the snapshot tree root
+	// without the leading slash. The stream must be consumed to EOF and
+	// closed; Close verifies the producer exited 0 AND that the stream
+	// was fully consumed — a truncated archive additionally surfaces at
+	// read time through the tar parser (Foundation §11.4 requires BOTH
+	// the producer-exit and parser-completion gates).
+	DumpTreeTar(ctx context.Context, repoDir, passfile, snapID, treePath string) (io.ReadCloser, error)
 }
 
 // SnapshotRef is an opaque backend snapshot identity plus the metadata
