@@ -222,3 +222,94 @@ entries` (per entry, the §14.4 metric):
   have no independent digest outside the snapshot.
 - Peak RSS excludes restic subprocess memory (runtime.MemStats covers the
   harness process only).
+
+---
+
+# Post-D019 re-measure (streaming tar readback) — 2026-09-19
+
+Same harness, same default scale, same machine, same reproduce command
+(`go run ./lab/bench`); the only change in the measured code path is that
+the harness now exercises the D019 streaming tar readback transport
+(wave G W2) instead of silently falling back to the per-file one — see
+the surprise below. Raw evidence for this run: `lab/bench/results/
+20260918T231442Z/` (the run's own UTC clock label; written 2026-09-19).
+
+## Surprise first: the harness was measuring the wrong transport
+
+The first rerun reproduced the baseline's per-file numbers almost
+exactly. Cause: the harness's counting decorator embedded only
+`domain.SnapshotStore`, and `DumpTreeTar` lives in the separate,
+interface-segregated `domain.TreeTarDumper` seam (D019 deliberately left
+`SnapshotStore`'s method set unchanged so all fakes keep compiling). A
+decorator that embeds only the base interface HIDES the optional seam
+from lifecycle's `store.(domain.TreeTarDumper)` assertion — the exact
+wrapper-hides-optional-interface lesson Learnings already records for
+verified-dir-descent probe wrappers. Fixed by embedding and explicitly
+delegating `TreeTarDumper` in the counting store (tar dumps are counted
+on stream Close, the producer-exit/full-consumption gate). Lesson
+recorded; any future decorator around the store must do the same.
+
+## Headline numbers (default scale 1.0)
+
+| fixture | snapshot before → after | park before → after | snapshot restic calls before → after |
+|---|---|---|---|
+| smallfiles | 96.6 s → 5.9 s | 86.2 s → 6.0 s | 106 → 8 |
+| node | 69.3 s → 5.8 s | 103.3 s → 5.9 s | 70 → 8 |
+| python | 46.4 s → 5.7 s | 40.6 s → 5.8 s | 47 → 8 |
+| media | 13.8 s → 7.0 s | 24.5 s → 6.9 s | 14 → 8 |
+| shared | 49.1 s → 5.9 s | 30.3 s → 5.9 s | 38 → 8 |
+
+The §11.4 full readback inside capture (snapshot) and park now costs a
+FLAT 8 restic invocations per fixture regardless of file count. Total
+harness runtime: 13 m 24 s → 4 m 45 s; peak harness RSS 590.2 →
+461.4 MiB.
+
+## Readback transport comparison (new measurement, same file set + same independent digests)
+
+The harness's explicit-readback operation remains, by design, a raw
+per-file `Store.DumpFile` walk — it is the D019 FALLBACK transport's
+cost curve, kept as the yardstick (that column did not "collapse" and
+should not: it is no longer the production path). The new comparison
+column drives the exact same file set and the same independent scan
+digests through `lifecycle.VerifyReadback` — the exported §11.4 executor
+`ebb verify --content` rides, which selects the tar transport when the
+store implements `TreeTarDumper`:
+
+| fixture | files | per-file DumpFile s | tar transport s | speedup |
+|---|---:|---:|---:|---:|
+| smallfiles | 96 | 80.0 | 0.8 | 99.2x |
+| node | 60 | 51.5 | 0.8 | 64.0x |
+| python | 37 | 33.1 | 0.8 | 40.7x |
+| media | 4 | 6.9 | 1.1 | 6.4x |
+| shared | 28 | 25.9 | 0.8 | 31.4x |
+
+Per-file overhead on the fallback transport is unchanged (~0.81–0.99
+s/file — invocation-bound, as the baseline established); the tar
+transport is a constant ~0.8 s subprocess per TREE plus byte-bound
+streaming (media, 4 × 64 MiB, is the honest byte-bound case at 6.4x).
+
+## What this does to the reference-scale projections
+
+The baseline's projection table (smallfiles `--scale 44` ≈ 3.3 h with a
+≈ 63 min readback pass) collapses on the transport that production
+actually uses: the tar readback pass for ~5,000 small files projects to
+roughly one minute (one subprocess streaming ~10 MiB at these file
+sizes), and a snapshot or park of that tree to minutes, not hours.
+D021's "reconsider when reference-scale runs become cheap enough" gate
+is now met — the default corpus can grow on the next baseline refresh.
+
+## Honesty notes for this run
+
+- Single wall-clock run, live laptop, same caveats as the baseline.
+- The per-file readback column and the new tar column run back to back
+  over the same snapshot, so the speedup column shares fixture state;
+  the tar pass runs second (repo/index warm) — the per-file pass had the
+  same warmup advantage over the baseline's cold numbers, and 30–99x is
+  far outside that noise.
+- park free-deltas for the small fixtures remain inside the measured
+  noise floor (0 B drift over 8 pre-run samples; small negative deltas
+  are live-system writes, as the baseline's note 7 already explains).
+- `media`'s tar speedup (6.4x) is byte-bound, not invocation-bound: with
+  4 × 64 MiB files the per-file transport pays only 4 invocations. The
+  tar win is a SMALL-FILE win — exactly the corpus shape the reference
+  targets care about.

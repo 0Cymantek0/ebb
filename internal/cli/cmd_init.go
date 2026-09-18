@@ -58,6 +58,10 @@ func cmdInit(args []string, streams Streams, deps Deps) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(streams.Err)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
+	rebuildCatalog := fs.Bool("rebuild-catalog", false,
+		"rebuild a lost/corrupt catalog from vault discovery (Foundation §11.5: workspaces come back UNBOUND, snapshots pinned; nothing is deleted)")
+	forceRebuild := fs.Bool("force-rebuild", false,
+		"with --rebuild-catalog: merge-discover over an existing non-empty catalog (duplicates reported; rows never dropped)")
 	if err := fs.Parse(reorderFlags(args)); err != nil {
 		return ExitUsage
 	}
@@ -69,6 +73,10 @@ func cmdInit(args []string, streams Streams, deps Deps) int {
 	if fs.NArg() == 1 {
 		root = fs.Arg(0)
 	}
+	if *forceRebuild && !*rebuildCatalog {
+		fmt.Fprintln(streams.Err, "ebb init: --force-rebuild only applies together with --rebuild-catalog")
+		return ExitUsage
+	}
 
 	env := newEnvelope("init", "error")
 	sess, err := openSession(deps)
@@ -76,6 +84,17 @@ func cmdInit(args []string, streams Streams, deps Deps) int {
 		return emitFailure(env, *jsonOut, streams, classifyExitCode(err), err.Error())
 	}
 	defer sess.close()
+
+	// Catalog recovery (F39): the rebuild path replaces the enrollment /
+	// detection flow entirely — it resolves the registered vault itself
+	// and never touches the working directory.
+	if *rebuildCatalog {
+		if fs.NArg() == 1 {
+			fmt.Fprintf(streams.Err, "note: --rebuild-catalog walks the vault; the path argument %q is unused\n", root)
+		}
+		return runCatalogRebuild(sess, streams, deps, *jsonOut, *forceRebuild)
+	}
+
 	ctx, stop := commandContext(deps)
 	defer stop()
 
