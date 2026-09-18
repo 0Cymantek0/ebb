@@ -36,6 +36,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -253,16 +254,30 @@ func resolvedRoutesDigest(entries []domain.Entry, groupIDs []string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// preflight validates containment: the vault repository and passfile
-// must live outside the captured root (capturing the repo into itself,
-// or deleting the passfile with the workspace, are both unacceptable).
+// preflight validates containment (I06: "Root/vault/operation paths
+// cannot overlap through aliases unnoticed"): the vault repository and
+// passfile must live outside the captured root, and the root must live
+// outside the vault repository, in BOTH directions and through ALIAS
+// spellings — capturing the repo into itself, parking a tree that lives
+// inside the live restic repository, or deleting the passfile with the
+// workspace are all unacceptable. Comparisons run on canonicalized
+// paths (canonicalPath resolves symlinks and junctions).
 func preflight(rootAbs string, vault VaultRef) error {
-	repoAbs := filepath.Clean(mustAbs(vault.RepoDir))
-	if pathEqual(repoAbs, rootAbs) || underPath(rootAbs, repoAbs) {
+	rootCanon := canonicalPath(rootAbs)
+	repoCanon := canonicalPath(mustAbs(vault.RepoDir))
+	if repoCanon == rootCanon {
 		return &ErrDestructiveBlocked{Reasons: []string{
-			fmt.Sprintf("vault repository %s is inside the captured root %s; capture would destroy its own backend", repoAbs, rootAbs)}}
+			fmt.Sprintf("vault repository %s IS the captured root %s; capture would destroy its own backend", vault.RepoDir, rootAbs)}}
 	}
-	if underPath(rootAbs, filepath.Clean(mustAbs(vault.Passfile))) {
+	if underPath(repoCanon, rootCanon) {
+		return &ErrDestructiveBlocked{Reasons: []string{
+			fmt.Sprintf("captured root %s is inside the vault repository %s; parking would quarantine and delete a tree inside the live backend (I06)", rootAbs, vault.RepoDir)}}
+	}
+	if underPath(rootCanon, repoCanon) {
+		return &ErrDestructiveBlocked{Reasons: []string{
+			fmt.Sprintf("vault repository %s is inside the captured root %s; capture would destroy its own backend", vault.RepoDir, rootAbs)}}
+	}
+	if underPath(rootCanon, canonicalPath(mustAbs(vault.Passfile))) {
 		return &ErrDestructiveBlocked{Reasons: []string{
 			fmt.Sprintf("vault passfile %s is inside the captured root %s; parking would delete the unlock secret", vault.Passfile, rootAbs)}}
 	}
@@ -277,10 +292,79 @@ func mustAbs(p string) string {
 	return abs
 }
 
-// pathEqual compares cleaned absolute paths. v1 requires callers to use
-// one consistent spelling of a root (the journal records it and Recover
-// compares identities, not names, per I13).
-func pathEqual(a, b string) bool { return filepath.Clean(a) == filepath.Clean(b) }
+// canonicalLinkBudget bounds alias resolution (chains of links pointing
+// at links); beyond it the lexical spelling stands.
+const canonicalLinkBudget = 32
+
+// canonicalPath resolves alias spellings — symlinks AND Windows
+// junctions/mount points — to a final absolute path, stdlib only (this
+// package must not import internal/platform, Foundation §16.7).
+//
+// filepath.EvalSymlinks alone is NOT sufficient on Windows: Go reports
+// junctions as ModeIrregular (not ModeSymlink), so EvalSymlinks neither
+// resolves them nor paths traversing them (probe-verified) — exactly the
+// alias class of Wave F review finding F6. canonicalPath therefore walks
+// the path components itself: a component observed as a link
+// (ModeSymlink or ModeIrregular) is resolved through os.Readlink (which
+// DOES read junction text on Windows) and resolution restarts on the
+// target (nested aliases collapse); a regular existing component is
+// normalized through EvalSymlinks, which also expands 8.3-short and
+// true-case spellings (the GIT-WT-1 lesson).
+//
+// Residual, documented honestly: a component that cannot be resolved —
+// it does not exist yet (a not-yet-initialized vault repo), cannot be
+// read, is a subst/ mapped drive with no link object to read, or the
+// link budget is exhausted — falls back to its lexical spelling, and an
+// alias expressed only through such a spelling can still go unnoticed
+// by this comparison. Removal-side identity revalidation (I13) remains
+// the backstop for anything that slips past preflight.
+func canonicalPath(p string) string {
+	return canonicalFrom(filepath.Clean(mustAbs(p)), canonicalLinkBudget)
+}
+
+func canonicalFrom(p string, budget int) string {
+	if budget <= 0 {
+		return p
+	}
+	vol := filepath.VolumeName(p)
+	rest := strings.TrimPrefix(p, vol)
+	rest = strings.TrimPrefix(rest, string(filepath.Separator))
+	cur := string(filepath.Separator)
+	if vol != "" {
+		cur = vol + string(filepath.Separator)
+	}
+	for _, comp := range strings.Split(rest, string(filepath.Separator)) {
+		if comp == "" {
+			continue
+		}
+		child := filepath.Join(cur, comp)
+		fi, err := os.Lstat(child)
+		if err == nil && fi.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			// An alias component: resolve its target and continue from
+			// the RESOLVED path (handles nested aliases).
+			tgt, rerr := os.Readlink(child)
+			if rerr != nil || tgt == "" {
+				cur = child
+				continue
+			}
+			tgt = strings.TrimPrefix(tgt, `\??\`) // junction substitute-name prefix
+			if !filepath.IsAbs(tgt) {
+				tgt = filepath.Join(cur, tgt)
+			}
+			cur = canonicalFrom(filepath.Clean(tgt), budget-1)
+			continue
+		}
+		// A regular (or missing) component: EvalSymlinks resolves any
+		// symlink spelling of the prefix AND normalizes short/case
+		// forms; on failure keep the lexical spelling (residual above).
+		if resolved, ferr := filepath.EvalSymlinks(child); ferr == nil {
+			cur = resolved
+		} else {
+			cur = child
+		}
+	}
+	return cur
+}
 
 // underPath reports whether child equals or lies below parent (native
 // separators; both must already be cleaned/absolute).
