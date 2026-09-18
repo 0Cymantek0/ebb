@@ -29,6 +29,7 @@ import (
 
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
+	"ebb/internal/platform"
 	"ebb/internal/restore"
 )
 
@@ -108,6 +109,11 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 		Store: sess.store,
 		Cat:   sess.cat,
 		Probe: deps.NewProbe(),
+		// Native link recreation: junctions unprivileged on Windows,
+		// symlinks privilege-typed (Wave F link staging). The stdlib
+		// default cannot create junctions, so production injects the
+		// platform implementation.
+		CreateLink: platform.CreateLink,
 	})
 	if err != nil {
 		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
