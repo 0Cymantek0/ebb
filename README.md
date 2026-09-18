@@ -1,4 +1,4 @@
-# Ark foundation package
+# Ebb foundation package
 
 Read `Foundation.md` first. It is the product and implementation baseline, including problem definition, decisions, contracts, sequencing and release gates.
 
