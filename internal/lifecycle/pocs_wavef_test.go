@@ -5,23 +5,20 @@
 // -tags security_poc so the default suite stays green by design (Wave C
 // precedent, lab/security-review).
 //
-// F1  Tampered retained documents (P's manifest/inventory) steer
+// F1  FIXED (Wave F secfix, regression form): retained-document re-reads
 //
-//	Recover/ResumeRemoval into deleting files OUTSIDE the quarantine:
-//	parseInventoryLines and the trim-plan re-read never validate entry
-//	paths (Foundation §13.4 requires rejecting traversal), and the
-//	catalog row's seal-time Manifest/Inventory digests are never
-//	cross-checked on the resume path.
+//	now validate every entry (Entry.Validate) AND cross-check the
+//	catalog's seal-time manifest/inventory digests; the removal permit
+//	re-validates entry paths as the last gate. The PoCs below assert
+//	the tampered-payload attacks are REFUSED with the victim intact.
 //
-// F2  Retained trim-plan Outputs feed removeEmptyAncestors unvalidated:
+// F2  FIXED (regression form): removeEmptyAncestors path-validates every
 //
-//	a tampered plan climbs outside the live root and deletes empty
-//	directories there.
+//	plan-supplied output before climbing.
 //
-// F3  removeEmptyAncestors violates the no-follow discipline: os.ReadDir
+// F3  FIXED (regression form): the ancestor climb classifies via Lstat
 //
-//	follows a junction substituted for an ancestor, and the junction
-//	link (user content, not a sealed member) is removed.
+//	first and never follows or removes a link.
 //
 // F5  Crash window between the quarantine rename and the QUARANTINED CAS
 //
@@ -59,10 +56,10 @@ import (
 
 // ---- F1 -----------------------------------------------------------------
 
-// TestPoC parseInventoryLines accepts traversal entries: the strict JSON
-// reader rejects unknown FIELDS but never runs domain.Entry.Validate, so
-// "../precious-victim.txt" parses into an Entry that later reaches the
-// removal permit.
+// TestPoCRetainedInventoryTraversalParses (FIXED, regression form): the
+// retained-inventory reader must reject a traversal entry with a typed
+// journal-mismatch error — never parse it into an Entry that could reach
+// a removal permit.
 func TestPoCRetainedInventoryTraversalParses(t *testing.T) {
 	line, err := json.Marshal(inventoryRecord{Entry: domain.Entry{
 		Root: domain.RootMain, Path: "../precious-victim.txt",
@@ -75,19 +72,17 @@ func TestPoCRetainedInventoryTraversalParses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entries, perr := parseInventoryLines(append(line, '\n'))
-	if perr != nil {
-		t.Fatalf("parseInventoryLines rejected the hostile line: %v", perr)
+	_, perr := parseInventoryLines(append(line, '\n'))
+	if perr == nil {
+		t.Fatalf("F1 REGRESSION: parseInventoryLines accepted a traversal entry (../precious-victim.txt) — validation lost")
 	}
-	if len(entries) != 1 || entries[0].Path != "../precious-victim.txt" {
-		t.Fatalf("unexpected entries: %+v", entries)
+	var jm *ErrJournalMismatch
+	if !errors.As(perr, &jm) {
+		t.Fatalf("rejection is not a typed ErrJournalMismatch: %v", perr)
 	}
-	if verr := entries[0].Validate(); verr == nil {
-		t.Log("note: Validate() accepts this shape too (no '..' at position 0? recheck domain)")
-	} else {
-		t.Logf("domain.Entry.Validate WOULD reject it (%v) — but parseInventoryLines never calls it", verr)
+	if !strings.Contains(perr.Error(), "precious-victim.txt") {
+		t.Fatalf("rejection does not name the offending path: %v", perr)
 	}
-	t.Errorf("F1 CONFIRMED: lifecycle's retained-inventory reader accepts a traversal entry (../precious-victim.txt) without validation; restore's parseInventory rejects the same line")
 }
 
 // TestPoCTamperedPayloadDeletesOutsideQuarantine — end-to-end F1: park is
@@ -166,28 +161,40 @@ func TestPoCTamperedPayloadDeletesOutsideQuarantine(t *testing.T) {
 	if err := os.WriteFile(snapInv, invBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// Count the original records for the manifest patch.
-	origEntries, perr := parseInventoryLines(invBytes)
-	if perr != nil {
-		t.Fatal(perr)
+	// Count the original records for the manifest patch (counting only —
+	// the validating reader correctly refuses the tampered line).
+	origCount := 0
+	for _, line := range strings.Split(string(invBytes), "\n") {
+		if line != "" {
+			origCount++
+		}
 	}
 	patchManifestDigest(t,
 		filepath.Join(h.vault.RepoDir, "snap", op.PayloadSnap, opDirName(opID), manifestName),
-		digestBytes(invBytes), int64(len(origEntries)))
+		digestBytes(invBytes), int64(origCount))
 
 	// Fresh coordinator (new-process simulation) runs plain Recover —
-	// NO --resume-removal, no writer re-assertion (also F7 evidence).
+	// the tampered, internally self-consistent documents must now be
+	// REFUSED: the catalog's seal-time digests disagree with the
+	// tampered inventory (and the traversal entry itself fails
+	// validation first). Nothing outside the quarantine is touched.
 	rep, rerr := h.coord().Recover(context.Background(), h.vault, opID)
-	if rerr != nil {
-		t.Fatalf("Recover failed: %v (report %+v)", rerr, rep)
+	if rerr == nil {
+		t.Fatalf("F1 REGRESSION: Recover accepted tampered documents (phase after=%s)", rep.PhaseAfter)
 	}
-	if rep.PhaseAfter != catalog.PhaseDone {
-		t.Fatalf("phase after recover = %s, want DONE", rep.PhaseAfter)
+	var jm *ErrJournalMismatch
+	if !errors.As(rerr, &jm) {
+		t.Fatalf("Recover refusal is not a typed ErrJournalMismatch: %v", rerr)
 	}
-	if _, serr := os.Lstat(victim); !errors.Is(serr, os.ErrNotExist) {
-		t.Fatalf("F1 CONFIRMED: victim %s still exists — walk did not delete it (unexpected)", victim)
+	if phase := h.phaseOf(t, opID); phase == catalog.PhaseDone {
+		t.Fatalf("F1 REGRESSION: operation reached DONE on tampered evidence")
 	}
-	t.Errorf("F1 CONFIRMED: Recover completed the removal walk and DELETED %s (outside the quarantine); phase DONE; every check in loadPayloadEvidence passed on the tampered, self-consistent documents", victim)
+	if _, serr := os.Lstat(victim); serr != nil {
+		t.Fatalf("F1 REGRESSION: victim %s was deleted: %v", victim, serr)
+	}
+	if _, serr := os.Lstat(quarantinePath(filepath.Dir(root), opID)); serr != nil {
+		t.Fatalf("quarantine content disturbed by the refused recovery: %v", serr)
+	}
 }
 
 func patchManifestDigest(t *testing.T, manifestPath, newInvDigest string, count int64) {
@@ -217,11 +224,10 @@ func patchManifestDigest(t *testing.T, manifestPath, newInvDigest string, count 
 
 // ---- F2 -----------------------------------------------------------------
 
-// TestPoCTrimOutputsClimbOutsideRoot: permit.removeEmptyAncestors with a
-// retained-plan Outputs entry containing ".." (possible only via a
-// tampered/corrupt removal manifest — the policy layer validates fresh
-// trims, resumeTrimRemoval does not re-validate) removes empty
-// directories OUTSIDE the live root.
+// TestPoCTrimOutputsClimbOutsideRoot (FIXED, regression form): a
+// retained-plan Outputs entry containing ".." must be REFUSED by
+// removeEmptyAncestors's path validation before any climb; nothing
+// outside the live root is touched.
 func TestPoCTrimOutputsClimbOutsideRoot(t *testing.T) {
 	h := newHarness(t)
 	root := h.workspace("ws")
@@ -252,24 +258,23 @@ func TestPoCTrimOutputsClimbOutsideRoot(t *testing.T) {
 	if err := os.MkdirAll(outA, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := permit.removeEmptyAncestors([]string{"../outside-empty/deep/output"}, nil); err != nil {
-		t.Fatalf("removeEmptyAncestors: %v", err)
+	if err := permit.removeEmptyAncestors([]string{"../outside-empty/deep/output"}, nil); err == nil {
+		t.Fatalf("F2 REGRESSION: removeEmptyAncestors accepted a traversal output")
 	}
-	if _, serr := os.Lstat(outA); !errors.Is(serr, os.ErrNotExist) {
-		t.Fatalf("outside dir %s still exists (unexpected)", outA)
+	if _, serr := os.Lstat(outA); serr != nil {
+		t.Fatalf("F2 REGRESSION: outside dir %s was removed: %v", outA, serr)
 	}
-	if _, serr := os.Lstat(filepath.Join(h.base, "work", "outside-empty")); !errors.Is(serr, os.ErrNotExist) {
-		t.Fatalf("outside dir parent still exists (unexpected)")
+	if _, serr := os.Lstat(filepath.Join(h.base, "work", "outside-empty")); serr != nil {
+		t.Fatalf("F2 REGRESSION: outside dir parent was removed: %v", serr)
 	}
-	t.Errorf("F2 CONFIRMED: unvalidated trim Outputs removed empty directories outside the live root (%s)", outA)
 }
 
 // ---- F3 (Windows: junction) ----------------------------------------------
 
-// TestPoCAncestorWalkFollowsJunction: an ancestor directory replaced by a
-// junction is READ THROUGH (os.ReadDir follows the link outside the root)
-// and then the junction link itself — user content that is not a sealed
-// group member — is removed. §12.2 step 8 requires no-follow operations.
+// TestPoCAncestorWalkFollowsJunction (FIXED, regression form): an
+// ancestor directory replaced by a junction must STOP the climb — the
+// link is user content, never read through and never removed (§12.2
+// step 8 no-follow).
 func TestPoCAncestorWalkFollowsJunction(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("junction fixture is windows-only")
@@ -297,17 +302,9 @@ func TestPoCAncestorWalkFollowsJunction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// g/ is a retained directory (no members under it) holding one file.
+	// g/ is a retained directory (no members under it), replaced by a
+	// junction to an EMPTY outside directory.
 	if err := os.MkdirAll(filepath.Join(root, "g"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "g", "user.txt"), []byte("user's own file\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// Replace g/ with a junction to an EMPTY outside directory (the
-	// substitution the permit's kind checks exist to catch — but
-	// removeEmptyAncestors performs no kind check).
-	if err := os.Remove(filepath.Join(root, "g", "user.txt")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(filepath.Join(root, "g")); err != nil {
@@ -322,15 +319,14 @@ func TestPoCAncestorWalkFollowsJunction(t *testing.T) {
 	}
 
 	if err := permit.removeEmptyAncestors([]string{"g/x"}, nil); err != nil {
-		t.Fatalf("removeEmptyAncestors: %v", err)
+		t.Fatalf("removeEmptyAncestors errored on a legitimate output: %v", err)
 	}
-	if _, serr := os.Lstat(filepath.Join(root, "g")); !errors.Is(serr, os.ErrNotExist) {
-		t.Fatalf("junction at root/g still exists (unexpected — no deletion happened)")
+	if _, serr := os.Lstat(filepath.Join(root, "g")); serr != nil {
+		t.Fatalf("F3 REGRESSION: the junction at root/g was removed: %v", serr)
 	}
 	if _, serr := os.Lstat(outside); serr != nil {
-		t.Fatalf("outside target damaged: %v", serr)
+		t.Fatalf("F3 REGRESSION: outside target damaged: %v", serr)
 	}
-	t.Errorf("F3 CONFIRMED: removeEmptyAncestors followed the substituted junction outside the root for its emptiness decision and removed the junction link (non-member user content) without any kind/no-follow check")
 }
 
 // ---- F5 -----------------------------------------------------------------
