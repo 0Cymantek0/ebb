@@ -129,17 +129,17 @@ type Streams struct {
 // operation facts; each is omitted when the command produced no value
 // for it.
 type Envelope struct {
-	OperationID string   `json:"operation_id,omitempty"`
-	Command     string   `json:"command"`
-	Phase       string   `json:"phase,omitempty"`
-	WorkspaceID string   `json:"workspace_id,omitempty"`
-	SnapshotID  string   `json:"snapshot_id,omitempty"`
-	Outcome     string   `json:"outcome"`
-	Conditions  []string `json:"conditions,omitempty"`
+	OperationID string        `json:"operation_id,omitempty"`
+	Command     string        `json:"command"`
+	Phase       string        `json:"phase,omitempty"`
+	WorkspaceID string        `json:"workspace_id,omitempty"`
+	SnapshotID  string        `json:"snapshot_id,omitempty"`
+	Outcome     string        `json:"outcome"`
+	Conditions  []string      `json:"conditions,omitempty"`
 	Bytes       *BytesSummary `json:"bytes,omitempty"`
-	Details     any      `json:"details,omitempty"`
-	Warnings    []string `json:"warnings"`
-	Errors      []string `json:"errors"`
+	Details     any           `json:"details,omitempty"`
+	Warnings    []string      `json:"warnings"`
+	Errors      []string      `json:"errors"`
 }
 
 // BytesSummary carries the §17.2 byte counters, one field per meaning

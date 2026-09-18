@@ -34,13 +34,13 @@ import (
 
 // openDetails is the --json payload of a completed files-only open.
 type openDetails struct {
-	Workspace        string             `json:"workspace"`
-	SnapshotID       string             `json:"snapshot_id"`
-	Kind             string             `json:"snapshot_kind"`
-	Destination      string             `json:"destination"`
-	EntriesRestored  int64              `json:"entries_restored"`
-	BytesRestored    int64              `json:"bytes_restored"`
-	RebuildHints     []openRebuildHint  `json:"rebuild_hints"`
+	Workspace       string            `json:"workspace"`
+	SnapshotID      string            `json:"snapshot_id"`
+	Kind            string            `json:"snapshot_kind"`
+	Destination     string            `json:"destination"`
+	EntriesRestored int64             `json:"entries_restored"`
+	BytesRestored   int64             `json:"bytes_restored"`
+	RebuildHints    []openRebuildHint `json:"rebuild_hints"`
 }
 
 type openRebuildHint struct {

@@ -36,22 +36,22 @@ type initVault struct {
 // initGroup is one detected ecosystem group (a suggestion, never a
 // decision).
 type initGroup struct {
-	ID         string `json:"id"`
-	Adapter    string `json:"adapter"`
-	Outputs    []string `json:"outputs"`
-	Inputs     []string `json:"inputs"`
-	ApproxBytes int64 `json:"approx_bytes"`
-	Present    bool   `json:"present"`
-	Confidence string `json:"confidence"`
+	ID          string   `json:"id"`
+	Adapter     string   `json:"adapter"`
+	Outputs     []string `json:"outputs"`
+	Inputs      []string `json:"inputs"`
+	ApproxBytes int64    `json:"approx_bytes"`
+	Present     bool     `json:"present"`
+	Confidence  string   `json:"confidence"`
 }
 
 // initDetails is the --json payload of init.
 type initDetails struct {
-	StateDir  string      `json:"state_dir"`
-	Catalog   string      `json:"catalog"`
-	Vault     *initVault  `json:"vault,omitempty"`
-	Groups    []initGroup `json:"groups"`
-	Notes     []string    `json:"notes"`
+	StateDir string      `json:"state_dir"`
+	Catalog  string      `json:"catalog"`
+	Vault    *initVault  `json:"vault,omitempty"`
+	Groups   []initGroup `json:"groups"`
+	Notes    []string    `json:"notes"`
 }
 
 func cmdInit(args []string, streams Streams, deps Deps) int {

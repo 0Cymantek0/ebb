@@ -247,7 +247,11 @@ func copyIntoTree(src, dst string) error {
 // The real probe stays the truth source; the wrapper only injects faults
 // at exact sequence points.
 type wrapProbe struct {
-	inner domain.PlatformProbe
+	// Embedding the INTERFACE (not a concrete probe) keeps optional
+	// capabilities like VerifiedDirProbe promoted through the wrapper —
+	// a concrete-method wrapper silently drops them and falls the
+	// scanner back to path-based descent (Wave E e2e finding).
+	domain.PlatformProbe
 	// onRootIdentity may answer (handled=true) or just observe.
 	onRootIdentity func(path string) (domain.RootIdentity, error, bool)
 	// onProbeFile observes every ProbeFile call.
@@ -260,18 +264,14 @@ func (w *wrapProbe) RootIdentity(path string) (domain.RootIdentity, error) {
 			return id, err
 		}
 	}
-	return w.inner.RootIdentity(path)
-}
-
-func (w *wrapProbe) VolumeUsage(path string) (domain.VolumeUsage, error) {
-	return w.inner.VolumeUsage(path)
+	return w.PlatformProbe.RootIdentity(path)
 }
 
 func (w *wrapProbe) ProbeFile(path string) (domain.FileFacts, error) {
 	if w.onProbeFile != nil {
 		w.onProbeFile(path)
 	}
-	return w.inner.ProbeFile(path)
+	return w.PlatformProbe.ProbeFile(path)
 }
 
 // ---- harness -----------------------------------------------------------
@@ -294,7 +294,7 @@ func newHarness(t *testing.T) *harness {
 		t:       t,
 		base:    base,
 		store:   newFakeStore(),
-		probe:   &wrapProbe{inner: platform.New()},
+		probe:   &wrapProbe{PlatformProbe: platform.New()},
 		catPath: filepath.Join(base, "catalog.db"),
 	}
 	h.vault = VaultRef{

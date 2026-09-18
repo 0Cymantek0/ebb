@@ -93,10 +93,10 @@ func cmdPark(args []string, streams Streams, deps Deps) int {
 	}
 
 	details := parkDetails{
-		snapshotDetails:        snapshotDetailsFrom(opts.WorkspaceName, disc.Root, res.Snapshot),
-		WriterAssertionSource:  assertion,
-		FreedObserved:          res.VolumeDeltaObserved,
-		FreedEstimated:         res.VolumeDeltaEstimated,
+		snapshotDetails:       snapshotDetailsFrom(opts.WorkspaceName, disc.Root, res.Snapshot),
+		WriterAssertionSource: assertion,
+		FreedObserved:         res.VolumeDeltaObserved,
+		FreedEstimated:        res.VolumeDeltaEstimated,
 	}
 	env.Outcome = "ok"
 	env.Phase = catalog.PhaseDone

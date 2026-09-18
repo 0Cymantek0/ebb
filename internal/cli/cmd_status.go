@@ -25,13 +25,13 @@ type statusDetails struct {
 // statusWorkspace is one workspace row plus its snapshots and active
 // operations.
 type statusWorkspace struct {
-	ID              string             `json:"id"`
-	Name            string             `json:"name"`
-	Status          string             `json:"status"`
-	Root            string             `json:"root,omitempty"`
-	CreatedAt       string             `json:"created_at"`
-	LatestSnapshots []statusSnapshot   `json:"latest_snapshots"`
-	ActiveOps       []statusOperation  `json:"active_operations"`
+	ID              string            `json:"id"`
+	Name            string            `json:"name"`
+	Status          string            `json:"status"`
+	Root            string            `json:"root,omitempty"`
+	CreatedAt       string            `json:"created_at"`
+	LatestSnapshots []statusSnapshot  `json:"latest_snapshots"`
+	ActiveOps       []statusOperation `json:"active_operations"`
 }
 
 // statusSnapshot is one retained snapshot of the workspace (the newest

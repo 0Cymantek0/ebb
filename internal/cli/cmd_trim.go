@@ -28,14 +28,14 @@ import (
 
 // trimDetails is the --json payload of a completed trim.
 type trimDetails struct {
-	Workspace       string       `json:"workspace"`
-	Root            string       `json:"root"`
-	SnapshotID      string       `json:"snapshot_id"`
-	Groups          []string     `json:"groups"`
-	EntriesRemoved  int          `json:"entries_removed"`
-	ReclaimCommands [][]string    `json:"reclaim_commands"`
-	EntriesPreserved int64       `json:"entries_preserved"`
-	EntriesOmitted  int64        `json:"entries_omitted"`
+	Workspace        string     `json:"workspace"`
+	Root             string     `json:"root"`
+	SnapshotID       string     `json:"snapshot_id"`
+	Groups           []string   `json:"groups"`
+	EntriesRemoved   int        `json:"entries_removed"`
+	ReclaimCommands  [][]string `json:"reclaim_commands"`
+	EntriesPreserved int64      `json:"entries_preserved"`
+	EntriesOmitted   int64      `json:"entries_omitted"`
 }
 
 func cmdTrim(args []string, streams Streams, deps Deps) int {
@@ -161,7 +161,7 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 		Workspace: opts.WorkspaceName, Root: disc.Root,
 		SnapshotID: string(res.Snapshot.SnapshotID),
 		Groups:     res.Groups, EntriesRemoved: res.EntriesRemoved,
-		ReclaimCommands: res.ReclaimCommands,
+		ReclaimCommands:  res.ReclaimCommands,
 		EntriesPreserved: res.Snapshot.EntriesPreserved,
 		EntriesOmitted:   res.Snapshot.EntriesOmitted,
 	}

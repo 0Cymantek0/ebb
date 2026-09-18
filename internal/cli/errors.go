@@ -22,8 +22,8 @@ import (
 // errors carry their own EBB_E_* codes; these are the blockers the CLI
 // layer itself raises before a coordinator call.
 const (
-	CodeNoVault          = "EBB_E_NO_VAULT"
-	CodeUnlockRejected   = "EBB_E_UNLOCK_REJECTED"
+	CodeNoVault           = "EBB_E_NO_VAULT"
+	CodeUnlockRejected    = "EBB_E_UNLOCK_REJECTED"
 	CodeWritersUnasserted = "EBB_E_WRITERS_UNASSERTED"
 	CodeOpenUnknownTarget = "EBB_E_OPEN_UNKNOWN_TARGET"
 	CodeOpenNoDestination = "EBB_E_OPEN_NO_DESTINATION"

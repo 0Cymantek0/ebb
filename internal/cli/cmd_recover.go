@@ -25,17 +25,17 @@ import (
 
 // recoverDetails is the --json payload: the RecoveryReport verbatim.
 type recoverDetails struct {
-	OperationID       string   `json:"operation_id"`
-	WorkspaceID       string   `json:"workspace_id"`
-	Kind              string   `json:"kind"`
-	PhaseBefore       string   `json:"phase_before"`
-	PhaseAfter        string   `json:"phase_after"`
-	Actions           []string `json:"actions"`
-	Remaining         []string `json:"remaining"`
-	LastRemovedPath   string   `json:"last_removed_path,omitempty"`
-	LastRemovedCount  int      `json:"last_removed_count,omitempty"`
-	NextAction        string   `json:"next_action"`
-	Warnings          []string `json:"warnings"`
+	OperationID      string   `json:"operation_id"`
+	WorkspaceID      string   `json:"workspace_id"`
+	Kind             string   `json:"kind"`
+	PhaseBefore      string   `json:"phase_before"`
+	PhaseAfter       string   `json:"phase_after"`
+	Actions          []string `json:"actions"`
+	Remaining        []string `json:"remaining"`
+	LastRemovedPath  string   `json:"last_removed_path,omitempty"`
+	LastRemovedCount int      `json:"last_removed_count,omitempty"`
+	NextAction       string   `json:"next_action"`
+	Warnings         []string `json:"warnings"`
 }
 
 func cmdRecover(args []string, streams Streams, deps Deps) int {

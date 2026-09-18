@@ -39,10 +39,10 @@ type eFakeSnap struct {
 }
 
 type eFakeStore struct {
-	mu        sync.Mutex
-	next      int
-	snaps     map[string]*eFakeSnap
-	tags      map[string]map[string]string
+	mu         sync.Mutex
+	next       int
+	snaps      map[string]*eFakeSnap
+	tags       map[string]map[string]string
 	onSnapshot func(tags map[string]string) error
 }
 
@@ -267,8 +267,12 @@ type eProbe struct {
 	onProbeFile func(path string)
 }
 
-func (p *eProbe) RootIdentity(path string) (domain.RootIdentity, error) { return p.inner.RootIdentity(path) }
-func (p *eProbe) VolumeUsage(path string) (domain.VolumeUsage, error)  { return p.inner.VolumeUsage(path) }
+func (p *eProbe) RootIdentity(path string) (domain.RootIdentity, error) {
+	return p.inner.RootIdentity(path)
+}
+func (p *eProbe) VolumeUsage(path string) (domain.VolumeUsage, error) {
+	return p.inner.VolumeUsage(path)
+}
 func (p *eProbe) ProbeFile(path string) (domain.FileFacts, error) {
 	if p.onProbeFile != nil {
 		p.onProbeFile(path)
@@ -297,8 +301,8 @@ type eHarness struct {
 	deps     Deps
 
 	// signal context control
-	ctx        context.Context
-	cancelSig  context.CancelFunc
+	ctx       context.Context
+	cancelSig context.CancelFunc
 
 	// terminal control
 	tty   bool
@@ -393,14 +397,14 @@ outputs = ["node_modules"]
 inputs = ["package.json", "pnpm-lock.yaml"]
 network = "allowed"
 `,
-		"package.json":     `{"name":"cliws","version":"1.0.0","private":true}` + "\n",
-		"pnpm-lock.yaml":   "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad: 1.3.0\n",
-		"notes.md":         "private notes that must survive everything\n",
-		".env":             "SECRET_TOKEN=ecli-do-not-print\n",
-		"src/main.go":      "package main\n\nfunc main() { println(\"cliws\") }\n",
-		"node_modules/.package-lock.json": `{"lockfileVersion":3}`,
+		"package.json":                       `{"name":"cliws","version":"1.0.0","private":true}` + "\n",
+		"pnpm-lock.yaml":                     "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad: 1.3.0\n",
+		"notes.md":                           "private notes that must survive everything\n",
+		".env":                               "SECRET_TOKEN=ecli-do-not-print\n",
+		"src/main.go":                        "package main\n\nfunc main() { println(\"cliws\") }\n",
+		"node_modules/.package-lock.json":    `{"lockfileVersion":3}`,
 		"node_modules/left-pad/package.json": "{\n  \"name\": \"left-pad\",\n  \"version\": \"1.3.0\"\n}\n",
-		"node_modules/left-pad/index.js":    "module.exports = () => 1;\n",
+		"node_modules/left-pad/index.js":     "module.exports = () => 1;\n",
 	}
 	for rel, content := range files {
 		p := filepath.Join(h.wsRoot, filepath.FromSlash(rel))

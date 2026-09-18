@@ -22,19 +22,19 @@ import (
 // snapshotDetails is the --json payload shared by snapshot and park (park
 // embeds it plus its tail measurements).
 type snapshotDetails struct {
-	Workspace        string   `json:"workspace"`
-	Root             string   `json:"root"`
-	SnapshotID       string   `json:"snapshot_id"`
+	Workspace        string    `json:"workspace"`
+	Root             string    `json:"root"`
+	SnapshotID       string    `json:"snapshot_id"`
 	BackendIDs       [2]string `json:"backend_ids"`
-	EntriesPreserved int64    `json:"entries_preserved"`
-	EntriesOmitted   int64    `json:"entries_omitted"`
-	PreservedBytes   int64    `json:"preserved_bytes"`
+	EntriesPreserved int64     `json:"entries_preserved"`
+	EntriesOmitted   int64     `json:"entries_omitted"`
+	PreservedBytes   int64     `json:"preserved_bytes"`
 }
 
 func snapshotDetailsFrom(wsName, root string, r lifecycle.SnapshotResult) snapshotDetails {
 	return snapshotDetails{
 		Workspace: wsName, Root: root, SnapshotID: string(r.SnapshotID),
-		BackendIDs: r.BackendIDs,
+		BackendIDs:       r.BackendIDs,
 		EntriesPreserved: r.EntriesPreserved, EntriesOmitted: r.EntriesOmitted,
 		PreservedBytes: r.PreservedBytes,
 	}

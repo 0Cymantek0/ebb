@@ -223,7 +223,7 @@ func TestPermitDigestChangeBlocks(t *testing.T) {
 	h := newHarness(t)
 	root := h.workspace("ws")
 
-	res := inventory.Scan(context.Background(), h.probe.inner, root, inventory.Options{Hash: true})
+	res := inventory.Scan(context.Background(), h.probe.PlatformProbe, root, inventory.Options{Hash: true})
 	if res.Err != nil {
 		t.Fatalf("scan: %v", res.Err)
 	}
@@ -231,7 +231,7 @@ func TestPermitDigestChangeBlocks(t *testing.T) {
 	for _, e := range res.Entries {
 		allowed[e.Path] = e
 	}
-	ident, err := h.probe.inner.RootIdentity(root)
+	ident, err := h.probe.PlatformProbe.RootIdentity(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestPermitDigestChangeBlocks(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "vendor", "dist", "gen.js"), []byte("tampered\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err = permit.execute(context.Background(), h.probe.inner, nil, nil)
+	_, err = permit.execute(context.Background(), h.probe.PlatformProbe, nil, nil)
 	var blocked *ErrRemovalBlocked
 	if !errors.As(err, &blocked) || blocked.Code != BlockDigestChanged {
 		t.Fatalf("expected ErrRemovalBlocked{%s}, got %v", BlockDigestChanged, err)
