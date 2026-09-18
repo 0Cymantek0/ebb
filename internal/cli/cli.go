@@ -192,6 +192,10 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdInspect(args[1:], streams, deps)
 	case "plan":
 		return cmdPlan(args[1:], streams, deps)
+	case "snapshot":
+		return cmdSnapshot(args[1:], streams, deps)
+	case "park":
+		return cmdPark(args[1:], streams, deps)
 	case "doctor":
 		return cmdDoctor(args[1:], streams)
 	case "help", "-h", "--help":
