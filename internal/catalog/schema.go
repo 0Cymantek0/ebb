@@ -1,0 +1,123 @@
+package catalog
+
+// Forward-only schema migrations. The slice index is the version
+// recorded in schema_migrations; migration N runs inside one transaction
+// together with its version insert (see Catalog.migrate).
+var migrations = []string{schemaV1}
+
+// schemaMigrationsDDL is created separately from any versioned
+// migration so a fresh database can record versions at all.
+const schemaMigrationsDDL = `CREATE TABLE IF NOT EXISTS schema_migrations (
+	version INTEGER PRIMARY KEY,
+	applied_at TEXT NOT NULL
+)`
+
+// schemaV1 is the Foundation §16.5 minimum table set. Notes:
+//
+//   - workspaces.status is 'live', 'parked' or 'UNBOUND'. UNBOUND is the
+//     post-rebuild state: a seal proves a snapshot exists, never that the
+//     source was removed (§16.5), so catalog reconstruction never guesses
+//     liveness.
+//   - snapshots.pinned defaults TRUE with a JSON pin-reason audit list
+//     (invariant I07: a live workspace always keeps a recovery
+//     obligation; a snapshot is presumed retained until explicitly
+//     unpinned).
+//   - replicas and action_runs carry future-wave data (verification
+//     receipts, approved-action history); the tables exist now so later
+//     waves never need destructive migrations.
+const schemaV1 = `
+CREATE TABLE workspaces (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	root_path TEXT,
+	root_identity TEXT,
+	status TEXT NOT NULL DEFAULT 'UNBOUND'
+);
+
+CREATE TABLE vaults (
+	id TEXT PRIMARY KEY,
+	path TEXT NOT NULL,
+	repo_id TEXT,
+	kind TEXT NOT NULL DEFAULT 'local',
+	registered_at TEXT NOT NULL
+);
+
+CREATE TABLE snapshots (
+	id TEXT PRIMARY KEY,
+	workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+	created_at TEXT NOT NULL,
+	payload_backend_id TEXT,
+	seal_backend_id TEXT,
+	vault_id TEXT REFERENCES vaults(id),
+	manifest_digest TEXT,
+	inventory_digest TEXT,
+	kind TEXT NOT NULL,
+	pinned INTEGER NOT NULL DEFAULT 1,
+	pin_reasons TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE TABLE replicas (
+	id TEXT PRIMARY KEY,
+	snapshot_id TEXT REFERENCES snapshots(id),
+	vault_id TEXT REFERENCES vaults(id),
+	verified_at TEXT,
+	scope TEXT,
+	UNIQUE (snapshot_id, vault_id)
+);
+
+CREATE TABLE operations (
+	id TEXT PRIMARY KEY,
+	workspace_id TEXT REFERENCES workspaces(id),
+	kind TEXT NOT NULL,
+	phase TEXT NOT NULL,
+	generation INTEGER NOT NULL DEFAULT 1,
+	source_root TEXT,
+	source_identity TEXT,
+	dest_path TEXT,
+	payload_snap TEXT,
+	seal_snap TEXT,
+	intent_digest TEXT,
+	last_error TEXT,
+	next_action TEXT,
+	started_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+
+CREATE TABLE action_runs (
+	id TEXT PRIMARY KEY,
+	operation_id TEXT REFERENCES operations(id),
+	action_id TEXT,
+	status TEXT,
+	exit_code INTEGER,
+	started_at TEXT,
+	ended_at TEXT,
+	output_excerpt TEXT
+);
+
+CREATE TABLE approvals (
+	id TEXT PRIMARY KEY,
+	workspace_id TEXT REFERENCES workspaces(id),
+	action_id TEXT NOT NULL,
+	argv_digest TEXT NOT NULL,
+	tool_identity TEXT,
+	input_digests TEXT NOT NULL,
+	network TEXT,
+	approved_by TEXT NOT NULL DEFAULT 'user',
+	approved_at TEXT NOT NULL,
+	revoked_at TEXT
+);
+
+CREATE TABLE retention_intents (
+	id TEXT PRIMARY KEY,
+	snapshot_id TEXT REFERENCES snapshots(id),
+	requested_by TEXT,
+	acknowledged TEXT NOT NULL DEFAULT '0',
+	created_at TEXT NOT NULL,
+	completed_at TEXT
+);
+
+CREATE INDEX idx_snapshots_workspace ON snapshots(workspace_id, created_at);
+CREATE INDEX idx_snapshots_vault ON snapshots(vault_id);
+CREATE INDEX idx_operations_workspace ON operations(workspace_id, updated_at);
+`

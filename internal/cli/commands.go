@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -44,53 +45,6 @@ func cmdVersion(args []string, streams Streams) int {
 	return ExitOK
 }
 
-// cmdInspect implements `ebb inspect <path>`. The inventory seam is a
-// wave-B stub, so the command currently reports "not yet integrated"
-// with exit 2 (unsupported command feature).
-func cmdInspect(args []string, streams Streams, deps Deps) int {
-	fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
-	fs.SetOutput(streams.Err)
-	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
-	if err := fs.Parse(args); err != nil {
-		return ExitUsage
-	}
-	root := "."
-	if fs.NArg() > 1 {
-		fmt.Fprintf(streams.Err, "ebb inspect: takes at most one path\n")
-		return ExitUsage
-	}
-	if fs.NArg() == 1 {
-		root = fs.Arg(0)
-	}
-
-	scan := deps.ScanInventory
-	if scan == nil {
-		scan = DefaultDeps().ScanInventory
-	}
-	_, _, _, err := scan(root)
-	env := newEnvelope("inspect", "error")
-	if err != nil {
-		if errors.Is(err, ErrNotIntegrated) {
-			env.Outcome = "unsupported"
-			env.Errors = []string{"inspect: inventory scan " + err.Error()}
-		} else {
-			env.Errors = []string{fmt.Sprintf("inspect %s: %v", root, err)}
-		}
-	} else {
-		// Unreachable until wave B wires a real scanner; kept so the
-		// success path is explicit rather than implicit.
-		env.Outcome = "ok"
-	}
-	emit(env, *jsonOut, streams, fmt.Sprintf("inspect %s: %s\n", root, env.Outcome))
-	if env.Outcome == "ok" {
-		return ExitOK
-	}
-	if env.Outcome == "unsupported" {
-		return ExitUsage
-	}
-	return ExitBlocked
-}
-
 // planDetails is the --json payload of the plan command.
 type planDetails struct {
 	Workspace string       `json:"workspace"`
@@ -99,7 +53,10 @@ type planDetails struct {
 
 // cmdPlan implements `ebb plan <path>`: parse the Ebbfile (or apply
 // conservative defaults), load or scan an inventory, resolve routes and
-// compute the effect-free plan.
+// compute the effect-free plan. The default path is a LIVE scan through
+// Deps (identity, git evidence, metadata-first inventory); the
+// --from-inventory seam loads a saved inventory JSON instead (kept as a
+// test seam; saved entries skip the live git annotation).
 func cmdPlan(args []string, streams Streams, deps Deps) int {
 	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
 	fs.SetOutput(streams.Err)
@@ -135,57 +92,52 @@ func cmdPlan(args []string, streams Streams, deps Deps) int {
 		target = &t
 	}
 
-	// Policy: an explicit Ebbfile must parse strictly; when absent the
-	// conservative defaults apply (Foundation §7.1).
-	pol, polErr := policy.ParseFile(filepath.Join(root, "Ebbfile.toml"))
-	switch {
-	case polErr == nil:
-	case errors.Is(polErr, os.ErrNotExist):
-		pol = policy.Default(workspaceLabel(root))
-	default:
-		env.Errors = []string{polErr.Error()}
-		return fail(ExitUsage)
-	}
-
-	// Inventory.
+	// Inventory + policy. The --from-inventory seam reproduces the wave-A
+	// behavior exactly; the live path runs the full discovery pipeline.
 	var (
-		summary domain.InventorySummary
-		entries []domain.Entry
-		volume  domain.VolumeUsage
+		summary  domain.InventorySummary
+		entries  []domain.Entry
+		volume   domain.VolumeUsage
+		pol      policy.Policy
+		resolved policy.Resolved
 	)
 	if *fromInventory != "" {
+		// Policy: an explicit Ebbfile must parse strictly; when absent the
+		// conservative defaults apply (Foundation §7.1).
+		p, polErr := policy.ParseFile(filepath.Join(root, "Ebbfile.toml"))
+		switch {
+		case polErr == nil:
+		case errors.Is(polErr, os.ErrNotExist):
+			p = policy.Default(workspaceLabel(root))
+		default:
+			env.Errors = []string{polErr.Error()}
+			return fail(ExitUsage)
+		}
 		inv, err := LoadInventory(*fromInventory)
 		if err != nil {
 			env.Errors = []string{fmt.Sprintf("--from-inventory: %v", err)}
 			return fail(ExitUsage)
 		}
+		pol = p
 		summary, entries, volume = inv.Summary, inv.Entries, inv.Volume
-	} else {
-		scan := deps.ScanInventory
-		if scan == nil {
-			scan = DefaultDeps().ScanInventory
-		}
-		s, es, v, err := scan(root)
+		r, err := policy.Resolve(entries, pol)
 		if err != nil {
-			if errors.Is(err, ErrNotIntegrated) {
-				env.Outcome = "unsupported"
-				env.Errors = []string{"plan: inventory scan " + err.Error() + "; pass --from-inventory or wait for wave B"}
-			} else {
-				env.Errors = []string{fmt.Sprintf("plan %s: %v", root, err)}
-			}
+			env.Errors = []string{err.Error()}
+			return fail(ExitUsage)
+		}
+		resolved = r
+	} else {
+		disc, err := runDiscovery(context.Background(), deps, root, streams.Err)
+		if err != nil {
+			var ce *cliError
 			code := ExitBlocked
-			if env.Outcome == "unsupported" {
-				code = ExitUsage
+			if errors.As(err, &ce) {
+				code = ce.code
 			}
+			env.Errors = []string{fmt.Sprintf("plan %s: %v", root, err)}
 			return fail(code)
 		}
-		summary, entries, volume = s, es, v
-	}
-
-	resolved, err := policy.Resolve(entries, pol)
-	if err != nil {
-		env.Errors = []string{err.Error()}
-		return fail(ExitUsage)
+		summary, entries, volume, pol, resolved = disc.Summary, disc.Entries, disc.Volume, disc.Policy, disc.Resolved
 	}
 
 	plan, err := planner.PlanReclaim(planner.Input{
@@ -260,10 +212,18 @@ func workspaceLabel(root string) string {
 // renderPlanHuman renders the plan for the human stream (stderr).
 func renderPlanHuman(workspace string, plan planner.Plan) string {
 	var b []byte
+	b = append(b, []byte(fmt.Sprintf("plan for workspace %q: %s\n", workspace, plan.Result))...)
+	b = append(b, renderPlanBody(plan)...)
+	return string(b)
+}
+
+// renderPlanBody renders everything after the plan header line; inspect
+// embeds it under its own "plan preview" label.
+func renderPlanBody(plan planner.Plan) string {
+	var b []byte
 	appendLine := func(format string, a ...any) {
 		b = append(b, []byte(fmt.Sprintf(format, a...))...)
 	}
-	appendLine("plan for workspace %q: %s\n", workspace, plan.Result)
 	if plan.Target != nil {
 		appendLine("target: %d bytes\n", *plan.Target)
 	}

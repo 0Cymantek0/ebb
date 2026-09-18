@@ -10,5 +10,5 @@ import (
 )
 
 func main() {
-	os.Exit(cli.Main(os.Args[1:], cli.Streams{Out: os.Stdout, Err: os.Stderr}, cli.DefaultDeps()))
+	os.Exit(cli.Main(os.Args[1:], cli.Streams{Out: os.Stdout, Err: os.Stderr}, cli.RealDeps()))
 }

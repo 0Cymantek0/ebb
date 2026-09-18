@@ -60,3 +60,27 @@ func ParseByteCount(s string) (int64, error) {
 	}
 	return n, nil
 }
+
+// humanUnits are the display ladder for HumanBytes (binary IEC powers,
+// matching the KiB family ParseByteCount accepts).
+var humanUnits = []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB"}
+
+// HumanBytes renders a byte count for humans: whole bytes below 1 KiB,
+// otherwise one decimal of the largest fitting binary unit (trailing
+// ".0" trimmed). Sizes are for display only; machine values stay exact.
+func HumanBytes(n int64) string {
+	if n < 0 {
+		return fmt.Sprintf("%d B", n)
+	}
+	f := float64(n)
+	i := 0
+	for f >= 1024 && i < len(humanUnits)-1 {
+		f /= 1024
+		i++
+	}
+	if i == 0 {
+		return fmt.Sprintf("%d B", n)
+	}
+	s := fmt.Sprintf("%.1f %s", f, humanUnits[i])
+	return strings.Replace(s, ".0 ", " ", 1)
+}

@@ -11,6 +11,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,32 +39,38 @@ const Version = "0.1.0-dev"
 // (D002/D003; probed against restic 0.19.1).
 const ResticTarget = "0.19.1"
 
-// Deps carries the integration seams. Wave B replaces the stubs with
-// the real inventory scanner; the CLI layer never touches the
-// filesystem for scanning itself.
+// Deps carries the integration seams. RealDeps wires the production
+// implementations (platform probe, hardened git observer, tracked-files
+// adapter, metadata-first inventory scanner); the CLI layer itself
+// never touches the filesystem for scanning.
 type Deps struct {
+	// NewProbe returns the native platform probe used for root
+	// identity, volume usage and per-entry facts.
+	NewProbe func() domain.PlatformProbe
+	// ObserveGit produces the Git topology observation for a root
+	// (diagnostics riding alongside preserved bytes; Foundation §9.1).
+	ObserveGit func(ctx context.Context, root string) (domain.GitObservation, error)
+	// GitTracked returns the set of Git-tracked root-relative paths
+	// (F53 evidence source).
+	GitTracked func(ctx context.Context, root string) (map[string]bool, error)
 	// ScanInventory inventories a workspace root without running
-	// project code (Foundation §8.1).
-	ScanInventory func(root string) (domain.InventorySummary, []domain.Entry, domain.VolumeUsage, error)
+	// project code (Foundation §8.1); the real implementation scans
+	// metadata-first (Hash=false).
+	ScanInventory func(ctx context.Context, probe domain.PlatformProbe, root string) (domain.InventorySummary, []domain.Entry, error)
 }
 
-// ErrNotIntegrated marks seams that wave B wires up.
+// ErrNotIntegrated marks seams that are not wired (a zero-value Deps);
+// dispatch maps it to exit 2 ("unsupported command feature").
 var ErrNotIntegrated = errNotIntegrated{}
 
 type errNotIntegrated struct{}
 
 func (errNotIntegrated) Error() string { return "not yet integrated (wave B)" }
 
-// DefaultDeps returns the stub dependency set: every seam reports
-// ErrNotIntegrated, which the dispatch maps to exit 2 ("unsupported
-// command feature") with a clear message.
-func DefaultDeps() Deps {
-	return Deps{
-		ScanInventory: func(string) (domain.InventorySummary, []domain.Entry, domain.VolumeUsage, error) {
-			return domain.InventorySummary{}, nil, domain.VolumeUsage{}, ErrNotIntegrated
-		},
-	}
-}
+// DefaultDeps returns the default dependency set of a real process: the
+// production wiring of RealDeps. (Wave A's stubs are gone; a zero-value
+// Deps still degrades each seam to ErrNotIntegrated.)
+func DefaultDeps() Deps { return RealDeps() }
 
 // Streams bundles the process output streams.
 type Streams struct {
@@ -121,6 +128,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdInspect(args[1:], streams, deps)
 	case "plan":
 		return cmdPlan(args[1:], streams, deps)
+	case "doctor":
+		return cmdDoctor(args[1:], streams)
 	case "help", "-h", "--help":
 		usage(streams.Err)
 		return ExitOK
@@ -139,9 +148,12 @@ commands:
   version            print ebb version, restic conformance target and go version
   inspect <path>     explain scope, costs and blockers without running project code
   plan <path>        compute a reclaim plan (preview only; grants no removal authority)
+  doctor             report supported capabilities and configuration problems
+
+inspect/plan flags:
+  --json                    emit the machine result envelope on stdout
 
 plan flags:
-  --json                    emit the machine result envelope on stdout
   --from-inventory <file>   load a saved inventory JSON instead of scanning
   --target <bytes>          space goal, e.g. 25GiB (default: release as much as safely possible)
 `)
