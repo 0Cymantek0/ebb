@@ -1,19 +1,22 @@
 // Package restore implements Foundation §12.5's restore ("open")
-// sequence for files: validate the retained seal, read back and verify
-// the payload documents against the seal's digests, materialize the
-// preserved workspace tree into a private staging directory, VERIFY the
-// staged tree against an oracle independent of the restore encoder (a
-// fresh inventory scan compared to the retained inventory — the E10
-// defense), publish by renaming onto the absent destination, and record
-// durable open-operation state (PLANNED → RESTORING → FILES_READY).
+// sequence: validate the retained seal, read back and verify the payload
+// documents against the seal's digests, materialize the preserved
+// workspace tree into a private staging directory, VERIFY the staged
+// tree against an oracle independent of the restore encoder (a fresh
+// inventory scan compared to the retained inventory — the E10 defense),
+// publish by renaming onto the absent destination, and record durable
+// open-operation state (PLANNED → RESTORING → FILES_READY).
 //
-// v1 terminal state: an open operation stops at FILES_READY. The
-// reconstruction actions of §12.5's last paragraphs (running approved
-// recipes at the final destination, REBUILDING → READY, and
-// REBUILD_FAILED) are the future actions wave; this package only
-// REPORTS them as RebuildHints and never executes project code (I05).
-// Opening never releases the recovery obligation: the snapshot stays
-// pinned (I07).
+// After publication, the reconstruction phase of §12.5's last paragraphs
+// runs the RETAINED, locally-approved reconstruction actions at the
+// final destination (rebuild.go: REBUILDING → READY → DONE, journaling
+// every attempt in action_runs and verifying protected files — F36).
+// `ebb open --files-only` stops after publication (FILES_READY → DONE);
+// a legacy manifest without exact action definitions is hint-only —
+// reported, never executed. A failed rebuild lands at REBUILD_FAILED
+// (non-terminal, resolvable by `ebb open --resume`) and NEVER removes
+// the published files (I08). Opening never releases the recovery
+// obligation: the snapshot stays pinned (I07).
 //
 // The ONLY filesystem mutations this package performs: creating its
 // staging directories, restoring the backend subtree into them
@@ -22,7 +25,9 @@
 // rename onto an absent destination, shape-gated removal of its own
 // .ebb-stage-<opID> directories, and removal of an EMPTY destination
 // directory. Unrelated content is never touched (§12.5: "An unrelated
-// nonempty directory is never overwritten").
+// nonempty directory is never overwritten"). Reconstruction actions
+// execute through the injected actions.Runner seam — this package adds
+// no removal authority of its own (Foundation §9.5).
 //
 // The frozen document formats parsed here (receipt, manifest,
 // inventory.jsonl records, and the .ebb-op-<opID> / .ebb-seal-<opID>
@@ -43,13 +48,15 @@ import (
 	"strings"
 	"time"
 
+	"ebb/internal/actions"
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 )
 
-// Dependencies wires the opener. All fields except Clock and CreateLink
-// are required; New refuses nil seams so a half-constructed opener can
-// never reach publishing code (mirroring lifecycle.New).
+// Dependencies wires the opener. All fields except Clock, CreateLink and
+// the rebuild seams are required; New refuses nil seams so a
+// half-constructed opener can never reach publishing code (mirroring
+// lifecycle.New).
 type Dependencies struct {
 	Store domain.SnapshotStore // required: the backend seam (restic adapter)
 	Cat   *catalog.Catalog     // required: durable operation journal
@@ -61,7 +68,22 @@ type Dependencies struct {
 	// case — recreate natively (this package cannot import platform;
 	// the seam is the module boundary).
 	CreateLink LinkCreator
-	Clock      func() time.Time // optional; defaults to time.Now
+	// Runner executes approved reconstruction actions at the destination
+	// (Foundation §12.5, §9.5). Optional: required only when an Open
+	// with recorded action definitions runs without FilesOnly.
+	// Satisfied by *actions.Runner; tests substitute a fake.
+	Runner ActionRunner
+	// Approver reads the recorded local approvals (Foundation §7.3);
+	// production wires the approvalstore. Required with Runner.
+	Approver actions.Approver
+	// Approve is the interactive approval seam (one grouped decision per
+	// rebuild — Foundation §5.2): it receives every action whose
+	// approval is missing or stale, may prompt and record through the
+	// same store backing Approver, and must never be called from this
+	// package's own logic beyond the rebuild flow. nil = non-interactive
+	// (a pending approval then blocks the rebuild).
+	Approve ApprovalResolver
+	Clock   func() time.Time // optional; defaults to time.Now
 }
 
 // VaultRef names one backend repository: the repo directory and the
@@ -72,14 +94,18 @@ type VaultRef struct {
 	Passfile string
 }
 
-// Options parameterizes one Open. FilesOnly is always effectively true
-// in v1 (rebuild is reported, never run); the field exists so the CLI
-// contract (`ebb open --files-only`, Foundation §17.2) maps cleanly when
-// the actions wave lands.
+// Options parameterizes one Open. FilesOnly stops after the preserved
+// files are published (`ebb open --files-only`, Foundation §17.2):
+// reported as files-ready, never a runnable environment, and the
+// operation completes FILES_READY → DONE (nothing outstanding). The
+// default (FilesOnly=false) runs the recorded reconstruction actions at
+// the final destination when the manifest carries exact action
+// definitions; a manifest without definitions is effectively files-only
+// (legacy payloads are hint-only — reported, never executed).
 type Options struct {
 	// Destination is the final absolute path for the workspace root.
 	Destination string
-	// FilesOnly is always true in v1 (rebuild is reported, never run).
+	// FilesOnly stops after publication (no reconstruction).
 	FilesOnly bool
 }
 
@@ -93,7 +119,9 @@ type RebuildHint struct {
 	Network string
 }
 
-// Result reports a completed files-only open (op left at FILES_READY).
+// Result reports a completed (or rebuild-failed) open. Phase carries the
+// operation's final durable phase (DONE, or REBUILD_FAILED when the
+// returned error is *ErrRebuildFailed — the files are still published).
 type Result struct {
 	OperationID domain.OperationID
 	SnapshotID  domain.SnapshotID
@@ -104,6 +132,11 @@ type Result struct {
 	BytesRestored   int64
 	Warnings        []string
 	RebuildHints    []RebuildHint
+	// Phase is the operation's terminal-or-resting phase after the call.
+	Phase string
+	// Actions reports each reconstruction action's outcome (empty for
+	// files-only opens and legacy hint-only payloads).
+	Actions []ActionReport
 }
 
 // Opener executes the §12.5 restore sequence. Safe for sequential use
@@ -113,6 +146,9 @@ type Opener struct {
 	cat        *catalog.Catalog
 	probe      domain.PlatformProbe
 	createLink LinkCreator
+	runner     ActionRunner
+	approver   actions.Approver
+	approve    ApprovalResolver
 	now        func() time.Time
 }
 
@@ -133,7 +169,11 @@ func New(d Dependencies) (*Opener, error) {
 	if d.Clock == nil {
 		d.Clock = time.Now
 	}
-	return &Opener{store: d.Store, cat: d.Cat, probe: d.Probe, createLink: d.CreateLink, now: d.Clock}, nil
+	return &Opener{
+		store: d.Store, cat: d.Cat, probe: d.Probe, createLink: d.CreateLink,
+		runner: d.Runner, approver: d.Approver, approve: d.Approve,
+		now: d.Clock,
+	}, nil
 }
 
 // Ebb-owned sibling names of the frozen capture layout (D003 and
@@ -252,15 +292,29 @@ func (o *Opener) Open(ctx context.Context, vault VaultRef, snapID domain.Snapsho
 	}
 	res.Destination = dest
 
+	// The rebuild plan: exact definitions only (legacy manifests without
+	// the definition extension are hint-only and never execute). The
+	// runner/approver seams are validated BEFORE any staging side effect
+	// so a wiring gap is a usage error, not a mid-operation failure.
+	defs, derr := rebuildDefinitions(docs.manifest)
+	if derr != nil {
+		return res, derr
+	}
+	runRebuild := !opts.FilesOnly && len(defs) > 0
+	if runRebuild && (o.runner == nil || o.approver == nil) {
+		return res, &ErrInvalidOptions{Detail: fmt.Sprintf(
+			"the snapshot records %d reconstruction action(s) and FilesOnly is false, but the runner/approver seams are not wired", len(defs))}
+	}
+
 	// ---- §12.5 interrupted-staging recovery (§12.4 RESTORING row) ----
 	warnings, err := o.recoverInterruptedOpen(ctx, snap.WorkspaceID, dest)
 	if err != nil {
 		return res, err
 	}
 	res.Warnings = append(res.Warnings, warnings...)
-	if !opts.FilesOnly {
+	if opts.FilesOnly && len(rebuildHints(docs.manifest)) > 0 {
 		res.Warnings = append(res.Warnings,
-			"FilesOnly=false requested, but v1 open is always files-only; rebuild groups are reported as hints, never executed (Foundation §17.2)")
+			"FilesOnly: reconstruction actions were skipped (--files-only); the workspace is files-ready, not runnable (Foundation §17.2)")
 	}
 	if err := checkContext(ctx); err != nil {
 		return res, err
@@ -351,13 +405,44 @@ func (o *Opener) Open(ctx context.Context, vault VaultRef, snapID domain.Snapsho
 		return res, fmt.Errorf("restore: mark workspace live: %w", err)
 	}
 
-	// ---- §12.5 step 9: finish (op stays FILES_READY; I07 pin intact) -
-	if err := removeStage(stage); err != nil {
-		res.Warnings = append(res.Warnings, fmt.Sprintf("cleanup staging %s failed: %v", stage, err))
-	}
+	// ---- §12.5 step 9: finish ------------------------------------------
+	// Files-only (or a legacy manifest with no definitions): nothing is
+	// outstanding — complete the operation FILES_READY → DONE (the D006
+	// convention: DONE means no reconciliation outstanding; leaving
+	// FILES_READY active forever blocked the workspace's future
+	// operations).
 	res.EntriesRestored = docs.entriesRestored
 	res.BytesRestored = docs.preservedBytes
 	res.RebuildHints = rebuildHints(docs.manifest)
+	if err := removeStage(stage); err != nil {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("cleanup staging %s failed: %v", stage, err))
+	}
+	if !runRebuild {
+		if err := o.cat.AdvanceOperation(opID, catalog.PhaseFilesReady, catalog.PhaseDone); err != nil {
+			return res, fmt.Errorf("restore: advance %s: FILES_READY -> DONE: %w", opID, err)
+		}
+		res.Phase = catalog.PhaseDone
+		return res, nil
+	}
+
+	// ---- §12.5 last paragraphs: reconstruction at the final path ------
+	// REBUILDING → (run retained, locally-approved actions) → F36 check
+	// → READY → DONE. Any failure lands at REBUILD_FAILED (non-terminal,
+	// resumable) with the published files intact (I08) and the snapshot
+	// pinned (I07).
+	if err := o.cat.AdvanceOperation(opID, catalog.PhaseFilesReady, catalog.PhaseRebuilding); err != nil {
+		return res, fmt.Errorf("restore: advance %s: FILES_READY -> REBUILDING: %w", opID, err)
+	}
+	reports, rerr := o.runRebuild(ctx, opID, dest, defs, docs.retained, false)
+	res.Actions = reports
+	if rerr != nil {
+		res.Phase = catalog.PhaseRebuildFailed
+		return res, rerr
+	}
+	if err := o.completeRebuild(opID); err != nil {
+		return res, err
+	}
+	res.Phase = catalog.PhaseDone
 	return res, nil
 }
 

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"ebb/internal/actions"
 	"ebb/internal/domain"
 	"ebb/internal/inventory"
 	"ebb/internal/policy"
@@ -104,6 +105,14 @@ type manifestPolicy struct {
 	ResolvedDigest string `json:"resolved_digest"`
 }
 
+// manifestAction is one §16.2 action record: the policy-derived group
+// declaration plus the OPTIONAL `definition` extension object (§16.1)
+// carrying the exact wire form of the actions.Definition the open
+// operation may run at the final destination (Foundation §12.5). The
+// extension is optional so legacy manifests (wave E and earlier) parse
+// unchanged: an action without `definition` is a HINT (reported, never
+// executed). schema_version stays 1 — optional extension fields live in
+// an explicitly named object rather than a new schema.
 type manifestAction struct {
 	ID        string   `json:"id"`
 	Adapter   string   `json:"adapter"`
@@ -113,6 +122,41 @@ type manifestAction struct {
 	Network   string   `json:"network"`
 	Command   []string `json:"command,omitempty"`
 	Ownership string   `json:"ownership"`
+	// Definition is the exact captured action definition (§16.2 "exact
+	// captured action definitions"): nil/absent on legacy manifests.
+	Definition *actionDefDoc `json:"definition,omitempty"`
+}
+
+// actionDefDoc is the wire form of actions.Definition as frozen in the
+// manifest's extension object. Field names are the actions package's
+// vocabulary (snake_case); timeout is integer nanoseconds because the
+// manifest carries byte/number fields as checked integers (§16.1), and
+// json.Marshal renders a time.Duration as integer nanoseconds anyway.
+type actionDefDoc struct {
+	ID          string   `json:"id"`
+	Argv        []string `json:"argv"`
+	WorkingRoot string   `json:"working_root"`
+	Inputs      []string `json:"inputs"`
+	Outputs     []string `json:"outputs"`
+	EnvAllow    []string `json:"env_allow"`
+	Network     string   `json:"network"`
+	TimeoutNS   int64    `json:"timeout_ns"`
+	DependsOn   []string `json:"depends_on"`
+}
+
+// actionDefWire converts a Definition into its frozen wire form.
+func actionDefWire(d actions.Definition) *actionDefDoc {
+	return &actionDefDoc{
+		ID:          d.ID,
+		Argv:        append([]string(nil), d.Argv...),
+		WorkingRoot: d.WorkingRoot,
+		Inputs:      append([]string(nil), d.Inputs...),
+		Outputs:     append([]string(nil), d.Outputs...),
+		EnvAllow:    actions.CanonicalEnvAllow(d.EnvAllow),
+		Network:     string(d.Network),
+		TimeoutNS:   int64(d.Timeout),
+		DependsOn:   append([]string(nil), d.DependsOn...),
+	}
 }
 
 type manifestExternal struct {
@@ -285,22 +329,32 @@ func buildManifest(
 		src = opts.WriterAssertion
 	}
 
-	var actions []manifestAction
+	var actionRecs []manifestAction
+	defByID := make(map[string]actions.Definition, len(opts.ActionDefs))
+	for _, d := range opts.ActionDefs {
+		defByID[d.ID] = d
+	}
 	for _, g := range resolved.Groups {
 		// Exact captured action definitions (§16.2): from the frozen
-		// policy groups, carrying ownership of outputs.
+		// policy groups, carrying ownership of outputs. The optional
+		// definition extension object (§16.1) freezes the exact argv the
+		// open operation may run; a group without one stays hint-only.
 		var cmd []string
 		for _, rg := range pol.Regenerate {
 			if rg.ID == g.ID {
 				cmd = rg.Command
 			}
 		}
-		actions = append(actions, manifestAction{
+		ma := manifestAction{
 			ID: g.ID, Adapter: string(g.Adapter), Root: groupRoot(pol, g.ID),
 			Outputs: g.Outputs, Inputs: groupInputs(pol, g.ID),
 			Network: string(groupNetwork(pol, g.ID)), Command: cmd,
 			Ownership: string(domain.OwnershipOwned),
-		})
+		}
+		if def, ok := defByID[g.ID]; ok {
+			ma.Definition = actionDefWire(def)
+		}
+		actionRecs = append(actionRecs, ma)
 	}
 
 	var externals []manifestExternal
@@ -392,7 +446,7 @@ func buildManifest(
 			Frozen: string(frozen), FrozenDigest: digestBytes(frozen),
 			ResolvedDigest: resolvedDigest,
 		},
-		Actions: actions, Externals: externals,
+		Actions: actionRecs, Externals: externals,
 		Capabilities:    manifestCapabilities{Captured: captured, NotPromised: notPromised},
 		GitObservations: opts.Git,
 		ManagedOutputs:  managed, ScopeExclusions: exclusions,

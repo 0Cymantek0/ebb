@@ -88,6 +88,16 @@ func (s *session) registry() *vault.Registry {
 	return vault.New(filepath.Join(s.cfgDir, vault.RegistryFile))
 }
 
+// approvalsFile is the durable local approval store's document name in
+// the state dir (approvalstore backs it; Foundation §7.3 local trust
+// never transfers).
+const approvalsFile = "approvals.json"
+
+// approvalsPath returns the approval store's location for this session.
+func (s *session) approvalsPath() string {
+	return filepath.Join(s.cfgDir, approvalsFile)
+}
+
 // defaultVault returns the registry's default vault, or a §5.5-worded
 // vault blocker (exit 7) when none is registered.
 func (s *session) defaultVault() (*vault.Vault, error) {

@@ -31,7 +31,7 @@ func TestNewRefusesNilSeams(t *testing.T) {
 
 // Round trip: files + symlink/junction + empty dir + nested tree are
 // restored to an absent destination, byte-compared by the TEST's own
-// walker, the op lands at FILES_READY, the workspace goes live with a
+// walker, the op completes to DONE (files-only), the workspace goes live with a
 // fresh identity, the staging is cleaned, and the snapshot stays pinned.
 func TestOpenRoundTrip(t *testing.T) {
 	f := buildFixture(t, fixtureSpec{recipeGroup: true})
@@ -68,14 +68,15 @@ func TestOpenRoundTrip(t *testing.T) {
 	// Staging fully cleaned.
 	assertNoStageDirs(t, f.parent)
 
-	// Durable state: op FILES_READY, workspace live at dest with a fresh
-	// identity, snapshot still pinned (I07).
+	// Durable state: op DONE (a files-only open completes: nothing
+	// outstanding — D006 convention), workspace live at dest with a
+	// fresh identity, snapshot still pinned (I07).
 	op, err := f.cat.GetOperation(res.OperationID)
 	if err != nil {
 		t.Fatalf("get operation: %v", err)
 	}
-	if op.Phase != catalog.PhaseFilesReady {
-		t.Fatalf("operation phase %q, want FILES_READY", op.Phase)
+	if op.Phase != catalog.PhaseDone {
+		t.Fatalf("operation phase %q, want DONE", op.Phase)
 	}
 	if op.Kind != catalog.OpKindOpen {
 		t.Fatalf("operation kind %q, want open", op.Kind)
@@ -146,22 +147,24 @@ func TestOpenRebuildHintCustomCommand(t *testing.T) {
 	}
 }
 
-// FilesOnly=false behaves identically in v1 and records a warning.
-func TestOpenFilesOnlyFalseWarns(t *testing.T) {
-	f := buildFixture(t, fixtureSpec{})
+// FilesOnly=false on a manifest WITHOUT action definitions (the
+// hint-only fixture) completes directly FILES_READY -> DONE: a legacy
+// payload is never executed, and nothing is left outstanding.
+func TestOpenFilesOnlyFalseWithoutDefinitionsCompletes(t *testing.T) {
+	f := buildFixture(t, fixtureSpec{recipeGroup: true})
 	dest := filepath.Join(f.parent, "restored")
 	res, err := f.open(context.Background(), newOpener(f), Options{Destination: dest})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	found := false
-	for _, w := range res.Warnings {
-		if strings.Contains(w, "files-only") {
-			found = true
-		}
+	if res.Phase != catalog.PhaseDone {
+		t.Fatalf("phase = %q, want DONE (hint-only manifests never rebuild)", res.Phase)
 	}
-	if !found {
-		t.Fatalf("expected a files-only warning, got %v", res.Warnings)
+	if len(res.RebuildHints) != 1 {
+		t.Fatalf("rebuild hints = %v, want the hint-only group reported", res.RebuildHints)
+	}
+	if len(res.Actions) != 0 {
+		t.Fatalf("no action may run from a hint-only manifest: %+v", res.Actions)
 	}
 }
 
@@ -484,8 +487,8 @@ func TestOpenPublishRaceAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get operation 2: %v", err)
 	}
-	if op2.Phase != catalog.PhaseFilesReady {
-		t.Fatalf("operation 2 phase %q, want FILES_READY", op2.Phase)
+	if op2.Phase != catalog.PhaseDone {
+		t.Fatalf("operation 2 phase %q, want DONE", op2.Phase)
 	}
 	warned := false
 	for _, w := range res2.Warnings {
@@ -529,13 +532,13 @@ func TestOpenActiveOpWithoutStagingReconciled(t *testing.T) {
 		t.Fatalf("stale phase %q, want CANCELED", stale.Phase)
 	}
 	op2, err := f.cat.GetOperation(res2.OperationID)
-	if err != nil || op2.Phase != catalog.PhaseFilesReady {
-		t.Fatalf("second op phase: %v %q, want FILES_READY", err, op2.Phase)
+	if err != nil || op2.Phase != catalog.PhaseDone {
+		t.Fatalf("second op phase: %v %q, want DONE", err, op2.Phase)
 	}
 }
 
-// A destination occupied by a PREVIOUSLY PUBLISHED Ebb open (op at
-// FILES_READY) is refused with the operation named, never overwritten.
+// A destination occupied by a PREVIOUSLY PUBLISHED Ebb open (op now
+// DONE) is refused with the operation named, never overwritten.
 func TestOpenDestinationHoldingPublishedEbbOpen(t *testing.T) {
 	f := buildFixture(t, fixtureSpec{})
 	dest := filepath.Join(f.parent, "restored")

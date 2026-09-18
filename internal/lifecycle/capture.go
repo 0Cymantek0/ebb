@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"ebb/internal/actions"
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 	"ebb/internal/inventory"
@@ -213,6 +214,13 @@ func (c *Coordinator) openCapture(ctx context.Context, vault VaultRef, root stri
 	if strings.TrimSpace(root) == "" {
 		return nil, &ErrInvalidOptions{Detail: "root path is required"}
 	}
+	// Exact captured action definitions (§16.2): a graph that cannot run
+	// (invalid definition, duplicate id, dependency cycle, dangling
+	// DependsOn) fails the capture up front — never freeze a manifest
+	// whose actions could not execute on open.
+	if err := actions.ValidateGraph(opts.ActionDefs); err != nil {
+		return nil, &ErrInvalidOptions{Detail: fmt.Sprintf("action definitions: %v", err)}
+	}
 	if opts.Park && strings.TrimSpace(opts.WriterAssertion) == "" {
 		return nil, &ErrInvalidOptions{Detail: "Park requires WriterAssertion (the recorded assert-writers-stopped source, Foundation §17.2)"}
 	}
@@ -360,6 +368,20 @@ func (c *Coordinator) writeOpDir(st *captureState) error {
 	st.inventoryBytes, st.inventoryDigest = invBytes, invDigest
 	if err := os.WriteFile(filepath.Join(st.opDir, inventoryName), invBytes, 0o600); err != nil {
 		return fmt.Errorf("lifecycle: write inventory: %w", err)
+	}
+	// Every derived definition must belong to a resolved group: an
+	// orphan definition could never run at open time and would mean the
+	// CLI derivation and the resolved policy disagree.
+	if len(st.opts.ActionDefs) > 0 {
+		known := make(map[string]bool, len(st.resolved.Groups))
+		for _, g := range st.resolved.Groups {
+			known[g.ID] = true
+		}
+		for _, d := range st.opts.ActionDefs {
+			if !known[d.ID] {
+				return fmt.Errorf("lifecycle: action definition %q matches no regenerate group of the resolved policy", d.ID)
+			}
+		}
 	}
 	manifest := buildManifest(
 		st.snapID, st.wsID, domain.FormatTime(c.now()),

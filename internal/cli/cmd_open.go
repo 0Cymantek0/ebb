@@ -1,39 +1,61 @@
 // cmdOpen implements `ebb open <name-or-snapshot-id> [--to dir]`
 // (Foundation §5.3, §12.5, §17.1): recover a retained workspace state
-// without an implicit upstream update. v1 is files-only: the open
-// sequence validates the seal, verifies the payload documents and the
-// staged tree against an independent oracle, publishes by rename and
-// reports files-ready; approved reconstruction actions are REPORTED as
-// rebuild hints, never run (exit 6 is unused in v1).
+// without an implicit upstream update. The open sequence validates the
+// seal, verifies the payload documents and the staged tree against an
+// independent oracle, and publishes by rename. When the manifest froze
+// exact action definitions, the reconstruction phase then runs the
+// retained, locally-approved actions at the final destination
+// (REBUILDING → READY → DONE, F36-verified); `--files-only` stops after
+// publication (FILES_READY → DONE) and legacy manifests without
+// definitions are hint-only.
 //
-// Target resolution: a 32-hex argument selects that snapshot directly;
-// a name selects the workspace's latest sealed park snapshot (falling
-// back to the latest plain snapshot when no park exists) — never the
-// vault's global latest (§5.3). Destination: --to, else the workspace's
-// recorded original root; a parked/unbound workspace without --to is a
-// usage error.
+// Approvals (Foundation §7.3): recorded approvals that still match
+// exactly are reused without prompting (§5.2); missing approvals get ONE
+// grouped interactive prompt (argv, resolved tool identity, inputs,
+// outputs, network, shell warning); `--yes` records approvals for
+// never-approved actions without a prompt but NEVER covers drift — a
+// stale approval always re-prompts interactively and blocks in
+// non-interactive mode.
 //
-// Exit contract: 0 files-ready; 2 usage (unknown target, no destination,
-// unopenable kind is NOT usage — see 3); 3 blocked (trim/seal-kind
-// snapshot, occupied destination, insufficient space); 4 seal/document
-// verification failure; 5 publish blocked (staging kept, RESTORING);
+// `ebb open --resume <op-id-or-workspace>` re-enters the rebuild of the
+// workspace's REBUILD_FAILED/REBUILDING/FILES_READY open operation,
+// re-running only actions without a journaled successful run.
+// `ebb open --cancel <op-id-or-workspace>` records an explicit cancel of
+// such an operation (CANCELED, terminal): the published files stay and
+// the snapshot stays pinned.
+//
+// Target resolution: a 32-hex argument selects that snapshot directly
+// (an operation id under --resume/--cancel); a name selects the
+// workspace's latest sealed park snapshot (falling back to the latest
+// plain snapshot when no park exists) — never the vault's global latest
+// (§5.3). Destination: --to, else the workspace's recorded original
+// root; a parked/unbound workspace without --to is a usage error.
+//
+// Exit contract: 0 done (files-only included); 2 usage; 3 blocked
+// (trim/seal-kind snapshot, occupied destination, insufficient space);
+// 4 seal/document verification failure; 5 publish blocked (staging
+// kept, RESTORING); 6 rebuild failed/blocked (files intact, resumable);
 // 7 vault; 130 cancelled.
 
 package cli
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"path/filepath"
 	"strings"
 
+	"ebb/internal/actions"
+	"ebb/internal/actions/approvalstore"
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 	"ebb/internal/platform"
 	"ebb/internal/restore"
 )
 
-// openDetails is the --json payload of a completed files-only open.
+// openDetails is the --json payload of a completed open.
 type openDetails struct {
 	Workspace       string            `json:"workspace"`
 	SnapshotID      string            `json:"snapshot_id"`
@@ -42,6 +64,7 @@ type openDetails struct {
 	EntriesRestored int64             `json:"entries_restored"`
 	BytesRestored   int64             `json:"bytes_restored"`
 	RebuildHints    []openRebuildHint `json:"rebuild_hints"`
+	Actions         []openActionRun   `json:"actions"`
 }
 
 type openRebuildHint struct {
@@ -51,16 +74,31 @@ type openRebuildHint struct {
 	Network string   `json:"network"`
 }
 
+type openActionRun struct {
+	ID       string `json:"id"`
+	Status   string `json:"status"`
+	ExitCode int    `json:"exit_code,omitempty"`
+	Skipped  bool   `json:"skipped,omitempty"`
+}
+
 func cmdOpen(args []string, streams Streams, deps Deps) int {
 	fs := flag.NewFlagSet("open", flag.ContinueOnError)
 	fs.SetOutput(streams.Err)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
 	to := fs.String("to", "", "destination directory (default: the workspace's recorded original root)")
+	filesOnly := fs.Bool("files-only", false, "stop after the preserved files are published; do not run reconstruction")
+	yes := fs.Bool("yes", false, "record approvals for not-yet-approved actions without a prompt (never covers approval drift)")
+	resume := fs.Bool("resume", false, "resume the rebuild of the workspace's interrupted open operation")
+	cancel := fs.Bool("cancel", false, "cancel the workspace's REBUILD_FAILED/REBUILDING open operation (files stay, snapshot stays pinned)")
 	if err := fs.Parse(reorderFlags(args, "to")); err != nil {
 		return ExitUsage
 	}
 	if fs.NArg() != 1 {
-		fmt.Fprintln(streams.Err, "ebb open: takes exactly one argument: a workspace name or a snapshot id (32 hex chars)")
+		fmt.Fprintln(streams.Err, "ebb open: takes exactly one argument: a workspace name, a snapshot id (32 hex chars), or with --resume/--cancel an operation id")
+		return ExitUsage
+	}
+	if *resume && *cancel {
+		fmt.Fprintln(streams.Err, "ebb open: --resume and --cancel are mutually exclusive")
 		return ExitUsage
 	}
 	target := fs.Arg(0)
@@ -73,6 +111,10 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 	defer sess.close()
 	ctx, stop := commandContext(deps)
 	defer stop()
+
+	if *resume || *cancel {
+		return runOpenRecovery(env, *jsonOut, streams, deps, sess, ctx, target, *resume, *yes)
+	}
 
 	// ---- resolve the target to one sealed snapshot ---------------------
 	snapID, wsRow, rerr := resolveOpenTarget(sess, target)
@@ -97,24 +139,7 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 			fmt.Sprintf("--to %s: %v", dest, aerr))
 	}
 
-	if deps.NewRestoreOp == nil {
-		return emitFailure(env, *jsonOut, streams, ExitUsage,
-			fmt.Sprintf("restore opener %v", ErrNotIntegrated))
-	}
-	if deps.NewProbe == nil {
-		return emitFailure(env, *jsonOut, streams, ExitUsage,
-			fmt.Sprintf("platform probe %v", ErrNotIntegrated))
-	}
-	opener, err := deps.NewRestoreOp(restore.Dependencies{
-		Store: sess.store,
-		Cat:   sess.cat,
-		Probe: deps.NewProbe(),
-		// Native link recreation: junctions unprivileged on Windows,
-		// symlinks privilege-typed (Wave F link staging). The stdlib
-		// default cannot create junctions, so production injects the
-		// platform implementation.
-		CreateLink: platform.CreateLink,
-	})
+	opener, err := newOpenOpener(deps, sess, streams, !*filesOnly, *yes)
 	if err != nil {
 		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
 			fmt.Sprintf("open %s: %v", target, err))
@@ -124,40 +149,379 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 	cErr := sess.withVaultPassfile(ctx, func(repoDir, passfile string) error {
 		var rErr error
 		res, rErr = opener.Open(ctx, restore.VaultRef{RepoDir: repoDir, Passfile: passfile},
-			snapID, restore.Options{Destination: absDest, FilesOnly: true})
+			snapID, restore.Options{Destination: absDest, FilesOnly: *filesOnly})
 		return rErr
 	})
 	if cErr != nil {
+		var rebuild *restore.ErrRebuildFailed
+		if errors.As(cErr, &rebuild) {
+			// Files ARE published; the rebuild failed. Report the partial
+			// success + exit 6 naming the failed actions and the resume
+			// command (§17.5).
+			return emitOpenRebuildFailure(env, *jsonOut, streams, target, rebuild,
+				openResultDetails(sess, snapID, res))
+		}
 		return emitFailure(env, *jsonOut, streams, classifyExitCode(cErr),
 			fmt.Sprintf("open %s: %s", target, codedWithSafeAction(cErr)))
 	}
 
-	snap, _ := sess.cat.GetSnapshot(snapID)
-	details := openDetails{
-		Workspace:       wsRow.Name,
-		SnapshotID:      string(snapID),
-		Kind:            snap.Kind,
-		Destination:     res.Destination,
-		EntriesRestored: res.EntriesRestored,
-		BytesRestored:   res.BytesRestored,
-		RebuildHints:    []openRebuildHint{},
-	}
-	for _, h := range res.RebuildHints {
-		details.RebuildHints = append(details.RebuildHints, openRebuildHint{
-			GroupID: h.GroupID, Command: h.Command, Inputs: h.Inputs, Network: h.Network})
-	}
-
+	details := openResultDetails(sess, snapID, res)
 	env.Outcome = "ok"
 	env.OperationID = string(res.OperationID)
-	env.Phase = catalog.PhaseFilesReady
+	env.Phase = res.Phase
 	env.WorkspaceID = string(res.WorkspaceID)
 	env.SnapshotID = string(snapID)
-	env.Conditions = []string{"files-ready", "snapshot-pinned"}
+	env.Conditions = openConditions(res)
 	env.Bytes = &BytesSummary{Restored: res.BytesRestored}
 	env.Details = details
 	env.Warnings = append(env.Warnings, res.Warnings...)
 	emit(env, *jsonOut, streams, renderOpenHuman(details))
 	return ExitOK
+}
+
+// runOpenRecovery serves `ebb open --resume` and `ebb open --cancel`.
+func runOpenRecovery(env Envelope, jsonOut bool, streams Streams, deps Deps, sess *session, ctx context.Context, target string, resume, yes bool) int {
+	op, rerr := resolveOpenOperation(sess, target)
+	if rerr != nil {
+		return emitFailure(env, jsonOut, streams, classifyExitCode(rerr),
+			fmt.Sprintf("open %s: %v", target, rerr))
+	}
+	env.OperationID = string(op.ID)
+	env.WorkspaceID = string(op.WorkspaceID)
+
+	if !resume {
+		op, err := cancelOpenOp(deps, sess, op)
+		if err != nil {
+			return emitFailure(env, jsonOut, streams, classifyExitCode(err),
+				fmt.Sprintf("open --cancel %s: %s", target, codedWithSafeAction(err)))
+		}
+		env.Outcome = "ok"
+		env.Phase = catalog.PhaseCanceled
+		env.Conditions = []string{"operation-canceled", "files-kept", "snapshot-pinned"}
+		emit(env, jsonOut, streams, fmt.Sprintf(
+			"canceled open operation %s at %s\n  published files kept at %s; the snapshot stays pinned\n",
+			op.ID, op.Phase, op.SourceRoot))
+		return ExitOK
+	}
+
+	opener, err := newOpenOpener(deps, sess, streams, true, yes)
+	if err != nil {
+		return emitFailure(env, jsonOut, streams, classifyExitCode(err),
+			fmt.Sprintf("open --resume %s: %v", target, err))
+	}
+	var res restore.Result
+	cErr := sess.withVaultPassfile(ctx, func(repoDir, passfile string) error {
+		var rErr error
+		res, rErr = opener.ResumeRebuild(ctx, restore.VaultRef{RepoDir: repoDir, Passfile: passfile}, op.ID)
+		return rErr
+	})
+	if cErr != nil {
+		var rebuild *restore.ErrRebuildFailed
+		if errors.As(cErr, &rebuild) {
+			return emitOpenRebuildFailure(env, jsonOut, streams, target, rebuild, openResultDetails(sess, res.SnapshotID, res))
+		}
+		return emitFailure(env, jsonOut, streams, classifyExitCode(cErr),
+			fmt.Sprintf("open --resume %s: %s", target, codedWithSafeAction(cErr)))
+	}
+
+	details := openResultDetails(sess, res.SnapshotID, res)
+	env.Outcome = "ok"
+	env.Phase = res.Phase
+	env.SnapshotID = string(res.SnapshotID)
+	env.Conditions = openConditions(res)
+	env.Bytes = &BytesSummary{Restored: res.BytesRestored}
+	env.Details = details
+	env.Warnings = append(env.Warnings, res.Warnings...)
+	emit(env, jsonOut, streams, renderOpenHuman(details))
+	return ExitOK
+}
+
+// newOpenOpener builds the restore opener with the reconstruction seams:
+// the real actions runner (or the Deps test seam), the approvalstore in
+// the state dir, and the CLI-owned grouped approval resolver. withRebuild
+// false (a --files-only open) wires nothing — no approvals are needed.
+func newOpenOpener(deps Deps, sess *session, streams Streams, withRebuild, yes bool) (*restore.Opener, error) {
+	if deps.NewRestoreOp == nil {
+		return nil, usageError(fmt.Errorf("restore opener %w", ErrNotIntegrated))
+	}
+	if deps.NewProbe == nil {
+		return nil, usageError(fmt.Errorf("platform probe %w", ErrNotIntegrated))
+	}
+	d := restore.Dependencies{
+		Store: sess.store,
+		Cat:   sess.cat,
+		Probe: deps.NewProbe(),
+		// Native link recreation: junctions unprivileged on Windows,
+		// symlinks privilege-typed (Wave F link staging). The stdlib
+		// default cannot create junctions, so production injects the
+		// platform implementation.
+		CreateLink: platform.CreateLink,
+	}
+	if withRebuild {
+		runner := newActionRunner(deps)
+		if runner == nil {
+			return nil, usageError(fmt.Errorf("action runner %w", ErrNotIntegrated))
+		}
+		store := approvalstore.New(sess.approvalsPath())
+		d.Runner = runner
+		d.Approver = store
+		d.Approve = openApprovalResolver(deps, streams, yes, store)
+	}
+	opener, err := deps.NewRestoreOp(d)
+	if err != nil {
+		return nil, blockedError(err)
+	}
+	return opener, nil
+}
+
+// newActionRunner returns the production actions.Runner (or the Deps
+// test seam), or nil when unwired.
+func newActionRunner(deps Deps) restore.ActionRunner {
+	if deps.NewActionRunner != nil {
+		return deps.NewActionRunner()
+	}
+	return actions.New()
+}
+
+// openApprovalResolver builds the CLI-side approval seam: ONE grouped
+// interactive prompt listing every pending action (argv, resolved tool
+// identity, inputs, outputs, network, shell warning; drift lines for
+// stale approvals), or --yes recording never-approved actions without a
+// prompt. Recorded approvals that match exactly never prompt (§5.2).
+// Drift ALWAYS re-prompts interactively and blocks in non-interactive
+// mode — --yes never silently covers a changed action.
+func openApprovalResolver(deps Deps, streams Streams, yes bool, store *approvalstore.FileApprover) restore.ApprovalResolver {
+	return func(ctx context.Context, pending []restore.PendingApproval) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		interactive := deps.StdinIsTerminal != nil && deps.StdinIsTerminal()
+		var required, stale []restore.PendingApproval
+		for _, p := range pending {
+			var staleErr *actions.ErrApprovalStale
+			if errors.As(p.Cause, &staleErr) {
+				stale = append(stale, p)
+				continue
+			}
+			required = append(required, p)
+		}
+
+		// Drift blocks without a terminal, even with --yes.
+		if len(stale) > 0 && !interactive {
+			return fmt.Errorf("%s: %d recorded approval(s) no longer match the action (drift) and stdin is not a terminal, so the required re-approval cannot be asked. Safe action: rerun in a terminal and re-approve after reviewing the drift",
+				CodeApprovalDrift, len(stale))
+		}
+		// Fresh approvals need --yes or a terminal.
+		if len(required) > 0 && !yes && !interactive {
+			return fmt.Errorf("%s: %d action(s) have no recorded approval and stdin is not a terminal. Safe action: rerun with --yes to record the approval, or run in a terminal to review the actions first",
+				CodeApprovalRequired, len(required))
+		}
+
+		// What is confirmed interactively? With --yes the never-approved
+		// set is auto-recorded, so only drift still prompts; without
+		// --yes everything prompts (one grouped decision).
+		var listing []restore.PendingApproval
+		switch {
+		case yes && len(stale) > 0:
+			listing = stale
+		case !yes:
+			listing = append(append([]restore.PendingApproval(nil), required...), stale...)
+		}
+		if len(listing) > 0 {
+			fmt.Fprint(streams.Err, approvalPromptText(listing))
+			if !confirmYes(deps, streams.Err, "") {
+				return fmt.Errorf("%s: the reconstruction approval was declined; nothing ran. Safe action: review the listed actions and rerun, or use --files-only to stop after publishing the files",
+					CodeApprovalDeclined)
+			}
+		}
+
+		// Record: never-approved actions under --yes record without a
+		// prompt; everything confirmed above records as interactive.
+		for _, p := range required {
+			approvedBy := "flag:--yes"
+			if !yes {
+				approvedBy = "interactive-confirm"
+			}
+			if _, aerr := store.Approve(p.Def, p.Tool, p.InputDigests, approvedBy); aerr != nil {
+				return fmt.Errorf("recording the approval for action %s: %w", p.Def.ID, aerr)
+			}
+		}
+		for _, p := range stale {
+			if _, aerr := store.Approve(p.Def, p.Tool, p.InputDigests, "interactive-confirm"); aerr != nil {
+				return fmt.Errorf("recording the re-approval for action %s: %w", p.Def.ID, aerr)
+			}
+		}
+		return nil
+	}
+}
+
+// approvalPromptText renders the grouped approval listing (§7.3: the
+// exact command, executable identity, inputs, outputs and network the
+// approval would pin; shell actions carry the stronger warning
+// verbatim; stale approvals show their drift lines).
+func approvalPromptText(pending []restore.PendingApproval) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "The following reconstruction actions will run at the destination:\n")
+	for _, p := range pending {
+		fmt.Fprintf(&b, "  - %s: %s\n", p.Def.ID, strings.Join(p.Def.Argv, " "))
+		fmt.Fprintf(&b, "      tool: %s (sha256 %s…)\n", p.Tool.ResolvedPath, shaPrefix(p.Tool.SHA256))
+		if len(p.Def.Inputs) > 0 {
+			fmt.Fprintf(&b, "      inputs: %s\n", strings.Join(p.Def.Inputs, ", "))
+		}
+		fmt.Fprintf(&b, "      outputs: %s\n", strings.Join(p.Def.Outputs, ", "))
+		fmt.Fprintf(&b, "      network: %s\n", p.Def.Network)
+		if w := p.Def.ShellWarning(); w != "" {
+			fmt.Fprintf(&b, "      %s\n", w)
+		}
+		var stale *actions.ErrApprovalStale
+		if errors.As(p.Cause, &stale) {
+			fmt.Fprintf(&b, "      approval drift since last approval:\n")
+			for _, d := range stale.Diff {
+				fmt.Fprintf(&b, "        - %s\n", d)
+			}
+		}
+	}
+	fmt.Fprint(&b, "Approve these actions? type 'yes': ")
+	return b.String()
+}
+
+func shaPrefix(digest string) string {
+	if len(digest) > 12 {
+		return digest[:12]
+	}
+	return digest
+}
+
+// resolveOpenOperation maps a --resume/--cancel argument onto one open
+// operation: a 32-hex argument addresses the operation row directly; a
+// name selects the workspace's single open operation in a resumable
+// phase (FILES_READY, REBUILDING, REBUILD_FAILED).
+func resolveOpenOperation(sess *session, target string) (catalog.Operation, error) {
+	resumable := func(op catalog.Operation) bool {
+		return op.Kind == catalog.OpKindOpen && restore.ResumablePhase(op.Phase)
+	}
+	if id, err := domain.ParseID(target); err == nil {
+		op, gerr := sess.cat.GetOperation(domain.OperationID(id))
+		if gerr != nil {
+			return catalog.Operation{}, usageError(fmt.Errorf("%s: no operation %s in the catalog. Safe action: check `ebb status` for operation ids",
+				CodeOpenUnknownTarget, target))
+		}
+		if !resumable(op) {
+			return catalog.Operation{}, usageError(fmt.Errorf(
+				"operation %s is %s/%s; --resume/--cancel apply to an open in FILES_READY, REBUILDING or REBUILD_FAILED", target, op.Kind, op.Phase))
+		}
+		return op, nil
+	}
+	workspaces, lerr := sess.cat.ListWorkspaces()
+	if lerr != nil {
+		return catalog.Operation{}, blockedError(lerr)
+	}
+	for _, w := range workspaces {
+		if w.Name != target {
+			continue
+		}
+		active, aerr := sess.cat.ActiveOperations(w.ID)
+		if aerr != nil {
+			return catalog.Operation{}, blockedError(aerr)
+		}
+		var found []catalog.Operation
+		for _, op := range active {
+			if resumable(op) {
+				found = append(found, op)
+			}
+		}
+		switch len(found) {
+		case 1:
+			return found[0], nil
+		case 0:
+			return catalog.Operation{}, usageError(fmt.Errorf(
+				"%s: workspace %q has no open operation to resume or cancel. Safe action: check `ebb status`",
+				CodeOpenUnknownTarget, target))
+		default:
+			ids := make([]string, 0, len(found))
+			for _, op := range found {
+				ids = append(ids, string(op.ID))
+			}
+			return catalog.Operation{}, usageError(fmt.Errorf(
+				"workspace %q has %d resumable open operations (%s); pass the operation id explicitly", target, len(found), strings.Join(ids, ", ")))
+		}
+	}
+	return catalog.Operation{}, usageError(fmt.Errorf(
+		"%s: no workspace named %q is recorded (and the argument is not a 32-hex operation id). Safe action: check `ebb status`",
+		CodeOpenUnknownTarget, target))
+}
+
+// cancelOpenOp cancels a resumable open operation through the restore
+// cancel path (phase → CANCELED; a pure journal act — the published
+// files and the snapshot pin are untouched).
+func cancelOpenOp(deps Deps, sess *session, op catalog.Operation) (catalog.Operation, error) {
+	if deps.NewRestoreOp == nil || deps.NewProbe == nil {
+		return op, usageError(fmt.Errorf("restore opener %w", ErrNotIntegrated))
+	}
+	opener, err := deps.NewRestoreOp(restore.Dependencies{
+		Store: sess.store, Cat: sess.cat, Probe: deps.NewProbe(),
+	})
+	if err != nil {
+		return op, blockedError(err)
+	}
+	return opener.CancelRebuild(op.ID)
+}
+
+// openResultDetails assembles the JSON/human details from a result.
+func openResultDetails(sess *session, snapID domain.SnapshotID, res restore.Result) openDetails {
+	details := openDetails{
+		Destination:     res.Destination,
+		EntriesRestored: res.EntriesRestored,
+		BytesRestored:   res.BytesRestored,
+		RebuildHints:    []openRebuildHint{},
+		Actions:         []openActionRun{},
+	}
+	snap, _ := sess.cat.GetSnapshot(snapID)
+	details.SnapshotID = string(snapID)
+	details.Kind = snap.Kind
+	if ws, err := sess.cat.GetWorkspace(res.WorkspaceID); err == nil {
+		details.Workspace = ws.Name
+	}
+	for _, h := range res.RebuildHints {
+		details.RebuildHints = append(details.RebuildHints, openRebuildHint{
+			GroupID: h.GroupID, Command: h.Command, Inputs: h.Inputs, Network: h.Network})
+	}
+	for _, a := range res.Actions {
+		details.Actions = append(details.Actions, openActionRun{
+			ID: a.ID, Status: a.Status, ExitCode: a.ExitCode, Skipped: a.Skipped})
+	}
+	return details
+}
+
+// openConditions derives the envelope conditions from the result.
+func openConditions(res restore.Result) []string {
+	conds := []string{"snapshot-pinned"}
+	switch res.Phase {
+	case catalog.PhaseDone:
+		if len(res.Actions) > 0 {
+			conds = append([]string{"ready", "rebuild-complete"}, conds...)
+		} else {
+			conds = append([]string{"files-ready"}, conds...)
+		}
+	case catalog.PhaseRebuildFailed:
+		conds = append([]string{"rebuild-failed", "files-intact"}, conds...)
+	}
+	return conds
+}
+
+// emitOpenRebuildFailure reports the §17.5 exit-6 outcome: files
+// recovered and intact, rebuild failed, naming the failed actions and
+// the resume command.
+func emitOpenRebuildFailure(env Envelope, jsonOut bool, streams Streams, target string, rebuild *restore.ErrRebuildFailed, details openDetails) int {
+	env.Outcome = outcomeForExit(ExitRebuildFailed)
+	env.Phase = catalog.PhaseRebuildFailed
+	env.Details = details
+	env.Conditions = []string{"rebuild-failed", "files-intact", "snapshot-pinned"}
+	msg := codedWithSafeAction(rebuild)
+	emit(env, jsonOut, streams, fmt.Sprintf(
+		"open %s: %s\n  recovered files are intact at %s; resolve the blocker and rerun with: ebb open --resume %s\n",
+		target, msg, details.Destination, rebuild.OperationID))
+	return ExitRebuildFailed
 }
 
 // resolveOpenTarget maps the CLI argument onto one sealed snapshot and
@@ -236,25 +600,44 @@ func resolveOpenTarget(sess *session, target string) (domain.SnapshotID, catalog
 		CodeOpenUnknownTarget, target))
 }
 
-// renderOpenHuman renders the files-ready open report.
+// renderOpenHuman renders the open report.
 func renderOpenHuman(d openDetails) string {
 	var b strings.Builder
 	line := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
 	line("opened workspace %q at %s\n", d.Workspace, d.Destination)
 	line("  snapshot: %s (kind %s, stays pinned)\n", d.SnapshotID, d.Kind)
 	line("  entries restored: %d (%s)\n", d.EntriesRestored, HumanBytes(d.BytesRestored))
-	line("  status: files-ready — preserved files are back; v1 open does not run reconstruction\n")
-	if len(d.RebuildHints) == 0 {
-		line("  rebuild: nothing to reconstruct\n")
+	if len(d.Actions) == 0 {
+		line("  status: files-ready — preserved files are back; no reconstruction actions ran\n")
 	} else {
-		line("  rebuild hints (run them yourself; Ebb will not execute them):\n")
-		for _, h := range d.RebuildHints {
-			line("    - %s: %s", h.GroupID, strings.Join(h.Command, " "))
-			if len(h.Inputs) > 0 {
-				line(" (inputs: %s)", strings.Join(h.Inputs, ", "))
+		for _, a := range d.Actions {
+			switch {
+			case a.Skipped:
+				line("  action %s: skipped (already succeeded earlier)\n", a.ID)
+			case a.Status == "succeeded":
+				line("  action %s: succeeded\n", a.ID)
+			default:
+				line("  action %s: %s (exit %d)\n", a.ID, a.Status, a.ExitCode)
 			}
-			line("\n")
 		}
+		line("  status: ready — approved reconstruction completed\n")
+	}
+	if len(d.RebuildHints) > 0 {
+		hinted := false
+		for _, h := range d.RebuildHints {
+			ran := false
+			for _, a := range d.Actions {
+				if a.ID == h.GroupID && a.Status == "succeeded" {
+					ran = true
+				}
+			}
+			if !ran {
+				hinted = true
+				line("  rebuild hint (not executable from this snapshot; run it yourself): %s: %s\n",
+					h.GroupID, strings.Join(h.Command, " "))
+			}
+		}
+		_ = hinted
 	}
 	return b.String()
 }

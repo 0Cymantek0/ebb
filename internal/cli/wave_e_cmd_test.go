@@ -382,11 +382,11 @@ func TestOpenAfterParkByName(t *testing.T) {
 	}
 	dest := filepath.Join(t.TempDir(), "restored")
 
-	code, stdout, stderr := h.run("open", "cliws", "--to", dest)
+	code, stdout, stderr := h.run("open", "cliws", "--to", dest, "--files-only")
 	if code != ExitOK {
 		t.Fatalf("open code = %d, stderr = %s", code, stderr)
 	}
-	for _, want := range []string{"files-ready", "entries restored", "rebuild hints", "pnpm"} {
+	for _, want := range []string{"files-ready", "entries restored", "rebuild hint", "pnpm"} {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("stderr lacks %q:\n%s", want, stderr)
 		}
@@ -420,12 +420,12 @@ func TestOpenJSONEnvelope(t *testing.T) {
 		t.Fatal("park failed")
 	}
 	dest := filepath.Join(t.TempDir(), "restored-json")
-	code, stdout, stderr := h.run("open", "--json", "cliws", "--to", dest)
+	code, stdout, stderr := h.run("open", "--json", "cliws", "--to", dest, "--files-only")
 	if code != ExitOK {
 		t.Fatalf("code = %d, stderr = %s", code, stderr)
 	}
 	env := envelopeOf(t, stdout)
-	if envString(t, env, "phase") != "FILES_READY" {
+	if envString(t, env, "phase") != "DONE" {
 		t.Errorf("phase = %v", env["phase"])
 	}
 	if !mustCondition(env, "files-ready") || !mustCondition(env, "snapshot-pinned") {
@@ -459,7 +459,7 @@ func TestOpenBySnapshotID(t *testing.T) {
 		t.Fatal("no park snapshot found")
 	}
 	dest := filepath.Join(t.TempDir(), "by-id")
-	code, _, stderr := h.run("open", snapID, "--to", dest)
+	code, _, stderr := h.run("open", snapID, "--to", dest, "--files-only")
 	if code != ExitOK {
 		t.Fatalf("code = %d, stderr = %s", code, stderr)
 	}

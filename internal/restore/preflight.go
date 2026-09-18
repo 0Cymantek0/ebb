@@ -61,13 +61,15 @@ func (o *Opener) preflight(ctx context.Context, wsID domain.WorkspaceID, destOpt
 			return "", fmt.Errorf("restore: destination %s: %w", dest, err)
 		}
 		if len(entries) > 0 {
-			// Is this Ebb's own prior publish? A completed open left a
-			// FILES_READY operation bound to this destination; its files
-			// are recoverable output, but overwriting them needs
-			// reconciliation authority this package does not have.
-			if opID, ok := o.publishedOpenAt(wsID, dest); ok {
+			// Is this Ebb's own prior publish? An open operation bound to
+			// this destination at a publish-or-later phase (FILES_READY,
+			// REBUILDING, REBUILD_FAILED, READY or DONE) put these files
+			// here; they may include user work since. Overwriting them
+			// needs authority this package does not have — name the
+			// operation and refuse.
+			if opID, phase, ok := o.publishedOpenAt(wsID, dest); ok {
 				return "", &ErrDestinationOccupied{Destination: dest, Occupant: fmt.Sprintf(
-					"files published by Ebb open operation %s (phase FILES_READY); reconcile that operation before reopening here", opID)}
+					"files published by Ebb open operation %s (phase %s); never overwritten — resume or cancel that operation, or choose another --to destination", opID, phase)}
 			}
 			first := "unknown"
 			if len(entries) > 0 {
@@ -96,20 +98,39 @@ func (o *Opener) preflight(ctx context.Context, wsID domain.WorkspaceID, destOpt
 	return dest, nil
 }
 
-// publishedOpenAt reports the id of an active open operation that has
-// already published its files at dest (phase FILES_READY with dest as
-// its root of record).
-func (o *Opener) publishedOpenAt(wsID domain.WorkspaceID, dest string) (domain.OperationID, bool) {
-	active, err := o.cat.ActiveOperations(wsID)
+// publishedOpenAt reports the id and phase of the open operation that
+// already published its files at dest (dest as its root of record, at a
+// publish-or-later phase). An ACTIVE operation (resumable) wins over a
+// completed one: it is the reconciliation target the message names.
+func (o *Opener) publishedOpenAt(wsID domain.WorkspaceID, dest string) (domain.OperationID, string, bool) {
+	ops, err := o.cat.ListOperations(wsID)
 	if err != nil {
-		return "", false // preflight treats a journal failure as "not Ebb's"
+		return "", "", false // preflight treats a journal failure as "not Ebb's"
 	}
-	for _, op := range active {
-		if op.Kind == catalog.OpKindOpen && op.Phase == catalog.PhaseFilesReady && op.SourceRoot == dest {
-			return op.ID, true
+	published := func(phase string) bool {
+		switch phase {
+		case catalog.PhaseFilesReady, catalog.PhaseRebuilding, catalog.PhaseRebuildFailed,
+			catalog.PhaseReady, catalog.PhaseDone:
+			return true
 		}
+		return false
 	}
-	return "", false
+	var doneMatch *catalog.Operation
+	for i := range ops {
+		op := ops[i]
+		if op.Kind != catalog.OpKindOpen || op.SourceRoot != dest || !published(op.Phase) {
+			continue
+		}
+		if resumePhases[op.Phase] {
+			return op.ID, op.Phase, true // active: the reconciliation target
+		}
+		o := op
+		doneMatch = &o
+	}
+	if doneMatch != nil {
+		return doneMatch.ID, doneMatch.Phase, true
+	}
+	return "", "", false
 }
 
 // recoverInterruptedOpen reconciles ACTIVE open operations of this

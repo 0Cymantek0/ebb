@@ -17,7 +17,9 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
+	"ebb/internal/actions"
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 )
@@ -107,6 +109,26 @@ type manifestAction struct {
 	Network   string   `json:"network"`
 	Command   []string `json:"command,omitempty"`
 	Ownership string   `json:"ownership"`
+	// Definition is the optional extension object (§16.1) freezing the
+	// exact captured action definition. Absent on legacy manifests:
+	// such an action is a HINT (reported, never executed). Strict
+	// parsing applies inside the object like everywhere else.
+	Definition *actionDefinitionDoc `json:"definition,omitempty"`
+}
+
+// actionDefinitionDoc is the strict reader's twin of the writer's
+// definition extension (internal/lifecycle actionDefDoc): the exact
+// actions.Definition wire form frozen at capture time.
+type actionDefinitionDoc struct {
+	ID          string   `json:"id"`
+	Argv        []string `json:"argv"`
+	WorkingRoot string   `json:"working_root"`
+	Inputs      []string `json:"inputs"`
+	Outputs     []string `json:"outputs"`
+	EnvAllow    []string `json:"env_allow"`
+	Network     string   `json:"network"`
+	TimeoutNS   int64    `json:"timeout_ns"`
+	DependsOn   []string `json:"depends_on"`
 }
 
 type manifestExternal struct {
@@ -489,8 +511,8 @@ func parseInventory(raw []byte) ([]domain.Entry, error) {
 // rebuildHints derives the reported-not-run reconstruction plan from the
 // manifest: every captured action whose group actually has omitted
 // members (a scope_exclusions entry naming that group) becomes one hint
-// carrying the literal command (the manifest's custom argv, or the
-// pinned ecosystem recipe constant).
+// carrying the literal command (the manifest's custom argv, or the pinned
+// ecosystem recipe constant).
 func rebuildHints(m manifestDoc) []RebuildHint {
 	omitted := map[string]bool{}
 	for _, ex := range m.ScopeExclusions {
@@ -516,6 +538,46 @@ func rebuildHints(m manifestDoc) []RebuildHint {
 	}
 	sort.Slice(hints, func(i, j int) bool { return hints[i].GroupID < hints[j].GroupID })
 	return hints
+}
+
+// rebuildDefinitions derives the EXECUTABLE rebuild plan from the
+// manifest: one actions.Definition per captured action that (a) carries
+// the exact `definition` extension object and (b) whose group actually
+// has omitted members. Legacy actions without the extension are
+// hint-only (rebuildHints) and never execute. The returned definitions
+// are re-validated (ValidateGraph) before any run: a manifest whose
+// frozen definitions cannot form a runnable DAG is a typed document
+// error, not a silent skip.
+func rebuildDefinitions(m manifestDoc) ([]actions.Definition, error) {
+	omitted := map[string]bool{}
+	for _, ex := range m.ScopeExclusions {
+		if ex.Group != "" {
+			omitted[ex.Group] = true
+		}
+	}
+	var defs []actions.Definition
+	for _, a := range m.Actions {
+		if !omitted[a.ID] || a.Definition == nil {
+			continue
+		}
+		d := a.Definition
+		defs = append(defs, actions.Definition{
+			ID:          d.ID,
+			Argv:        append([]string(nil), d.Argv...),
+			WorkingRoot: d.WorkingRoot,
+			Inputs:      append([]string(nil), d.Inputs...),
+			Outputs:     append([]string(nil), d.Outputs...),
+			EnvAllow:    append([]string(nil), d.EnvAllow...),
+			Network:     actions.Network(d.Network),
+			Timeout:     time.Duration(d.TimeoutNS),
+			DependsOn:   append([]string(nil), d.DependsOn...),
+		})
+	}
+	if err := actions.ValidateGraph(defs); err != nil {
+		return nil, &ErrVerification{Check: "documents", Details: []string{
+			fmt.Sprintf("manifest action definitions do not form a runnable graph: %v", err)}}
+	}
+	return defs, nil
 }
 
 // Adapter names of the frozen manifest vocabulary (they serialize from

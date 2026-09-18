@@ -30,8 +30,14 @@ const (
 	CodeEscalationUnconfirmed = "EBB_E_ESCALATION_UNCONFIRMED"
 	CodeForgetLastOfParked    = "EBB_E_LAST_OF_PARKED"
 	CodeForgetUnconfirmed     = "EBB_E_FORGET_UNCONFIRMED"
-	CodeForgetUnsealed        = "EBB_E_FORGET_UNSEAILED"
+	CodeForgetUnsealed        = "EBB_E_FORGET_UNSEALED"
 	CodeForgetNotForgettable  = "EBB_E_NOT_FORGETTABLE"
+	// Reconstruction-approval blockers (open's rebuild phase). The
+	// outcome is exit 6 either way: preserved files were recovered, the
+	// reconstruction is blocked (Foundation §17.5).
+	CodeApprovalRequired = "EBB_E_APPROVAL_REQUIRED"
+	CodeApprovalDrift    = "EBB_E_APPROVAL_DRIFT"
+	CodeApprovalDeclined = "EBB_E_APPROVAL_DECLINED"
 )
 
 // blockerMessage renders one §5.5 blocker: stable code, reason and a
@@ -123,6 +129,15 @@ func classifyExitCode(err error) int {
 		// The staged tree is kept and the operation stays RESTORING for
 		// recovery (§12.5): reconciliation is outstanding.
 		return ExitInterrupted
+	}
+	// Preserved files recovered but reconstruction failed/blocked
+	// (§17.5 exit 6): non-zero action exit, timeout, missing outputs,
+	// unresolvable tool (F14), declined/stale approval or a protected
+	// file changed (F36). Note a cancellation inside the rebuild keeps
+	// its 130 semantics: the context check above wins over this branch.
+	var rebuild *restore.ErrRebuildFailed
+	if errors.As(err, &rebuild) {
+		return ExitRebuildFailed
 	}
 	// Vault/unlock/provider unavailable.
 	var noSource *vault.NoSourceError
@@ -239,6 +254,11 @@ func safeActionFor(err error) string {
 	var sourceChanged *lifecycle.ErrSourceChanged
 	if errors.As(err, &sourceChanged) {
 		return ". Safe action: the sealed snapshot stays retained and the source is intact; resolve the change and run a fresh capture"
+	}
+	var rebuild *restore.ErrRebuildFailed
+	if errors.As(err, &rebuild) {
+		return fmt.Sprintf(". Safe action: the recovered files are intact at the destination and the snapshot stays pinned; resolve the blocker (install the missing toolchain, fix the action), then `ebb open --resume %s`",
+			rebuild.OperationID)
 	}
 	return ""
 }

@@ -64,6 +64,16 @@ func openCaptureCommand(deps Deps, streams Streams, root string) (*session, disc
 		Policy:        disc.Policy,
 		Git:           disc.Obs,
 	}
+	// Exact captured action definitions (§16.2): derived per regenerate
+	// group now so the manifest freezes exactly what `ebb open` may run
+	// later (lifecycle validates the graph before freezing).
+	actionDefs, aerr := deriveActionDefs(disc.Policy)
+	if aerr != nil {
+		stop()
+		sess.close()
+		return nil, discovery{}, nil, lifecycle.CaptureOptions{}, nil, nil, usageError(aerr)
+	}
+	opts.ActionDefs = actionDefs
 	probe := deps.NewProbe()
 	if probe == nil {
 		stop()

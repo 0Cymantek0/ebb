@@ -630,7 +630,8 @@ func TestE2EResticParkOpenRoundTrip(t *testing.T) {
 				res.EntriesRestored, res.BytesRestored, preserved, preservedBytes)
 		}
 
-		// Durable state: op FILES_READY, workspace live at the destination
+		// Durable state: op DONE (files-only completes: FILES_READY ->
+		// DONE, nothing outstanding), workspace live at the destination
 		// with a FRESH identity (I13 — compare via the probe, not path
 		// strings), snapshot STILL pinned (I07), staging cleaned.
 		cat := e.newCat()
@@ -638,8 +639,8 @@ func TestE2EResticParkOpenRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if op.Phase != catalog.PhaseFilesReady || op.Kind != catalog.OpKindOpen {
-			t.Errorf("open op = %s/%s, want open/FILES_READY", op.Kind, op.Phase)
+		if op.Phase != catalog.PhaseDone || op.Kind != catalog.OpKindOpen {
+			t.Errorf("open op = %s/%s, want open/DONE", op.Kind, op.Phase)
 		}
 		w, err := cat.GetWorkspace(ws)
 		if err != nil {
@@ -809,8 +810,8 @@ func TestE2EResticJunctionWorkspace(t *testing.T) {
 	}
 	cat := e.newCat()
 	op, gerr := cat.GetOperation(ores.OperationID)
-	if gerr != nil || op.Phase != catalog.PhaseFilesReady {
-		t.Errorf("open op phase: %v %q, want FILES_READY", gerr, op.Phase)
+	if gerr != nil || op.Phase != catalog.PhaseDone {
+		t.Errorf("open op phase: %v %q, want DONE", gerr, op.Phase)
 	}
 	w, werr := cat.GetWorkspace(ws)
 	if werr != nil || w.Status != catalog.WorkspaceLive || w.RootPath != filepath.Clean(dest) {
@@ -1074,8 +1075,8 @@ func TestE2EResticCrashRecoverAndReopenOriginalPath(t *testing.T) {
 	e2eSameTree(t, before, e2eWalkTree(t, root))
 	final := e.newCat()
 	op, err := final.GetOperation(res.OperationID)
-	if err != nil || op.Phase != catalog.PhaseFilesReady {
-		t.Errorf("reopen op phase: %v %q, want FILES_READY", err, op.Phase)
+	if err != nil || op.Phase != catalog.PhaseDone {
+		t.Errorf("reopen op phase: %v %q, want DONE", err, op.Phase)
 	}
 	w2, err := final.GetWorkspace(ws)
 	if err != nil || w2.Status != catalog.WorkspaceLive || w2.RootPath != filepath.Clean(root) {
