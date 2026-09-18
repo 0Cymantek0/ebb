@@ -1,0 +1,33 @@
+version = 1
+
+[workspace]
+name = "fixture"
+
+[policy]
+network = "approved-actions"
+unknown = "preserve"
+
+[[preserve]]
+patterns = ["research/**"]
+reason = "original material"
+
+[[sensitive]]
+paths = [".env"]
+patterns = [".env.*"]
+
+[[regenerate]]
+id = "node-dependencies"
+adapter = "pnpm"
+root = "."
+outputs = ["node_modules"]
+inputs = ["package.json", "pnpm-lock.yaml"]
+network = "allowed"
+
+[[regenerate]]
+id = "build-dist"
+adapter = "custom"
+root = "."
+outputs = ["dist"]
+inputs = ["package.json"]
+network = "offline-artifacts"
+command = ["make", "dist"]

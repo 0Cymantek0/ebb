@@ -45,6 +45,13 @@ type FileFacts struct {
 	// Sparse reports that the file carries sparse allocation.
 	Sparse bool
 
+	// Placeholder reports a provider cloud placeholder (Windows
+	// FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS/RECALL_ON_OPEN). Content must
+	// never be opened for such files (hydration, §8.1). When false but
+	// the platform cannot observe allocation, scanners may still apply
+	// their zero-allocation heuristic and mark suspicion.
+	Placeholder bool
+
 	// ReparseTag is the raw tag for reparse points, hex-encoded; used to
 	// distinguish junction / mount point / other (§10.2).
 	ReparseTag string
@@ -101,12 +108,12 @@ type SnapshotRef struct {
 
 // TreeEntry is one node in a backend snapshot listing.
 type TreeEntry struct {
-	Path     string   `json:"path"` // store-normalized, bijection via manifest
-	Kind     EntryKind `json:"kind"`
-	Size     int64    `json:"size"`
-	Mode     string   `json:"mode,omitempty"`
-	ModTime  string   `json:"mtime,omitempty"`
-	LinkTarget string `json:"link_target,omitempty"`
+	Path       string    `json:"path"` // store-normalized, bijection via manifest
+	Kind       EntryKind `json:"kind"`
+	Size       int64     `json:"size"`
+	Mode       string    `json:"mode,omitempty"`
+	ModTime    string    `json:"mtime,omitempty"`
+	LinkTarget string    `json:"link_target,omitempty"`
 }
 
 // StoreError separates failure classes so lifecycle can decide between
@@ -120,11 +127,11 @@ type StoreError struct {
 type StoreErrorClass string
 
 const (
-	StoreErrSource     StoreErrorClass = "source"      // exit 3: incomplete snapshot created
-	StoreErrRepo       StoreErrorClass = "repo"         // exit 10: repo missing/unavailable
-	StoreErrAuth       StoreErrorClass = "auth"         // exit 12: wrong password/key
-	StoreErrUsage      StoreErrorClass = "usage"        // bad invocation of the backend
-	StoreErrUnknown    StoreErrorClass = "unknown"
+	StoreErrSource  StoreErrorClass = "source" // exit 3: incomplete snapshot created
+	StoreErrRepo    StoreErrorClass = "repo"   // exit 10: repo missing/unavailable
+	StoreErrAuth    StoreErrorClass = "auth"   // exit 12: wrong password/key
+	StoreErrUsage   StoreErrorClass = "usage"  // bad invocation of the backend
+	StoreErrUnknown StoreErrorClass = "unknown"
 )
 
 func (e *StoreError) Error() string { return string(e.Class) + ": " + e.Err.Error() }

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "summary": {
+    "total_entries": 2,
+    "preserved": 2,
+    "omitted_by_route": {},
+    "preserved_bytes": 120
+  },
+  "entries": [
+    {
+      "root": "main",
+      "path": "a.txt",
+      "kind": "file",
+      "logical_size": 100,
+      "allocated_size": 100,
+      "digest": "4444444444444444444444444444444444444444444444444444444444444444",
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": "preserve",
+      "evidence": ["git:tracked"]
+    },
+    {
+      "root": "main",
+      "path": "b.txt",
+      "kind": "file",
+      "logical_size": 20,
+      "allocated_size": 20,
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": ""
+    }
+  ],
+  "volume": {
+    "volume_id": "v-min"
+  }
+}

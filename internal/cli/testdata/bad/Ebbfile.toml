@@ -1,0 +1,8 @@
+version = 1
+
+[workspace]
+name = "bad"
+
+[policy]
+networkk = "approved-actions"
+unknown = "preserve"

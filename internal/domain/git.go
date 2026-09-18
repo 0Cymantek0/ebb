@@ -17,32 +17,37 @@ type GitObservation struct {
 	AdminInsideRoot bool `json:"admin_inside_root"`
 
 	// HEAD state
-	HeadCommit    string `json:"head_commit,omitempty"` // "" on unborn
-	HeadBranch    string `json:"head_branch,omitempty"` // "" on detached
-	Detached      bool   `json:"detached"`
-	Unborn        bool   `json:"unborn"`
+	HeadCommit string `json:"head_commit,omitempty"` // "" on unborn
+	HeadBranch string `json:"head_branch,omitempty"` // "" on detached
+	Detached   bool   `json:"detached"`
+	Unborn     bool   `json:"unborn"`
 
 	// Working state summaries (counts, not content)
-	StagedEntries   int64 `json:"staged_entries"`    // index entries
-	DirtyWorktree   bool  `json:"dirty_worktree"`    // porcelain v2 saw changes
-	UnmergedEntries int64 `json:"unmerged_entries"`  // conflict stages
-	StashCount      int64 `json:"stash_count"`
+	StagedEntries    int64 `json:"staged_entries"`   // index entries
+	DirtyWorktree    bool  `json:"dirty_worktree"`   // porcelain v2 saw changes
+	UnmergedEntries  int64 `json:"unmerged_entries"` // conflict stages
+	StashCount       int64 `json:"stash_count"`
 	UntrackedEntries int64 `json:"untracked_entries"`
 
 	// In-progress operations detected via admin files
-	MergeInProgress  bool `json:"merge_in_progress"`
-	RebaseInProgress bool `json:"rebase_in_progress"`
+	MergeInProgress      bool `json:"merge_in_progress"`
+	RebaseInProgress     bool `json:"rebase_in_progress"`
 	CherryPickInProgress bool `json:"cherry_pick_in_progress"`
-	RevertInProgress bool `json:"revert_in_progress"`
+	RevertInProgress     bool `json:"revert_in_progress"`
 
 	// Topology
-	Remotes     []GitRemote `json:"remotes,omitempty"`
-	Worktrees   []GitWorktree `json:"worktrees,omitempty"` // linked worktrees
-	HasShallow  bool `json:"has_shallow"`
-	HasAlternates bool `json:"has_alternates"` // objects/info/alternates present
-	IsPartialClone bool `json:"is_partial_clone"` // promisor remote configured
-	HasLFS       bool `json:"has_lfs"`          // filter.lfs config or .git/lfs present
-	Submodules   []string `json:"submodules,omitempty"` // names from .gitmodules (parsed as INI, never initialized)
+	Remotes []GitRemote `json:"remotes,omitempty"`
+	// Worktrees lists ALL entries of `worktree list --porcelain`,
+	// including the main (or bare) worktree. DestructiveParkBlockers
+	// treats >1 entry as shared Git administration (§9.2), so the main
+	// entry must be included for a single linked worktree to fire the
+	// blocker.
+	Worktrees      []GitWorktree `json:"worktrees,omitempty"`
+	HasShallow     bool          `json:"has_shallow"`
+	HasAlternates  bool          `json:"has_alternates"`       // objects/info/alternates present
+	IsPartialClone bool          `json:"is_partial_clone"`     // promisor remote configured
+	HasLFS         bool          `json:"has_lfs"`              // filter.lfs config or .git/lfs present
+	Submodules     []string      `json:"submodules,omitempty"` // names from .gitmodules (parsed as INI, never initialized)
 
 	// ObjectFormat from config (sha1/object-format).
 	ObjectFormat string `json:"object_format,omitempty"`

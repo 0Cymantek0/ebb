@@ -1,14 +1,14 @@
 // Command ebb reclaims developer workspace disk space with verified
-// recovery. This stub will be replaced by the CLI package; it exists so
-// the module builds from the first commit.
+// recovery. This is the thin process entry point; all dispatch, exit
+// codes and presentation live in ebb/internal/cli (Foundation §17).
 package main
 
 import (
-	"fmt"
 	"os"
+
+	"ebb/internal/cli"
 )
 
 func main() {
-	fmt.Fprintln(os.Stderr, "ebb: not yet implemented (M0 scaffold)")
-	os.Exit(2)
+	os.Exit(cli.Main(os.Args[1:], cli.Streams{Out: os.Stdout, Err: os.Stderr}, cli.DefaultDeps()))
 }

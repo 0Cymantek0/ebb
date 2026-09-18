@@ -1,0 +1,47 @@
+version = 1
+
+[workspace]
+name = "renderer"
+
+[policy]
+network = "approved-actions"
+unknown = "preserve"
+
+[[preserve]]
+patterns = ["research/**", "assets/private/**"]
+reason = "Original material"
+
+[[sensitive]]
+paths = [".env"]
+patterns = [".env.*", "certificates/**"]
+
+[[regenerate]]
+id = "node-dependencies"
+adapter = "pnpm"
+root = "."
+outputs = ["node_modules"]
+inputs = ["package.json", "pnpm-lock.yaml"]
+network = "allowed"
+
+[[regenerate]]
+id = "build-dist"
+adapter = "custom"
+root = "."
+outputs = ["dist", "build/out"]
+inputs = ["package.json"]
+network = "offline-artifacts"
+command = ["make", "dist"]
+
+[[external]]
+id = "reference-dataset"
+kind = "directory"
+location = "dataset-main"
+ownership = "shared"
+required = true
+
+[[external]]
+id = "index-service"
+kind = "service"
+location = "search-index"
+ownership = "reference-only"
+required = false

@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "summary": {
+    "total_entries": 11,
+    "preserved": 6,
+    "omitted_by_route": {},
+    "preserved_bytes": 1650,
+    "excl_reclaimable": {
+      "node_modules": 3500000,
+      "dist": 400000
+    }
+  },
+  "entries": [
+    {
+      "root": "main",
+      "path": "package.json",
+      "kind": "file",
+      "logical_size": 200,
+      "allocated_size": 200,
+      "digest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": "preserve",
+      "evidence": ["git:tracked"]
+    },
+    {
+      "root": "main",
+      "path": "pnpm-lock.yaml",
+      "kind": "file",
+      "logical_size": 400,
+      "allocated_size": 400,
+      "digest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": "preserve",
+      "evidence": ["git:tracked"]
+    },
+    {
+      "root": "main",
+      "path": ".env",
+      "kind": "file",
+      "logical_size": 50,
+      "allocated_size": 50,
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": ""
+    },
+    {
+      "root": "main",
+      "path": "research",
+      "kind": "dir",
+      "logical_size": 0,
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": ""
+    },
+    {
+      "root": "main",
+      "path": "research/notes.md",
+      "kind": "file",
+      "logical_size": 1000,
+      "allocated_size": 1000,
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": ""
+    },
+    {
+      "root": "main",
+      "path": "node_modules",
+      "kind": "dir",
+      "logical_size": 0,
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": ""
+    },
+    {
+      "root": "main",
+      "path": "node_modules/.pnpm/x/index.js",
+      "kind": "file",
+      "logical_size": 3000000,
+      "allocated_size": 3000000,
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": ""
+    },
+    {
+      "root": "main",
+      "path": "node_modules/leftpad/index.js",
+      "kind": "file",
+      "logical_size": 1000000,
+      "allocated_size": 1000000,
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": ""
+    },
+    {
+      "root": "main",
+      "path": "dist",
+      "kind": "dir",
+      "logical_size": 0,
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": ""
+    },
+    {
+      "root": "main",
+      "path": "dist/app.js",
+      "kind": "file",
+      "logical_size": 500000,
+      "allocated_size": 500000,
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": ""
+    },
+    {
+      "root": "main",
+      "path": "src/main.go",
+      "kind": "file",
+      "logical_size": 5000,
+      "allocated_size": 5000,
+      "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "ownership": "owned",
+      "sensitivity": "ordinary",
+      "route": "preserve",
+      "evidence": ["git:tracked"]
+    }
+  ],
+  "volume": {
+    "volume_id": "test-vol",
+    "free_to_caller": 1000000000,
+    "volume_free": 2000000000,
+    "total": 5000000000
+  }
+}

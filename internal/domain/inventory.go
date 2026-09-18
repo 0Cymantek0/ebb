@@ -20,10 +20,10 @@ func (r RootIdentity) String() string { return r.VolumeID + "/" + r.FileID }
 
 // Root is one declared capture root.
 type Root struct {
-	ID       RootID       `json:"id"`
-	Path     string       `json:"path"` // absolute, native separators
-	Identity RootIdentity `json:"identity"`
-	Ownership Ownership   `json:"ownership"`
+	ID        RootID       `json:"id"`
+	Path      string       `json:"path"` // absolute, native separators
+	Identity  RootIdentity `json:"identity"`
+	Ownership Ownership    `json:"ownership"`
 }
 
 // VolumeUsage is per-volume space accounting input (Foundation §14.1).
@@ -51,13 +51,13 @@ type ScanIssue struct {
 // InventorySummary accounts for every in-scope entry: each has exactly
 // one outcome — captured, omitted-with-route, or blocking (§8.4).
 type InventorySummary struct {
-	TotalEntries   int64             `json:"total_entries"`
-	Preserved      int64             `json:"preserved"`
-	OmittedByRoute map[Route]int64   `json:"omitted_by_route"`
-	Blocking       []string          `json:"blocking,omitempty"` // entry paths that block destructive ops
-	PreservedBytes int64             `json:"preserved_bytes"`    // logical sum of preserved files
+	TotalEntries    int64            `json:"total_entries"`
+	Preserved       int64            `json:"preserved"`
+	OmittedByRoute  map[Route]int64  `json:"omitted_by_route"`
+	Blocking        []string         `json:"blocking,omitempty"`         // entry paths that block destructive ops
+	PreservedBytes  int64            `json:"preserved_bytes"`            // logical sum of preserved files
 	ExclReclaimable map[string]int64 `json:"excl_reclaimable,omitempty"` // root-path prefix -> bytes exclusively reclaimable
-	Issues         []ScanIssue       `json:"issues,omitempty"`
+	Issues          []ScanIssue      `json:"issues,omitempty"`
 }
 
 // Complete reports whether accounting closes with no unaccounted entry.

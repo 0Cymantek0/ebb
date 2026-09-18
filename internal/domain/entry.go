@@ -52,15 +52,15 @@ const (
 type EntryKind string
 
 const (
-	KindFile        EntryKind = "file"
-	KindDir         EntryKind = "dir"
-	KindSymlink     EntryKind = "symlink"
-	KindJunction    EntryKind = "junction"
-	KindMountPoint  EntryKind = "mount-point"
+	KindFile         EntryKind = "file"
+	KindDir          EntryKind = "dir"
+	KindSymlink      EntryKind = "symlink"
+	KindJunction     EntryKind = "junction"
+	KindMountPoint   EntryKind = "mount-point"
 	KindOtherReparse EntryKind = "other-reparse"
-	KindFIFO        EntryKind = "fifo"
-	KindSocket      EntryKind = "socket"
-	KindDevice      EntryKind = "device"
+	KindFIFO         EntryKind = "fifo"
+	KindSocket       EntryKind = "socket"
+	KindDevice       EntryKind = "device"
 )
 
 // DestructiveSafe reports whether this kind can participate in v1
@@ -83,9 +83,9 @@ func (k EntryKind) DestructiveSafe() bool {
 // Fields are orthogonal by design: a generated file may be sensitive;
 // an ignored asset may be shared (§6.2).
 type Entry struct {
-	Root   RootID    `json:"root"`
-	Path   string    `json:"path"` // root-relative, '/', no '..' (validated)
-	Kind   EntryKind `json:"kind"`
+	Root RootID    `json:"root"`
+	Path string    `json:"path"` // root-relative, '/', no '..' (validated)
+	Kind EntryKind `json:"kind"`
 
 	// LogicalSize is the default-stream length for files; 0 for dirs/links.
 	LogicalSize int64 `json:"logical_size"`
