@@ -121,7 +121,12 @@ func TestGlobMatching(t *testing.T) {
 		if err := ValidateGlob(tt.glob); err != nil {
 			t.Fatalf("test bug: glob %q invalid: %v", tt.glob, err)
 		}
-		if got := matchGlobPath(tt.glob, tt.path); got != tt.want {
+		got, err := matchGlobPath(tt.glob, tt.path)
+		if err != nil {
+			t.Errorf("MatchGlob(%q, %q): %v", tt.glob, tt.path, err)
+			continue
+		}
+		if got != tt.want {
 			t.Errorf("MatchGlob(%q, %q) = %v, want %v", tt.glob, tt.path, got, tt.want)
 		}
 	}
@@ -189,5 +194,25 @@ func TestMatcherInvalidPatternRejected(t *testing.T) {
 	}
 	if _, err := NewMatcher([]Pattern{{Kind: PatternKind("regex"), Value: "a", Source: "s"}}); err == nil {
 		t.Error("unknown pattern kind accepted")
+	}
+}
+
+// POL-GLOB-1: hostile patterns must fail fast with an error, not hang
+// the backtracking matcher.
+func TestGlobBudgetRejectsPathologicalPattern(t *testing.T) {
+	pattern := "*a*a*a*a*a*a*a*a*a*b"
+	if err := ValidateGlob(pattern); err != nil {
+		t.Skipf("pattern rejected at validation: %v", err)
+	}
+	m, err := NewMatcher([]Pattern{{Kind: PatternGlob, Value: pattern, Source: "t"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := ""
+	for i := 0; i < 60; i++ {
+		name += "a"
+	}
+	if _, err := m.Match(name); err == nil {
+		t.Fatalf("expected budget error for pathological pattern %q against %d chars", pattern, len(name))
 	}
 }

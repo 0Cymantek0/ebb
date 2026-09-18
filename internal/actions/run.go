@@ -149,8 +149,32 @@ func (r *Runner) Run(ctx context.Context, def Definition, wsRoot string, appr Ap
 
 	// 4. Re-validate immediately before execution (Foundation §9.5:
 	// inputs and executables are revalidated immediately before use).
+	// The approval above matched digests taken BEFORE this point, so a
+	// concurrent writer could still swap an input file or the tool
+	// binary in the window between hashing and Start. Re-digest inputs
+	// and re-resolve/re-hash the tool NOW and refuse on any drift
+	// (ACT-TOCTOU-1 / ACT-TOOLRACE-1). This narrows the race to the
+	// final span between these reads and execve; a fully closed window
+	// needs an OS-level exec-from-handle provider, which v1 does not
+	// claim.
 	if err := def.Validate(); err != nil {
 		return Result{}, err
+	}
+	retool, err := ResolveTool(def.Argv[0])
+	if err != nil {
+		return Result{}, fmt.Errorf("actions: action %q: pre-exec tool revalidation: %w", def.ID, err)
+	}
+	if retool.ResolvedPath != tool.ResolvedPath || retool.SHA256 != tool.SHA256 {
+		return Result{}, fmt.Errorf("actions: action %q: executable changed between approval and execution (%q -> %q): refusing", def.ID, tool.ResolvedPath, retool.ResolvedPath)
+	}
+	for _, rel := range def.Inputs {
+		d, err := DigestFile(filepath.Join(wsRoot, filepath.FromSlash(rel)))
+		if err != nil {
+			return Result{}, fmt.Errorf("actions: action %q: pre-exec input revalidation of %q: %w", def.ID, rel, err)
+		}
+		if d != inputDigests[rel] {
+			return Result{}, fmt.Errorf("actions: action %q: input %q changed between approval and execution: refusing", def.ID, rel)
+		}
 	}
 
 	workDir := wsRoot

@@ -94,9 +94,33 @@ func isGlobMeta(c byte) bool { return c == '*' || c == '?' }
 // '*' matches any run of characters within the segment and '?' exactly
 // one character, but neither matches a literal metacharacter in the name
 // (F52): the glob "a*b" does not match a file literally named "a*b".
-func segMatch(pattern, name string) bool {
+// segMatchBudget bounds the total recursive work one segment match may
+// perform. Without it the backtracking matcher explodes exponentially on
+// hostile patterns like "*a*a*a*a*a*a*a*b" against long names
+// (POL-GLOB-1); a blown budget is surfaced as a validation error, never
+// a hang.
+const segMatchBudget = 200_000
+
+type budgetExceeded struct{}
+
+func (budgetExceeded) Error() string { return "policy: glob match budget exceeded" }
+
+func segMatchSafe(pattern, name string) (matched bool, err error) {
+	var steps int
+	ok, over := segMatchBounded(pattern, name, &steps)
+	if over {
+		return false, budgetExceeded{}
+	}
+	return ok, nil
+}
+
+func segMatchBounded(pattern, name string, steps *int) (bool, bool) {
+	*steps++
+	if *steps > segMatchBudget {
+		return false, true
+	}
 	if pattern == "" {
-		return name == ""
+		return name == "", false
 	}
 	switch pattern[0] {
 	case '*':
@@ -104,21 +128,21 @@ func segMatch(pattern, name string) bool {
 			if i > 0 && isGlobMeta(name[i-1]) {
 				break // '*' never consumes a literal metacharacter
 			}
-			if segMatch(pattern[1:], name[i:]) {
-				return true
+			if ok, over := segMatchBounded(pattern[1:], name[i:], steps); ok || over {
+				return ok, over
 			}
 		}
-		return false
+		return false, false
 	case '?':
 		if name == "" || isGlobMeta(name[0]) {
-			return false
+			return false, false
 		}
-		return segMatch(pattern[1:], name[1:])
+		return segMatchBounded(pattern[1:], name[1:], steps)
 	default:
 		if name == "" || name[0] != pattern[0] {
-			return false
+			return false, false
 		}
-		return segMatch(pattern[1:], name[1:])
+		return segMatchBounded(pattern[1:], name[1:], steps)
 	}
 }
 
@@ -126,30 +150,36 @@ func segMatch(pattern, name string) bool {
 // segments. A complete-segment "**" matches zero or more path segments,
 // so "a/**" matches "a" itself and everything below it. Matching is
 // case-sensitive.
-func globMatch(pattern, path []string) bool {
+func globMatch(pattern, path []string) (bool, error) {
 	if len(pattern) == 0 {
-		return len(path) == 0
+		return len(path) == 0, nil
 	}
 	if pattern[0] == "**" {
 		for skip := 0; skip <= len(path); skip++ {
-			if globMatch(pattern[1:], path[skip:]) {
-				return true
+			ok, err := globMatch(pattern[1:], path[skip:])
+			if err != nil {
+				return false, err
+			}
+			if ok {
+				return true, nil
 			}
 		}
-		return false
+		return false, nil
 	}
 	if len(path) == 0 {
-		return false
+		return false, nil
 	}
-	if !segMatch(pattern[0], path[0]) {
-		return false
+	ok, err := segMatchSafe(pattern[0], path[0])
+	if err != nil || !ok {
+		return false, err
 	}
 	return globMatch(pattern[1:], path[1:])
 }
 
 // matchGlobPath reports whether the glob pattern matches the
-// root-relative path. The pattern must already pass ValidateGlob.
-func matchGlobPath(pattern, path string) bool {
+// root-relative path, and surfaces a blown match budget as an error
+// (POL-GLOB-1: hostile patterns must fail fast, not hang).
+func matchGlobPath(pattern, path string) (bool, error) {
 	return globMatch(strings.Split(pattern, "/"), strings.Split(path, "/"))
 }
 

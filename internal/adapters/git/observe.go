@@ -108,6 +108,13 @@ func Observe(ctx context.Context, rootPath string) (domain.GitObservation, error
 			"config inventory failed (exit "+strconv.Itoa(cfgRc)+"): "+firstLine(cfgErrStr)+
 				"; static neutralization only")
 	}
+	if len(inv.unneutralizable) > 0 {
+		// GIT-NEUT-2: an execution key no -c spelling can neutralize is
+		// present. The argv allowlist contains no filter-applying command
+		// today, but proceeding with a known-live execution key violates
+		// the fail-closed rule; refuse observation entirely.
+		return obs, fmt.Errorf("gitadapter: refusing observation: repository config contains execution keys that cannot be neutralized (subsection contains '='): %q", inv.unneutralizable[0])
+	}
 	r.overrides = inv.overrideArgs()
 
 	// ---- Pass 2: allowlisted observations ------------------------------
@@ -168,8 +175,20 @@ func Observe(ctx context.Context, rootPath string) (domain.GitObservation, error
 	} else if !insideWorkTree {
 		containmentRoot = gitDir
 	}
+	canonRoot := canonicalForm(absRoot) // caller spelling may be 8.3-short; git reports long form
+	adminInRoot := adminInside(canonRoot, gitDir) && adminInside(canonRoot, commonDir)
 	obs.AdminInsideRoot = adminInside(containmentRoot, gitDir) &&
 		adminInside(containmentRoot, commonDir)
+	// GIT-WT-1: a repository whose administration lives INSIDE the
+	// observed root must have its work tree AT the root. A hostile
+	// core.worktree pointing elsewhere (e.g. an ancestor) makes the
+	// allowlisted status enumerate far outside the workspace; refuse
+	// before any work-tree-scoped command runs. (A workspace that is a
+	// subdirectory of a larger repository has its admin OUTSIDE the
+	// root and is not affected.)
+	if adminInRoot && insideWorkTree && toplevel != "" && toplevel != canonRoot {
+		return obs, fmt.Errorf("gitadapter: refusing observation: repository administration is inside the root but its work tree is %q (core.worktree override?); git status would enumerate outside the workspace", toplevel)
+	}
 
 	// HEAD state (A3/A4 + direct file read). Unborn: symbolic-ref resolves
 	// but HEAD has no commit. Detached: symbolic-ref reports "not a
@@ -349,15 +368,24 @@ func Observe(ctx context.Context, rootPath string) (domain.GitObservation, error
 	}
 
 	// .gitmodules: parsed as INI in pure Go; submodules are never
-	// initialized (Foundation §9.2). Searched at the reported toplevel
-	// (core.worktree-aware) with the root as fallback.
-	gmPath := filepath.Join(toplevel, ".gitmodules")
-	if _, statErr := os.Stat(gmPath); statErr == nil {
-		data, readErr := os.ReadFile(gmPath)
-		if readErr != nil {
-			obs.Warnings = append(obs.Warnings, ".gitmodules unreadable: "+readErr.Error())
-		} else {
-			obs.Submodules = parseGitmodulesINI(data)
+	// initialized (Foundation §9.2). Read ONLY at a toplevel that is
+	// the observed root itself: an empty toplevel would join to a
+	// PROCESS-CWD-relative ".gitmodules" (GIT-GM-1), and a toplevel
+	// outside the root belongs to a different scope than this
+	// workspace.
+	if toplevel == "" {
+		obs.Warnings = append(obs.Warnings, ".gitmodules not inspected: no work-tree toplevel reported")
+	} else {
+		gmPath := filepath.Join(toplevel, ".gitmodules")
+		if toplevel != canonRoot {
+			obs.Warnings = append(obs.Warnings, ".gitmodules not inspected: toplevel is outside the observed root")
+		} else if _, statErr := os.Stat(gmPath); statErr == nil {
+			data, readErr := os.ReadFile(gmPath)
+			if readErr != nil {
+				obs.Warnings = append(obs.Warnings, ".gitmodules unreadable: "+readErr.Error())
+			} else {
+				obs.Submodules = parseGitmodulesINI(data)
+			}
 		}
 	}
 

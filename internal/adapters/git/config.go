@@ -21,7 +21,8 @@ type configInventory struct {
 	values map[string]string
 	// overrideKeys are the exact-case keys needing empty `-c key=`
 	// overrides in pass 2, deduplicated, in first-seen order.
-	overrideKeys []string
+	overrideKeys    []string
+	unneutralizable []string // raw key=value lines holding execution keys no -c override can address
 }
 
 // staticallyNeutralized keys already carry an empty/false override in
@@ -57,6 +58,33 @@ func executionKey(key string) bool {
 	return false
 }
 
+// unneutralizableExecutionLine reports whether a lowercased key=value
+// line from `git config --list` holds an execution key whose '=' sign
+// lives in the SUBSECTION: the prefix is a filter./diff. execution
+// family, the first-'='-split key part is NOT itself a recognized
+// execution key, and an execution suffix appears after that first '='.
+// Such keys cannot be neutralized by any -c spelling (GIT-NEUT-2); the
+// caller must refuse observation instead of proceeding with a live key.
+func unneutralizableExecutionLine(lowKv string) bool {
+	eq := strings.IndexByte(lowKv, '=')
+	if eq <= 0 {
+		return false
+	}
+	keyPart, rest := lowKv[:eq], lowKv[eq+1:]
+	if executionKey(keyPart) {
+		return false // first-'='-split already yields the exact key
+	}
+	if !strings.HasPrefix(keyPart, "filter.") && !strings.HasPrefix(keyPart, "diff.") {
+		return false
+	}
+	for _, suffix := range []string{".clean=", ".smudge=", ".process=", ".textconv=", ".command="} {
+		if strings.Contains(rest, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // parseConfigList parses `git config --list --show-origin --show-scope`
 // output. Line format is `<scope>\t<origin>\t<key>=<value>`; lines without
 // the expected shape are skipped rather than trusted.
@@ -84,9 +112,20 @@ func parseConfigList(out string) *configInventory {
 		}
 		low := strings.ToLower(key)
 		inv.values[low] = value
-		if executionKey(low) && !staticallyNeutralized[low] && !seen[low] {
-			seen[low] = true
+		// GIT-NEUT-1: git subsections are case-sensitive, so each exact
+		// spelling needs its own -c override; dedup must be on the exact
+		// key, not the lowercased one (a lowered dedup let the second
+		// case-variant of a filter key survive neutralization).
+		if executionKey(low) && !staticallyNeutralized[low] && !seen[key] {
+			seen[key] = true
 			inv.overrideKeys = append(inv.overrideKeys, key)
+		}
+		// GIT-NEUT-2: a subsection containing '=' (e.g. [filter "a=b"])
+		// makes the key print as `filter.a=b.clean=...`; the first-'='
+		// split above mis-collects it and NO `git -c key=` spelling can
+		// address it. Fail closed: remember the raw line.
+		if unneutralizableExecutionLine(strings.ToLower(kv)) {
+			inv.unneutralizable = append(inv.unneutralizable, kv)
 		}
 	}
 	return inv

@@ -36,8 +36,9 @@ func TestParseConfigListCollectsExecutionKeys(t *testing.T) {
 	inv := parseConfigList(out)
 
 	want := []string{
-		"filter.lfs.clean", // any scope; dedup keeps the first spelling of a key
+		"filter.lfs.clean", // any scope
 		"filter.evil.clean",
+		"Filter.EVIL.CLEAN", // section/var case variant: same git key, redundant-but-harmless override
 		"filter.evil.smudge",
 		"filter.lfs.process",
 		"diff.evil.textconv",

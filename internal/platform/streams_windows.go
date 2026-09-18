@@ -52,11 +52,14 @@ func resolveAuxProcs() error {
 	return auxProcsErr
 }
 
-// findStreamData mirrors WIN32_FIND_STREAM_DATA
-// (LARGE_INTEGER StreamSize; WCHAR cStreamName[257]).
+// findStreamData mirrors WIN32_FIND_STREAM_DATA. The Win32 contract is
+// WCHAR cStreamName[MAX_PATH+36] = 296 wchars: the kernel may write the
+// full capacity regardless of the name's actual length, so the Go
+// field must reserve all 296 (PLAT-STREAM-1: a [257] field let a
+// 255-char stream name write 10 bytes past the field).
 type findStreamData struct {
 	size int64
-	name [257]uint16
+	name [296]uint16
 }
 
 // listNamedStreams enumerates the named data streams of path via

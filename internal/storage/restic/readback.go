@@ -15,6 +15,9 @@ import (
 // skipped; only node records are returned. Unknown node types are
 // surfaced conservatively (see mapNodeKind).
 func (s *Store) Ls(ctx context.Context, repoDir, passfile, snapID string) ([]domain.TreeEntry, error) {
+	if !isSnapshotID(snapID) {
+		return nil, storeErr(domain.StoreErrUsage, "resticstore: snapshot id %q is not 8-64 hex characters", snapID)
+	}
 	res, err := s.runRepo(ctx, repoDir, passfile, "ls", "--json", snapID)
 	if err != nil {
 		return nil, err
@@ -58,6 +61,9 @@ func (s *Store) DumpFile(ctx context.Context, repoDir, passfile, snapID, path st
 	dump, err := normalizeDumpPath(path)
 	if err != nil {
 		return nil, err
+	}
+	if !isSnapshotID(snapID) {
+		return nil, storeErr(domain.StoreErrUsage, "resticstore: snapshot id %q is not 8-64 hex characters", snapID)
 	}
 	res, rerr := s.runRepo(ctx, repoDir, passfile, "dump", snapID, dump)
 	if rerr != nil {
@@ -113,6 +119,9 @@ func normalizeDumpPath(p string) (string, error) {
 // restore timestamp") map to StoreErrUnknown. Lock-held failures carry
 // an explicit never-auto-unlock note.
 func (s *Store) Restore(ctx context.Context, repoDir, passfile, snapID, subtree, dest string) error {
+	if !isSnapshotID(snapID) {
+		return storeErr(domain.StoreErrUsage, "resticstore: snapshot id %q is not 8-64 hex characters", snapID)
+	}
 	argv := []string{"restore", snapID, "--target", dest}
 	if subtree != "" {
 		norm, err := normalizeDumpPath(subtree)

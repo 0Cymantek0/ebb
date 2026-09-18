@@ -230,6 +230,9 @@ func encodeTags(tags map[string]string) (args []string, decoded map[string]strin
 }
 
 func validTagToken(s string) bool {
+	if s == "" {
+		return false // RESTIC-TAG-1: the empty string loops zero times and passed
+	}
 	for _, c := range s {
 		switch {
 		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':

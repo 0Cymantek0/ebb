@@ -87,7 +87,11 @@ func (m *Matcher) Match(path string) (MatchResult, error) {
 		return MatchResult{Matched: true, Kind: MatchLiteral, Source: src, Value: path}, nil
 	}
 	for _, g := range m.globs {
-		if matchGlobPath(g.Value, path) {
+		ok, err := matchGlobPath(g.Value, path)
+		if err != nil {
+			return MatchResult{}, err
+		}
+		if ok {
 			return MatchResult{Matched: true, Kind: MatchGlob, Source: g.Source, Value: g.Value}, nil
 		}
 	}
