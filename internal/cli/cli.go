@@ -207,6 +207,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdRecover(args[1:], streams, deps)
 	case "forget":
 		return cmdForget(args[1:], streams, deps)
+	case "verify":
+		return cmdVerify(args[1:], streams, deps)
 	case "status":
 		return cmdStatus(args[1:], streams, deps)
 	case "doctor":
