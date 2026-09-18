@@ -151,9 +151,14 @@ type inventoryRecord struct {
 // from the payload snapshot.
 type payloadDocs struct {
 	wsPrefix string // manifest main-root backend_prefix (tree prefix)
+	opDir    string // frozen op-dir name (".ebb-op-<opID>")
 	// retained is the preserve-route entry set the oracle compares the
 	// staged tree against (§12.5 / E10).
 	retained []domain.Entry
+	// links are the retained entries of the link kinds (symlink /
+	// junction / mount-point): excluded from the staging restore and
+	// recreated natively after it (links.go).
+	links []domain.Entry
 	// preservedBytes sums preserved file logical sizes (peak-space check,
 	// Result.BytesRestored).
 	preservedBytes  int64
@@ -162,6 +167,34 @@ type payloadDocs struct {
 	// manifestLen is the exact byte length of the dumped manifest.json
 	// (expected-tree evidence for callers re-deriving coverage).
 	manifestLen int64
+}
+
+// isLinkKind reports whether an entry kind is a link this package
+// recreates natively instead of asking the backend to materialize.
+func isLinkKind(k domain.EntryKind) bool {
+	switch k {
+	case domain.KindSymlink, domain.KindJunction, domain.KindMountPoint:
+		return true
+	}
+	return false
+}
+
+// stageExcludes lists the snapshot-relative paths the staging restore
+// must SKIP: every retained link node (recreated natively after
+// staging — the backend cannot materialize reparse points without
+// SeCreateSymbolicLinkPrivilege) and the frozen op dir (its documents
+// were read back and digest-verified in step 3; staging them again is
+// pure waste). Paths are literal; the adapter escapes any glob
+// metacharacters before they reach the backend's pattern matcher.
+func (d payloadDocs) stageExcludes() []string {
+	ex := make([]string, 0, 1+len(d.links))
+	if d.opDir != "" {
+		ex = append(ex, d.opDir)
+	}
+	for _, e := range d.links {
+		ex = append(ex, d.wsPrefix+"/"+e.Path)
+	}
+	return ex
 }
 
 // digestBytes is SHA-256 over the exact bytes (§16.1: verification is
@@ -304,6 +337,7 @@ func (o *Opener) loadDocuments(ctx context.Context, vault VaultRef, snapID domai
 		return docs, &ErrVerification{Check: "documents", Details: []string{
 			fmt.Sprintf("%s failed strict parsing: %v", manifestPath, err)}}
 	}
+	docs.opDir = opDir
 	if manifest.SchemaVersion != schemaVersionCurrent {
 		return docs, &ErrVerification{Check: "documents", Details: []string{
 			fmt.Sprintf("manifest schema_version %d, reader supports %d", manifest.SchemaVersion, schemaVersionCurrent)}}
@@ -380,6 +414,9 @@ func (o *Opener) loadDocuments(ctx context.Context, vault VaultRef, snapID domai
 		docs.entriesRestored++
 		if e.Kind == domain.KindFile {
 			docs.preservedBytes += e.LogicalSize
+		}
+		if isLinkKind(e.Kind) {
+			docs.links = append(docs.links, e)
 		}
 	}
 	return docs, nil

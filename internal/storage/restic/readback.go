@@ -130,6 +130,52 @@ func (s *Store) Restore(ctx context.Context, repoDir, passfile, snapID, subtree,
 		}
 		argv = append(argv, "--include", strings.TrimPrefix(norm, "/"))
 	}
+	return s.runRestore(ctx, repoDir, passfile, snapID, dest, argv)
+}
+
+// RestoreExcluding materializes the FULL snapshot tree into dest,
+// skipping exactly the listed snapshot-relative paths (forward-slash,
+// relative to the snapshot root, no leading slash). It exists because
+// restic cannot materialize reparse points without
+// SeCreateSymbolicLinkPrivilege: the open path stages the workspace
+// with every link node excluded (the restore layer then recreates links
+// natively from the retained inventory).
+//
+// Probe-verified on restic 0.19.1 (this machine, Wave F):
+//
+//   - --include and --exclude are MUTUALLY EXCLUSIVE ("Fatal: exclude
+//     and include patterns are mutually exclusive", exit 1), so subtree
+//     restriction cannot be combined with exclusion — the caller names
+//     everything to skip instead (link nodes plus the op dir).
+//   - Exclude patterns are matched against snapshot paths WITHOUT their
+//     leading slash: `ws/link-out` matches, `/ws/link-out` never does
+//     (both pinned live). Excluding a directory prunes its subtree.
+//   - With every link excluded, restore exits 0 unprivileged — no
+//     "ignoring error for …" records, no content failures.
+//
+// Each exclude is a LITERAL path: glob metacharacters in entry names
+// are escaped into single-character classes (restic filters patterns
+// with filepath.Match semantics), so an arbitrary name can neither
+// re-target nor widen the exclusion.
+func (s *Store) RestoreExcluding(ctx context.Context, repoDir, passfile, snapID, dest string, excludes []string) error {
+	if !isSnapshotID(snapID) {
+		return storeErr(domain.StoreErrUsage, "resticstore: snapshot id %q is not 8-64 hex characters", snapID)
+	}
+	argv := make([]string, 0, 6+2*len(excludes))
+	argv = append(argv, "restore", snapID, "--target", dest)
+	for _, ex := range excludes {
+		pat, err := excludePattern(ex)
+		if err != nil {
+			return err
+		}
+		argv = append(argv, "--exclude", pat)
+	}
+	return s.runRestore(ctx, repoDir, passfile, snapID, dest, argv)
+}
+
+// runRestore executes one assembled restore argv and classifies the
+// outcome (shared by Restore and RestoreExcluding).
+func (s *Store) runRestore(ctx context.Context, repoDir, passfile, snapID, dest string, argv []string) error {
 	res, err := s.runRepo(ctx, repoDir, passfile, argv...)
 	if err != nil {
 		return err
@@ -155,6 +201,66 @@ func (s *Store) Restore(ctx context.Context, repoDir, passfile, snapID, subtree,
 	}
 	fmt.Fprintf(&b, "\nstderr:\n%s", excerpt(res.stderr, stderrExcerptLimit))
 	return storeErr(class, "%s", b.String())
+}
+
+// excludePattern validates one snapshot-relative exclude path and
+// renders it as a restic filter pattern that matches that path
+// LITERALLY (and, for a directory, prunes its subtree).
+func excludePattern(p string) (string, error) {
+	if p == "" {
+		return "", storeErr(domain.StoreErrUsage, "resticstore: empty exclude path")
+	}
+	if strings.ContainsRune(p, 0) {
+		return "", storeErr(domain.StoreErrUsage, "resticstore: exclude path contains NUL")
+	}
+	if strings.Contains(p, "\\") {
+		return "", storeErr(domain.StoreErrUsage, "resticstore: exclude path %q must use forward slashes", p)
+	}
+	if strings.HasPrefix(p, "/") {
+		return "", storeErr(domain.StoreErrUsage,
+			"resticstore: exclude path %q must be relative to the snapshot root (leading-slash exclude patterns never match; probed live)", p)
+	}
+	segs := strings.Split(p, "/")
+	for _, seg := range segs {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", storeErr(domain.StoreErrUsage,
+				"resticstore: exclude path %q must be a clean relative path", p)
+		}
+	}
+	for i, seg := range segs {
+		segs[i] = escapeGlobSegment(seg)
+	}
+	return strings.Join(segs, "/"), nil
+}
+
+// escapeGlobSegment renders one path segment as a pattern that matches
+// its literal bytes under filepath.Match (the exact matcher restic's
+// filter calls per segment): `*` → `[*]`, `?` → `[?]`, `[` → `[[]`,
+// `!` → `[!]` (a leading `!` would otherwise negate the whole pattern
+// in restic's filter). A literal `]` needs NO escape — outside a class
+// it is literal, and the constructs above never leave a class open for
+// a following `]` to terminate early (`[[]` carries its own terminator
+// inside). This matters because Go's filepath.Match DISABLES the
+// in-class `\` escape on Windows (GOOS-guarded in getEsc), so
+// `[\]]`-style escapes are unportable; the minimal scheme is
+// Windows/Linux identical (verified empirically against the live
+// matcher, including names like "tricky[]][" and "]_[[").
+// `^` only negates at the very start of a class and never begins one
+// here; `-` is only special inside classes.
+func escapeGlobSegment(seg string) string {
+	var b strings.Builder
+	b.Grow(len(seg))
+	for _, c := range seg {
+		switch c {
+		case '*', '?', '[', '!':
+			b.WriteByte('[')
+			b.WriteRune(c)
+			b.WriteByte(']')
+		default:
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
 }
 
 // restoreOutcome summarizes restore stderr failure lines.

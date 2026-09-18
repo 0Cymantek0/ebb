@@ -452,8 +452,15 @@ func walkTree(t *testing.T, root string) map[string]string {
 	return out
 }
 
+// newOpener wires the production-shaped seams, including the platform
+// link creator the CLI will inject in the Wave F integration (mirrors
+// the wiring note in links.go: restore itself cannot import platform).
 func newOpener(f *fixture) *Opener {
-	o, err := New(Dependencies{Store: f.store, Cat: f.cat, Probe: f.probe})
+	return newOpenerWithCreator(f, platform.CreateLink)
+}
+
+func newOpenerWithCreator(f *fixture, creator LinkCreator) *Opener {
+	o, err := New(Dependencies{Store: f.store, Cat: f.cat, Probe: f.probe, CreateLink: creator})
 	if err != nil {
 		f.t.Fatalf("New: %v", err)
 	}

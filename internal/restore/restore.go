@@ -16,9 +16,11 @@
 // pinned (I07).
 //
 // The ONLY filesystem mutations this package performs: creating its
-// staging directories, restoring the backend subtree into them, the
-// publish rename onto an absent destination, shape-gated removal of its
-// own .ebb-stage-<opID> directories, and removal of an EMPTY destination
+// staging directories, restoring the backend subtree into them
+// (link nodes excluded), recreating retained links inside the staging
+// from the retained inventory's LinkTarget (links.go), the publish
+// rename onto an absent destination, shape-gated removal of its own
+// .ebb-stage-<opID> directories, and removal of an EMPTY destination
 // directory. Unrelated content is never touched (§12.5: "An unrelated
 // nonempty directory is never overwritten").
 //
@@ -45,14 +47,21 @@ import (
 	"ebb/internal/domain"
 )
 
-// Dependencies wires the opener. All fields except Clock are required;
-// New refuses nil seams so a half-constructed opener can never reach
-// publishing code (mirroring lifecycle.New).
+// Dependencies wires the opener. All fields except Clock and CreateLink
+// are required; New refuses nil seams so a half-constructed opener can
+// never reach publishing code (mirroring lifecycle.New).
 type Dependencies struct {
 	Store domain.SnapshotStore // required: the backend seam (restic adapter)
 	Cat   *catalog.Catalog     // required: durable operation journal
 	Probe domain.PlatformProbe // required: identity, volume usage, oracle facts
-	Clock func() time.Time     // optional; defaults to time.Now
+	// CreateLink recreates retained links during staging (links.go).
+	// Optional; defaults to the stdlib os.Symlink creator with the
+	// Windows privilege refusal mapped to the typed contract. Production
+	// wiring passes platform.CreateLink so junctions — the unprivileged
+	// case — recreate natively (this package cannot import platform;
+	// the seam is the module boundary).
+	CreateLink LinkCreator
+	Clock      func() time.Time // optional; defaults to time.Now
 }
 
 // VaultRef names one backend repository: the repo directory and the
@@ -100,10 +109,11 @@ type Result struct {
 // Opener executes the §12.5 restore sequence. Safe for sequential use
 // by the serialized CLI (D11); the catalog serializes journal writes.
 type Opener struct {
-	store domain.SnapshotStore
-	cat   *catalog.Catalog
-	probe domain.PlatformProbe
-	now   func() time.Time
+	store      domain.SnapshotStore
+	cat        *catalog.Catalog
+	probe      domain.PlatformProbe
+	createLink LinkCreator
+	now        func() time.Time
 }
 
 // New validates the dependency seams and returns a ready Opener.
@@ -117,10 +127,13 @@ func New(d Dependencies) (*Opener, error) {
 	if d.Probe == nil {
 		return nil, fmt.Errorf("restore: dependencies: Probe is required")
 	}
+	if d.CreateLink == nil {
+		d.CreateLink = stdlibCreateLink
+	}
 	if d.Clock == nil {
 		d.Clock = time.Now
 	}
-	return &Opener{store: d.Store, cat: d.Cat, probe: d.Probe, now: d.Clock}, nil
+	return &Opener{store: d.Store, cat: d.Cat, probe: d.Probe, createLink: d.CreateLink, now: d.Clock}, nil
 }
 
 // Ebb-owned sibling names of the frozen capture layout (D003 and
@@ -282,15 +295,26 @@ func (o *Opener) Open(ctx context.Context, vault VaultRef, snapID domain.Snapsho
 	}
 
 	// ---- §12.5 step 6: staging materialization -----------------------
+	// Links are EXCLUDED from the backend stage (it cannot materialize
+	// reparse points without SeCreateSymbolicLinkPrivilege) and recreated
+	// natively right after (links.go): junctions unprivileged, true
+	// symlinks privilege-gated with a typed per-entry blocker that fails
+	// the open before publish.
 	stage := stagingRoot(dest, opID)
 	staged := filepath.Join(stage, docs.wsPrefix)
 	if err := os.MkdirAll(stage, 0o700); err != nil {
 		return fail(fmt.Errorf("restore: staging dir: %w", err))
 	}
-	if err := o.store.Restore(ctx, vault.RepoDir, vault.Passfile, snap.PayloadBackendID,
-		"/"+docs.wsPrefix, stage); err != nil {
+	linksExcluded, err := o.stagePayload(ctx, vault, snap, docs, stage)
+	if err != nil {
 		_ = removeStage(stage)
-		return fail(fmt.Errorf("restore: materialize payload into staging: %w", err))
+		return fail(err)
+	}
+	if linksExcluded && len(docs.links) > 0 {
+		if err := o.recreateLinks(staged, docs.links); err != nil {
+			_ = removeStage(stage)
+			return fail(err)
+		}
 	}
 
 	// ---- §12.5 step 7: independent-oracle verification (E10) ---------
