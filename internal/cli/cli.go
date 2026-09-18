@@ -198,6 +198,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdPark(args[1:], streams, deps)
 	case "trim":
 		return cmdTrim(args[1:], streams, deps)
+	case "open":
+		return cmdOpen(args[1:], streams, deps)
 	case "doctor":
 		return cmdDoctor(args[1:], streams)
 	case "help", "-h", "--help":
