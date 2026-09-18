@@ -66,6 +66,14 @@ func newRemovalPermit(opID domain.OperationID, snapID domain.SnapshotID, basePat
 		if e.Root != domain.RootMain {
 			return nil, fmt.Errorf("lifecycle: removal permit: entry %s is not main-root", path)
 		}
+		// Security (Wave F review F1c): the permit is the LAST gate
+		// before os.Remove and must not trust its caller's path
+		// hygiene — entries rebuilt from retained documents on the
+		// recovery path are untrusted input. Validate() rejects
+		// traversal, absolute, drive-prefix and backslash forms.
+		if err := e.Validate(); err != nil {
+			return nil, fmt.Errorf("lifecycle: removal permit: entry %s fails validation: %w", path, err)
+		}
 	}
 	return &removalPermit{opID: opID, snapshotID: snapID, basePath: basePath, rootIdentity: ident, allowed: allowed}, nil
 }
@@ -174,15 +182,33 @@ func (p *removalPermit) removeRoot(j *opJournal) error {
 // live root, removing directories that the trim left empty (§17.3
 // "empty parent dirs up the group root removed"). It stops at the
 // first non-empty or missing directory and never touches the live root.
+//
+// Security (Wave F review F2/F3): outputs arrive from retained trim
+// plans on the resume path — untrusted input — so every output is
+// path-validated before climbing, and the climb itself never follows a
+// link (a substituted junction is user content, not an empty ancestor:
+// Lstat classifies before ReadDir, and a link is never removed here).
 func (p *removalPermit) removeEmptyAncestors(outputs []string, j *opJournal) error {
 	for _, out := range outputs {
+		if err := validRelPath(out); err != nil {
+			return fmt.Errorf("lifecycle: trim output %q fails path validation: %w", out, err)
+		}
 		dir := parentRel(out)
 		for dir != "" && dir != "." && dir != "/" {
 			abs := filepath.Join(p.basePath, filepath.FromSlash(dir))
-			des, err := os.ReadDir(abs)
+			fi, err := os.Lstat(abs)
 			if errors.Is(err, fs.ErrNotExist) {
 				break // already gone; keep climbing is pointless
 			}
+			if err != nil {
+				return p.classifyRemoveError(abs, err)
+			}
+			if !fi.IsDir() || fi.Mode()&(os.ModeSymlink|fs.ModeIrregular) != 0 {
+				// A link or non-directory: stop climbing this branch
+				// and never remove it (§12.2 step 8 no-follow).
+				break
+			}
+			des, err := os.ReadDir(abs)
 			if err != nil {
 				return p.classifyRemoveError(abs, err)
 			}
@@ -196,6 +222,33 @@ func (p *removalPermit) removeEmptyAncestors(outputs []string, j *opJournal) err
 				j.append(journalRecord{Step: "removed-empty-ancestor", Path: dir})
 			}
 			dir = parentRel(dir)
+		}
+	}
+	return nil
+}
+
+// validRelPath enforces the root-relative path contract for plan-supplied
+// outputs (Wave F review F2): no traversal, no absolute/drive/backslash
+// forms, no NUL, no empty segments.
+func validRelPath(p string) error {
+	if p == "" {
+		return fmt.Errorf("empty path")
+	}
+	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") || strings.Contains(p, "\\") {
+		return fmt.Errorf("not forward-slash root-relative form")
+	}
+	if len(p) >= 2 && p[1] == ':' {
+		return fmt.Errorf("drive prefix")
+	}
+	if strings.ContainsRune(p, 0) {
+		return fmt.Errorf("NUL byte")
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return fmt.Errorf(".. segment")
+		}
+		if seg == "" {
+			return fmt.Errorf("empty segment")
 		}
 	}
 	return nil

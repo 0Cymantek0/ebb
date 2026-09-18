@@ -240,6 +240,13 @@ func (c *Coordinator) loadPayloadEvidence(ctx context.Context, vault VaultRef, o
 		}
 		for _, g := range plan.Groups {
 			for _, m := range g.Members {
+				// Security (Wave F review F1): trim-plan members are
+				// retained-document input on the resume path — same
+				// validation rule as inventory lines.
+				if verr := m.Entry.Validate(); verr != nil {
+					return ev, &ErrJournalMismatch{Detail: fmt.Sprintf(
+						"retained trim plan group %s member %q fails entry validation (tampered payload?): %v", g.GroupID, m.Path, verr)}
+				}
 				entries = append(entries, m.Entry)
 			}
 		}
@@ -255,6 +262,14 @@ func (c *Coordinator) loadPayloadEvidence(ctx context.Context, vault VaultRef, o
 	}
 	ev.entries = entries
 	ev.inventoryDigest = digestBytes(invBytes)
+
+	// Security (Wave F review F1): the catalog's seal-time snapshot row
+	// is an INDEPENDENT record of what was sealed. P-internal
+	// self-consistency alone let a tampered payload steer recovery;
+	// the retained digests are cross-checked against the row.
+	if cerr := c.crossCheckSealDigests(op, ev.manifestDigest, ev.inventoryDigest); cerr != nil {
+		return ev, cerr
+	}
 	ev.inventoryBytes = invBytes
 
 	// The frozen policy inside P must equal the policy text the manifest
@@ -268,6 +283,62 @@ func (c *Coordinator) loadPayloadEvidence(ctx context.Context, vault VaultRef, o
 	}
 	ev.policyBytes = polBytes
 	return ev, nil
+}
+
+// sealedPhases are the phases at or after the seal commit: the catalog
+// snapshot row MUST exist for them, so its seal-time digests are a hard
+// requirement rather than a cross-check-of-opportunity.
+var sealedPhases = map[string]bool{
+	catalog.PhaseSealed:         true,
+	catalog.PhaseQuarantined:    true,
+	catalog.PhaseRemoving:       true,
+	catalog.PhaseRemovalBlocked: true,
+	catalog.PhaseParked:         true,
+	catalog.PhaseTrimSealing:    true,
+}
+
+// crossCheckSealDigests compares the digests of the retained documents
+// just re-read from the vault against the snapshot row recorded at seal
+// time (Wave F review F1 fix). The catalog row is the tamper-independent
+// witness: an attacker who rewrites P's manifest+inventory to agree with
+// each other cannot make them agree with this row without writing the
+// catalog too.
+func (c *Coordinator) crossCheckSealDigests(op catalog.Operation, manifestDigest, inventoryDigest string) error {
+	snaps, err := c.cat.ListSnapshots(op.WorkspaceID)
+	if err != nil {
+		return fmt.Errorf("lifecycle: list snapshots for seal cross-check: %w", err)
+	}
+	var match *catalog.Snapshot
+	for i := range snaps {
+		if snaps[i].PayloadBackendID == op.PayloadSnap {
+			if match != nil {
+				return &ErrJournalMismatch{Detail: fmt.Sprintf(
+					"multiple snapshot rows reference payload %s; durable state diverged — inspect manually", op.PayloadSnap)}
+			}
+			match = &snaps[i]
+		}
+	}
+	if match == nil {
+		if sealedPhases[op.Phase] {
+			return &ErrJournalMismatch{Detail: fmt.Sprintf(
+				"operation %s is %s but no snapshot row records payload %s; refusing to trust retained documents alone", op.ID, op.Phase, op.PayloadSnap)}
+		}
+		// Pre-seal phases (PAYLOAD_COMMITTED and earlier) have no
+		// snapshot row yet; P-internal consistency is the only
+		// available evidence and remains the gate.
+		return nil
+	}
+	if match.ManifestDigest != "" && match.ManifestDigest != manifestDigest {
+		return &ErrJournalMismatch{Detail: fmt.Sprintf(
+			"retained manifest digest %s differs from the seal-time catalog record %s — vault tampering suspected; refusing",
+			manifestDigest, match.ManifestDigest)}
+	}
+	if match.InventoryDigest != "" && match.InventoryDigest != inventoryDigest {
+		return &ErrJournalMismatch{Detail: fmt.Sprintf(
+			"retained inventory digest %s differs from the seal-time catalog record %s — vault tampering suspected; refusing",
+			inventoryDigest, match.InventoryDigest)}
+	}
+	return nil
 }
 
 // parseTrimPlan strictly parses and validates a retained trim plan.

@@ -481,6 +481,15 @@ func parseInventoryLines(b []byte) ([]domain.Entry, error) {
 		if err := decodeStrictJSON([]byte(line), &rec); err != nil {
 			return nil, fmt.Errorf("inventory line %d: %w", i+1, err)
 		}
+		// Security (Wave F review F1): retained documents are untrusted
+		// input — a tampered but internally self-consistent payload must
+		// never feed unvalidated paths into a removal permit. Restore's
+		// twin reader (documents.go) validates; the asymmetry here was
+		// the deletion-authority escape.
+		if err := rec.Entry.Validate(); err != nil {
+			return nil, &ErrJournalMismatch{Detail: fmt.Sprintf(
+				"retained inventory line %d (%s) fails entry validation (tampered payload?): %v", i+1, rec.Entry.Path, err)}
+		}
 		out = append(out, rec.Entry)
 	}
 	return out, nil
