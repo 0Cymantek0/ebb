@@ -205,6 +205,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdOpen(args[1:], streams, deps)
 	case "recover":
 		return cmdRecover(args[1:], streams, deps)
+	case "forget":
+		return cmdForget(args[1:], streams, deps)
 	case "status":
 		return cmdStatus(args[1:], streams, deps)
 	case "doctor":

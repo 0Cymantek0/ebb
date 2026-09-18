@@ -30,6 +30,8 @@ const (
 	CodeEscalationUnconfirmed = "EBB_E_ESCALATION_UNCONFIRMED"
 	CodeForgetLastOfParked    = "EBB_E_LAST_OF_PARKED"
 	CodeForgetUnconfirmed     = "EBB_E_FORGET_UNCONFIRMED"
+	CodeForgetUnsealed        = "EBB_E_FORGET_UNSEAILED"
+	CodeForgetNotForgettable  = "EBB_E_NOT_FORGETTABLE"
 )
 
 // blockerMessage renders one §5.5 blocker: stable code, reason and a

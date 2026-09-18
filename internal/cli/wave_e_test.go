@@ -44,6 +44,7 @@ type eFakeStore struct {
 	snaps      map[string]*eFakeSnap
 	tags       map[string]map[string]string
 	onSnapshot func(tags map[string]string) error
+	onForget   func(ids []string) error
 }
 
 func newEFakeStore() *eFakeStore {
@@ -252,11 +253,17 @@ func (s *eFakeStore) Restore(ctx context.Context, repoDir, passfile, snapID, sub
 
 func (s *eFakeStore) Forget(ctx context.Context, repoDir, passfile string, snapIDs []string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.onForget != nil {
+		if err := s.onForget(snapIDs); err != nil {
+			s.mu.Unlock()
+			return &domain.StoreError{Class: domain.StoreErrUnknown, Err: err}
+		}
+	}
 	for _, id := range snapIDs {
 		delete(s.snaps, id)
 		delete(s.tags, id)
 	}
+	s.mu.Unlock()
 	return nil
 }
 

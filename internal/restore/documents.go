@@ -159,6 +159,9 @@ type payloadDocs struct {
 	preservedBytes  int64
 	entriesRestored int64
 	manifest        manifestDoc
+	// manifestLen is the exact byte length of the dumped manifest.json
+	// (expected-tree evidence for callers re-deriving coverage).
+	manifestLen int64
 }
 
 // digestBytes is SHA-256 over the exact bytes (§16.1: verification is
@@ -367,6 +370,7 @@ func (o *Opener) loadDocuments(ctx context.Context, vault VaultRef, snapID domai
 	}
 
 	docs.manifest = manifest
+	docs.manifestLen = int64(len(manifestRaw))
 	docs.wsPrefix = main.BackendPrefix
 	for _, e := range entries {
 		if e.Route != domain.RoutePreserve {
