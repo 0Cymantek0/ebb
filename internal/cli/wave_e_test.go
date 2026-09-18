@@ -45,6 +45,8 @@ type eFakeStore struct {
 	tags       map[string]map[string]string
 	onSnapshot func(tags map[string]string) error
 	onForget   func(ids []string) error
+	onPrune    func(dryRun bool) error // Wave H gc seam
+	pruneCalls []bool                  // one entry per Prune call (dryRun flag)
 }
 
 func newEFakeStore() *eFakeStore {

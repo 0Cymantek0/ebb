@@ -298,7 +298,16 @@ func (c *Coordinator) openCapture(ctx context.Context, vault VaultRef, root stri
 // catalog has no lookup-by-path; a digest-derived id keeps repeated
 // captures bound to one vault row without inventing a second registry.
 func (c *Coordinator) vaultIDFor(repoID string, vault VaultRef) domain.VaultID {
-	return domain.VaultID(digestBytes([]byte("ebb:vault:" + repoID + ":" + filepath.Clean(mustAbs(vault.RepoDir))))[:32])
+	return VaultIDFor(repoID, vault.RepoDir)
+}
+
+// VaultIDFor is the single exported authority for the catalog vault-row
+// id derivation (repoID + cleaned absolute repo dir). `ebb gc` uses it to
+// attribute catalog snapshot rows to a registry-resolved vault; keeping
+// the derivation here means gc and capture can never disagree about
+// which vault a row belongs to.
+func VaultIDFor(repoID, repoDir string) domain.VaultID {
+	return domain.VaultID(digestBytes([]byte("ebb:vault:" + repoID + ":" + filepath.Clean(mustAbs(repoDir))))[:32])
 }
 
 // scanAndResolve performs step 2's discovery: a full no-follow scan with
