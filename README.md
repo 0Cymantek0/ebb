@@ -25,7 +25,8 @@ What works, end to end, verified against the real restic 0.19.1 binary (`interna
 - **Capture** (`snapshot`) — full inventory with SHA-256 digests, encrypted restic backend, exact coverage check, and full content readback of every preserved byte. A capture that fails verification is retained (pinned, marked unsealed) — never silently erased.
 - **Park** — capture → seal → revalidate the live source against the sealed inventory (any change invalidates removal) → quarantine rename → per-entry re-verified removal. Crash-safe: interrupted parks resume from durable evidence (`ebb recover`).
 - **Trim** — remove only explicitly declared reconstructible groups (e.g. `node_modules`), leaving the workspace live; the removal plan + recipe inputs are captured and sealed first.
-- **Open** — restore a parked/captured workspace: seal validated, files materialized to a private staging dir (links excluded from the backend stage and recreated natively — junctions work unprivileged on Windows), verified against the retained inventory as an independent oracle, then published. Nothing unrelated is ever overwritten.
+- **Open** — restore a parked/captured workspace: seal validated (and cross-checked against the catalog's seal-time digests — a tampered vault cannot publish forged content), files materialized to a private staging dir (links excluded from the backend stage and recreated natively — junctions work unprivileged on Windows), verified against the retained inventory as an independent oracle, then published. Nothing unrelated is ever overwritten.
+- **Rebuild** — after publishing, `open` runs the retained, locally-approved reconstruction actions (e.g. `pnpm install --frozen-lockfile`) at the final destination: exact command definitions are frozen in the snapshot manifest, approvals are recorded once and reused while they match, every attempt is journaled, and protected files are re-verified afterwards (a rebuild that damages preserved content fails loudly — files are never deleted). `--files-only` skips reconstruction; a failed rebuild exits 6 and is resumable (`ebb open --resume`).
 - **Reclaim** — the ordinary "I need space" entry point: plans, executes approved trims, and escalates to a full park only with its own explicit terminal confirmation when the target can't be met otherwise. Exit 8 is an honest shortfall report, never an invitation to weaken policy.
 - **Forget / verify** — deliberate, confirmed release of a pinned snapshot (with a last-recovery-copy guard for parked workspaces) and on-demand evidence re-checks.
 - **Safety architecture** — removal authority lives in one audited file (AST-enforced tripwire); the scanner verifies directory-handle identities during descent (junction-swap attack detected, not followed); recovery-path evidence is validated against the catalog's seal-time digests (a tampered vault cannot steer deletion — independently reviewed, PoC-backed); Git observation runs a hardened, non-executing recipe; no project code ever runs during inspection; vault passwords live in the OS credential store, never in logs or argv.
@@ -45,7 +46,7 @@ State lives in `os.UserConfigDir()/ebb` (Windows: `%AppData%\ebb`): `catalog.db`
 
 - `park` requires a stopped-writers assertion: interactive confirm in a terminal, or `--assert-writers-stopped` for automation. `--yes` never supplies it.
 - Policies are optional `Ebbfile.toml` files; without one, everything unknown is preserved (conservative default). Generated-output removal requires an explicit `[[regenerate]]` declaration — a lockfile alone never marks a tree disposable.
-- Snapshots stay pinned after open; deliberate release via `ebb forget` is future work (see limitations).
+- Snapshots stay pinned after open; deliberate release is `ebb forget` (with a last-recovery-copy guard for parked workspaces).
 
 ## Documentation
 
@@ -53,13 +54,13 @@ State lives in `os.UserConfigDir()/ebb` (Windows: `%AppData%\ebb`): `catalog.db`
 - `Decisions.md` — architecture decision ledger (D001…).
 - `Modules.md` — current module map (Mermaid) of the implemented system.
 - `Learnings.md` — hard-won platform/backend lessons.
+- `docs/BENCHMARKS.md` — measured performance baseline and the harness command (`lab/bench`).
 
 ## Known limitations (explicit, not hidden)
 
 - Opening a workspace whose preserved set contains **true symlinks** requires the Windows symlink privilege (Developer Mode / elevation) — junctions (the common case, e.g. pnpm-style `node_modules`) recreate unprivileged. A privilege-blocked open fails BEFORE publishing anything, with a precise typed error naming the blocked entries.
-- Rebuild actions after open are reported (exact commands), not executed — `open` stops at files-ready in v1.
-- `gc`, `export`, `import` are not yet implemented; `verify --content` is subprocess-per-file (slow on large trees).
-- Open security-review P2s (lab/security-review/wave-F/FINDINGS.md F4-F7): restore lacks a seal-digest cross-check against the catalog, a crash window between quarantine rename and CAS commit needs manual reconciliation, the vault/root overlap preflight is lexical, and `recover` auto-resumes blocked walks without writer reconfirmation. All require an attacker who can already write the vault or catalog; all are scheduled work.
+- `gc`, `export`, `import` are not yet implemented.
+- Rebuild executes approved actions with your privileges — there is no sandbox (Foundation §9.5); the approval prompt shows the exact command, tool hash, inputs and outputs before anything runs.
 - Hardlink relationships, NTFS alternate data streams, sparse flags and ACLs are captured as inventory facts but not restored (documented per-snapshot in the manifest's `not_promised` capabilities).
 - Linux: builds clean and the platform layer is implemented, but no native Linux test run has certified it; macOS is unsupported.
-- Full §11.4 readback spawns one restic dump per file — capture latency scales with file count (batching is a known optimization; no benchmark baseline exists yet).
+- Full §11.4 readback uses one streaming `restic dump --archive tar` subprocess per tree (measured ~17x faster than the former per-file transport on a small fixture; see `docs/BENCHMARKS.md` for the baseline). Very large single files still dominate readback time by bytes.
