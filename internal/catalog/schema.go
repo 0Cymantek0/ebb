@@ -3,7 +3,7 @@ package catalog
 // Forward-only schema migrations. The slice index is the version
 // recorded in schema_migrations; migration N runs inside one transaction
 // together with its version insert (see Catalog.migrate).
-var migrations = []string{schemaV1}
+var migrations = []string{schemaV1, schemaV2}
 
 // schemaMigrationsDDL is created separately from any versioned
 // migration so a fresh database can record versions at all.
@@ -120,4 +120,14 @@ CREATE TABLE retention_intents (
 CREATE INDEX idx_snapshots_workspace ON snapshots(workspace_id, created_at);
 CREATE INDEX idx_snapshots_vault ON snapshots(vault_id);
 CREATE INDEX idx_operations_workspace ON operations(workspace_id, updated_at);
+`
+
+// schemaV2 (Wave H) widens replicas for portable capsules: a capsule
+// export records one row per produced capsule file with vault_id NULL
+// (a capsule is NOT one of the registered vaults) and the capsule's
+// output path in the new column. SQLite UNIQUE(snapshot_id, vault_id)
+// treats NULL vault ids as distinct, so multiple capsules of the same
+// snapshot remain representable. Non-destructive ALTERs only.
+const schemaV2 = `
+ALTER TABLE replicas ADD COLUMN path TEXT;
 `

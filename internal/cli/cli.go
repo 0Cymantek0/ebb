@@ -216,6 +216,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdGc(args[1:], streams, deps)
 	case "verify":
 		return cmdVerify(args[1:], streams, deps)
+	case "export":
+		return cmdExport(args[1:], streams, deps)
 	case "status":
 		return cmdStatus(args[1:], streams, deps)
 	case "doctor":
@@ -289,6 +291,8 @@ commands:
   forget <snapshot-id>       deliberately end a snapshot's recovery obligation (explicit confirmation)
   gc <vault>                 reclaim vault storage no snapshot references anymore (backend prune; never removes snapshots)
   verify <snapshot-id>       refresh retained-snapshot evidence (coverage; --content adds full readback)
+  export <snapshot-id> --output <file>
+                             produce an independent encrypted capsule (the source stays pinned)
   status [workspace]         show local recorded state (workspaces, snapshots, operations)
   doctor                     report supported capabilities and configuration problems
 
@@ -334,5 +338,9 @@ gc flags:
 
 verify flags:
   --content                  full per-file readback of every preserved byte (expensive; one backend call per file)
+
+export flags:
+  --output <file>            capsule output path (required; never overwritten)
+  --dry-run                  check eligibility and print the plan without creating anything
 `)
 }

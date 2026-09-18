@@ -153,6 +153,36 @@ func (c *Catalog) Unpin(id domain.SnapshotID, reason string, force bool) error {
 	})
 }
 
+// RecordPinRelease appends "unpin:<reason>" to the pin audit list
+// WITHOUT changing the pinned flag: it closes a scoped, additive pin
+// (e.g. an export pin, Foundation §15.2 "take a retention pin for the
+// duration") while the snapshot stays pinned by its original reasons.
+// Use Unpin for the deliberate end of the whole recovery obligation
+// (forget); this method never unpins. The reason must be non-empty and
+// should carry the owning operation id.
+func (c *Catalog) RecordPinRelease(id domain.SnapshotID, reason string) error {
+	if reason == "" {
+		return errors.New("catalog: pin release reason required")
+	}
+	return withTx(c.db, func(tx *sql.Tx) error {
+		s, err := getSnapshotForUpdate(tx, id)
+		if err != nil {
+			return err
+		}
+		reasons, err := marshalReasons(appendReason(s.PinReasons, "unpin:"+reason))
+		if err != nil {
+			return err
+		}
+		// pinned is deliberately untouched: the flag reflects the original
+		// obligation, which the scoped pin never replaced.
+		const q = `UPDATE snapshots SET pin_reasons = ? WHERE id = ?`
+		if _, err := tx.Exec(q, reasons, string(id)); err != nil {
+			return fmt.Errorf("catalog: record pin release of %s: %w", id, err)
+		}
+		return nil
+	})
+}
+
 // ImportDiscoveredSnapshot records one snapshot discovered by vault
 // recovery (Foundation §11.5). If the workspace row does not exist it is
 // created with status UNBOUND and the snapshot's creation time —
