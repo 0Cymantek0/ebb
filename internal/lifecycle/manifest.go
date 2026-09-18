@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -193,8 +194,11 @@ type removalManifestDoc struct {
 
 type recipeInput struct {
 	Path   string `json:"path"` // root-relative original location
-	Copy   string `json:"copy"` // op-dir-relative copy ("inputs/<name>")
+	Copy   string `json:"copy"` // op-dir-relative copy ("inputs/<group>/<path>")
 	Digest string `json:"digest"`
+	// Missing records a policy-declared input that is absent from the
+	// live workspace at trim time (recorded, never guessed).
+	Missing bool `json:"missing,omitempty"`
 }
 
 // inventoryRecord is one inventory.jsonl line: the domain entry plus the
@@ -263,9 +267,20 @@ func buildManifest(
 	if trimScope {
 		scope = scopeTrimPlan
 	}
+	// A trim's authoritative accounting document is the removal plan
+	// (§11.4 readback-scope-follows-authority); the inventory reference
+	// names whichever document this capture actually sealed.
+	invPath := inventoryName
+	if trimScope {
+		invPath = removalManifestName
+	}
 	consistency := consistencyBestEffort
 	src := ""
-	if opts.Park && opts.WriterAssertion != "" {
+	if opts.WriterAssertion != "" {
+		// The recorded stopped-writers assertion is recorded truthfully
+		// whenever the CLI supplies one (park requires it; trim may
+		// supply one for the trimmed group; a plain snapshot's default
+		// remains best-effort-live by omission).
 		consistency = consistencyStoppedWriters
 		src = opts.WriterAssertion
 	}
@@ -370,7 +385,7 @@ func buildManifest(
 				BackendPrefix: opDir},
 		},
 		Inventory: manifestInventoryRef{
-			Path: inventoryName, Digest: invDigest,
+			Path: invPath, Digest: invDigest,
 			Count: int64(len(entries)), Bytes: int64(len(invBytes)),
 		},
 		Policy: manifestPolicy{
@@ -435,6 +450,51 @@ func writeJSONDoc(path string, v any) ([]byte, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+// decodeStrictJSON is the ONLY re-read path for retained documents
+// (recover.go): encoding/json with DisallowUnknownFields plus a
+// trailing-data check, so a hostile or corrupted record cannot smuggle
+// fields past verification (the package comment promises this).
+func decodeStrictJSON(b []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("lifecycle: strict document parse: %w", err)
+	}
+	if dec.More() {
+		return fmt.Errorf("lifecycle: strict document parse: trailing data after JSON value")
+	}
+	return nil
+}
+
+// parseInventoryLines strictly parses inventory.jsonl bytes. A torn or
+// malformed line is an error, never a silently dropped entry (complete
+// accounting, §8.4).
+func parseInventoryLines(b []byte) ([]domain.Entry, error) {
+	var out []domain.Entry
+	for i, line := range strings.Split(string(b), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec inventoryRecord
+		if err := decodeStrictJSON([]byte(line), &rec); err != nil {
+			return nil, fmt.Errorf("inventory line %d: %w", i+1, err)
+		}
+		out = append(out, rec.Entry)
+	}
+	return out, nil
+}
+
+// parseRootIdentity reverses RootIdentity.String() ("volume/file-id") as
+// recorded in the catalog's source_identity column. Recover compares
+// identities, not names (I13); the stored string is the durable form.
+func parseRootIdentity(s string) (domain.RootIdentity, error) {
+	vol, file, ok := strings.Cut(s, "/")
+	if !ok || vol == "" || file == "" {
+		return domain.RootIdentity{}, fmt.Errorf("lifecycle: unparsable root identity %q", s)
+	}
+	return domain.RootIdentity{VolumeID: vol, FileID: file}, nil
 }
 
 // buildReceipt assembles the §16.4 seal receipt. Written only after P

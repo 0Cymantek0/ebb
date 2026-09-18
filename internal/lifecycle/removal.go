@@ -154,9 +154,14 @@ func (p *removalPermit) execute(ctx context.Context, probe domain.PlatformProbe,
 // removeRoot removes the (now empty) base directory itself — the final
 // park step. Non-empty means new content appeared; that is a block,
 // never a force-remove (§12.3: the system does not finish deleting just
-// to achieve a tidy status).
+// to achieve a tidy status). An already-absent root is success: a crash
+// between the root removal and the PARKED commit reconciles idempotently
+// on resume (§12.4).
 func (p *removalPermit) removeRoot(j *opJournal) error {
 	if err := removeOne(p.basePath); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		return p.classifyRemoveError(p.basePath, err)
 	}
 	if j != nil {

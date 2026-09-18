@@ -58,6 +58,9 @@ func (j *opJournal) append(rec journalRecord) {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.f == nil {
+		return // already closed (sequence ended); the catalog is authority
+	}
 	if rec.Time == "" {
 		rec.Time = domain.FormatTime(time.Now())
 	}
@@ -73,14 +76,18 @@ func (j *opJournal) step(step, detail string) {
 	j.append(journalRecord{Step: step, Detail: detail})
 }
 
-// close flushes the journal file to the OS.
+// close flushes the journal file to the OS. Idempotent: every sequence
+// end (success and failure) closes it so the file is never left held
+// (on Windows an open handle blocks deleting the parent directory).
 func (j *opJournal) close() error {
-	if j == nil {
+	if j == nil || j.f == nil {
 		return nil
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return j.f.Close()
+	f := j.f
+	j.f = nil
+	return f.Close()
 }
 
 // readJournal loads every record of the journal for opID, if present.

@@ -140,9 +140,78 @@ func verifyReadback(ctx context.Context, store domain.SnapshotStore, repoDir, pa
 		}
 	}
 	if len(details) > 0 {
+		sort.Strings(details) // deterministic failure text
 		return &ErrVerification{Check: "readback", Details: details}
 	}
 	return nil
+}
+
+// expectedTreeAndReadback derives the §11.4 coverage expectation and
+// readback set for the entries that actually end up in a capture under one
+// backend prefix. It mirrors buildSelection's listing rules exactly:
+//
+//   - a preserved file with a digest is always captured (listed itself or
+//     inside a shorthand-listed ancestor directory);
+//   - every preserved link is listed individually;
+//   - a preserved directory is in the tree when it is empty (listed as a
+//     genuine empty dir) or has any in-tree descendant (restic
+//     materializes ancestor nodes of listed children); a directory whose
+//     only descendants are omitted or unhashed entries is NOT in the tree;
+//   - omitted entries and blocking kinds are never in the tree.
+//
+// Recover reuses this to rebuild the evidence for re-verifying P from P's
+// own retained inventory — the same rules must reconstruct the same tree
+// expectation or a re-verification would be vacuous.
+func expectedTreeAndReadback(entries []domain.Entry, prefix string) (map[string]expectedNode, []readbackFile) {
+	expected := make(map[string]expectedNode, len(entries))
+	var readback []readbackFile
+
+	hasChild := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if p := parentSlash(e.Path); p != "" {
+			hasChild[p] = true
+		}
+	}
+	// Canonical order sorts every descendant after its ancestors, so a
+	// reverse scan has seen each entry's whole subtree before the entry;
+	// in-tree-ness propagates to the immediate parent as it is decided.
+	childInTree := make(map[string]bool, len(entries))
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.Route != domain.RoutePreserve {
+			continue
+		}
+		inTree := false
+		switch e.Kind {
+		case domain.KindFile:
+			inTree = e.Digest != ""
+		case domain.KindSymlink, domain.KindJunction, domain.KindMountPoint:
+			inTree = true
+		case domain.KindDir:
+			inTree = !hasChild[e.Path] || childInTree[e.Path]
+		}
+		if !inTree {
+			continue
+		}
+		if p := parentSlash(e.Path); p != "" {
+			childInTree[p] = true
+		}
+		treePath := "/" + prefix + "/" + e.Path
+		addExpectedPath(expected, treePath, expectedNode{Kind: treeKindOf(e.Kind), Size: e.LogicalSize})
+		if e.Kind == domain.KindFile {
+			readback = append(readback, readbackFile{SnapPath: treePath, Digest: e.Digest})
+		}
+	}
+	return expected, readback
+}
+
+// parentSlash returns the parent of a root-relative slash path, "" for a
+// top-level path (its parent is the root itself, which is not an entry).
+func parentSlash(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[:i]
+	}
+	return ""
 }
 
 // walkLocalTree returns every file (path relative to root, forward
