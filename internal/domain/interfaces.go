@@ -1,6 +1,9 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"os"
+)
 
 // PlatformProbe is the capability seam the inventory scanner consumes.
 // It is defined here (core) and implemented by internal/platform per OS,
@@ -61,6 +64,36 @@ type FileFacts struct {
 type NamedStream struct {
 	Name string `json:"name"` // without the file path, e.g. "cred"
 	Size int64  `json:"size"`
+}
+
+// IdentifiedDir is an open directory enumerated through the SAME
+// handle whose identity was verified at open time. A directory
+// handle cannot be re-pointed, so entries enumerated through it
+// cannot escape a race-substituted path (SCAN-RACE-1 fix).
+type IdentifiedDir interface {
+	// Identity returns the native identity of the opened directory
+	// (same spelling as FileFacts.FileIdentity / RootIdentity).
+	Identity() string
+	// ReadDir enumerates the directory through the handle.
+	ReadDir() ([]os.DirEntry, error)
+	Close() error
+}
+
+// VerifiedDirProbe is implemented by native platform probes.
+type VerifiedDirProbe interface {
+	// OpenDirVerified opens path and verifies the OPENED HANDLE's
+	// identity equals the identity previously observed for that path
+	// (expectedIdentity, from the classification-time FileFacts).
+	// A mismatch (path substituted between classification and open)
+	// returns an error; it never returns a handle to a different object.
+	//
+	// Contract for mismatch errors: they must satisfy
+	// interface{ IdentityMismatch() bool } returning true, so callers
+	// can distinguish "the path was substituted" from ordinary open
+	// failures without importing the platform package. All other
+	// failures keep ordinary error semantics. expectedIdentity must be
+	// non-empty; an empty expectation is an invalid-argument error.
+	OpenDirVerified(path, expectedIdentity string) (IdentifiedDir, error)
 }
 
 // SnapshotStore is the storage backend seam (implemented by

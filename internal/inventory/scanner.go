@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -65,6 +66,12 @@ const (
 	// IssueNonrepresentableName marks names that are not valid UTF-8;
 	// they stay in inventory but block destructive capability (§8.2).
 	IssueNonrepresentableName = "EBB_SCAN_NONREPRESENTABLE_NAME"
+	// IssueDirReplaced marks a directory whose opened-for-enumeration
+	// handle did not carry the identity observed at classification time
+	// (junction/reparse substitution in the classification→open window,
+	// SCAN-RACE-1). Its children are never enumerated and its entry
+	// blocks destructive capability; the scan itself continues.
+	IssueDirReplaced = "EBB_SCAN_DIR_REPLACED"
 )
 
 // Options controls one scan. The zero value selects the defaults.
@@ -163,8 +170,20 @@ func Scan(ctx context.Context, probe domain.PlatformProbe, rootPath string, opts
 		excl:     make(map[string]int64),
 		blocking: make(map[string]struct{}),
 	}
-	s.walk("", 0)
+	s.walk("", 0, rootIdentityString(ident))
 	return s.finalize(root)
+}
+
+// rootIdentityString composes the probe's RootIdentity components into
+// the single-string spelling domain.VerifiedDirProbe compares against.
+// Every native probe renders FileFacts.FileIdentity as exactly
+// "<RootIdentity.VolumeID>:<RootIdentity.FileID>"
+// (platform_windows.go fileIdentityString / platform_linux.go
+// devInoIdentity), so composing here reuses that spelling rather than
+// inventing a second one. A probe that ever drifts from it fails
+// closed: the root handle never verifies and the scan aborts.
+func rootIdentityString(ri domain.RootIdentity) string {
+	return ri.VolumeID + ":" + ri.FileID
 }
 
 func mustAbs(p string) string {
@@ -211,11 +230,28 @@ type scanner struct {
 
 // walk enumerates one directory's children at depth+1 and recurses into
 // real subdirectories only. rel is "" for the root itself.
-func (s *scanner) walk(rel string, depth int) bool {
-	des, err := os.ReadDir(s.abs(rel))
+// expectedIdentity is the classification-time native identity of that
+// directory ("" when none is available): enumeration goes through one
+// verified handle when the probe supports it (readClassifiedDir).
+func (s *scanner) walk(rel string, depth int, expectedIdentity string) bool {
+	des, replaced, err := s.readClassifiedDir(rel, expectedIdentity)
 	if err != nil {
 		s.fail(fmt.Sprintf("reading directory %q", s.relOrRoot(rel)), err)
 		return false
+	}
+	if replaced {
+		if rel == "" {
+			// The root is the trust anchor: an unverified root means no
+			// entry in the result can be trusted. (This also fires when
+			// the root path itself is a link: RootIdentity certifies the
+			// link object while os.Open would follow it — fail closed
+			// and tell the user to scan the real target.)
+			s.fail(fmt.Sprintf("root %q does not match its resolved identity %q (root replaced, or the root path is a link); refusing to enumerate a different object",
+				s.rootAbs, expectedIdentity), nil)
+			return false
+		}
+		s.dirReplaced(rel, expectedIdentity)
+		return true // children never enumerated; the walk continues
 	}
 	if len(des) > 0 && depth+1 > s.opts.MaxDepth {
 		s.fail(fmt.Sprintf("depth bound exceeded at %q (max depth %d)", joinRel(rel, des[0].Name()), s.opts.MaxDepth), nil)
@@ -240,11 +276,77 @@ func (s *scanner) walk(rel string, depth int) bool {
 		if !ok {
 			return false
 		}
-		if kind == domain.KindDir && !s.walk(childRel, depth+1) {
+		if kind == domain.KindDir && !s.walk(childRel, depth+1, facts.FileIdentity) {
 			return false
 		}
 	}
 	return true
+}
+
+// readClassifiedDir enumerates directory rel. When the probe implements
+// domain.VerifiedDirProbe AND a classification-time identity exists,
+// enumeration goes through ONE handle whose native identity was checked
+// against the classified identity before a single entry was read
+// (SCAN-RACE-1: a junction/reparse substituted after classification
+// re-roots a path-based enumeration; a verified handle cannot be
+// re-pointed). Probes without the capability (test fakes), and the rare
+// classification without an identity, keep the legacy path-based
+// os.ReadDir — a documented pre-existing limitation; removal-side
+// per-entry revalidation still bounds the destructive consequence.
+func (s *scanner) readClassifiedDir(rel, expectedIdentity string) (des []os.DirEntry, replaced bool, err error) {
+	vp, ok := s.probe.(domain.VerifiedDirProbe)
+	if !ok || expectedIdentity == "" {
+		des, err = os.ReadDir(s.abs(rel))
+		return des, false, err
+	}
+	dir, err := vp.OpenDirVerified(s.abs(rel), expectedIdentity)
+	if err != nil {
+		if isDirIdentityMismatch(err) {
+			return nil, true, nil
+		}
+		return nil, false, err
+	}
+	des, err = dir.ReadDir()
+	if cerr := dir.Close(); err == nil && cerr != nil {
+		err = cerr
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return des, false, nil
+}
+
+// dirIdentityMismatch is the structural contract a VerifiedDirProbe
+// mismatch error satisfies (documented on domain.VerifiedDirProbe).
+// Detected structurally so this package never imports internal/platform.
+type dirIdentityMismatch interface {
+	IdentityMismatch() bool
+}
+
+func isDirIdentityMismatch(err error) bool {
+	var m dirIdentityMismatch
+	return errors.As(err, &m) && m.IdentityMismatch()
+}
+
+// dirReplaced records a directory whose verified descent failed the
+// identity check: the entry flips to the blocking outcome with the
+// matching issue and evidence, and its children are never enumerated.
+// The scan itself continues (other entries are still reported).
+func (s *scanner) dirReplaced(rel, expectedIdentity string) {
+	s.addIssue(rel, IssueDirReplaced, fmt.Sprintf(
+		"directory replaced between classification and enumeration (expected native identity %q); children not enumerated; destructive capability blocked",
+		expectedIdentity))
+	for i := range s.entries {
+		if s.entries[i].Path == rel {
+			s.entries[i].Evidence = append(s.entries[i].Evidence, evidenceScan+":"+IssueDirReplaced)
+			if !s.meta[i].blocking {
+				s.meta[i].blocking = true
+				s.preserved--
+			}
+			break
+		}
+	}
+	s.blocking[rel] = struct{}{}
 }
 
 // emit classifies one child, records the entry and its accounting meta,
