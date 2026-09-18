@@ -44,6 +44,34 @@ func (c *Catalog) UpsertWorkspace(w Workspace) error {
 	})
 }
 
+// ListWorkspaces returns every workspace row, ordered by name then id.
+// It is the catalog-side listing behind `ebb status` and the CLI's
+// workspace-name resolution for `ebb open <name>` (names are labels, not
+// keys, so callers disambiguate by root path or recency themselves).
+func (c *Catalog) ListWorkspaces() ([]Workspace, error) {
+	const q = `SELECT id, name, created_at, root_path, root_identity, status
+		FROM workspaces ORDER BY name, id`
+	rows, err := c.db.Query(q)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: list workspaces: %w", err)
+	}
+	defer rows.Close()
+	var out []Workspace
+	for rows.Next() {
+		var w Workspace
+		var rootPath, rootIdentity sql.NullString
+		if err := rows.Scan(&w.ID, &w.Name, &w.CreatedAt, &rootPath, &rootIdentity, &w.Status); err != nil {
+			return nil, fmt.Errorf("catalog: list workspaces: %w", err)
+		}
+		w.RootPath, w.RootIdentity = rootPath.String, rootIdentity.String
+		out = append(out, w)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: list workspaces: %w", err)
+	}
+	return out, nil
+}
+
 // GetWorkspace returns the workspace row for id, or ErrNotFound.
 func (c *Catalog) GetWorkspace(id domain.WorkspaceID) (Workspace, error) {
 	const q = `SELECT id, name, created_at, root_path, root_identity, status
