@@ -25,7 +25,7 @@ func trimManifestOf(t *testing.T, h *eHarness) map[string]any {
 		t.Fatalf("no payload %s in the fake store", snap.PayloadBackendID)
 	}
 	for p, b := range s.files {
-		if strings.HasSuffix(p, "manifest.json") && strings.Contains(p, ".ebb-op-") {
+		if pth := strings.ReplaceAll(p, "\\", "/"); (pth == "manifest.json" || strings.HasSuffix(pth, "/manifest.json")) && strings.Contains(pth, ".ebb-op-") {
 			var doc map[string]any
 			if err := json.Unmarshal(b, &doc); err != nil {
 				t.Fatalf("manifest %s: %v", p, err)
