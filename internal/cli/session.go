@@ -60,6 +60,12 @@ func openSession(deps Deps) (*session, error) {
 	store, closeStore, err := deps.NewStore()
 	if err != nil {
 		cat.Close()
+		var ce *cliError
+		if errors.As(err, &ce) {
+			// The seam already classified (e.g. missing restic binary
+			// is provider-unavailable, not a generic block).
+			return nil, ce
+		}
 		return nil, blockedError(fmt.Errorf("snapshot store: %v", err))
 	}
 	return &session{deps: deps, cfgDir: cfgDir, cat: cat, store: store, closeStore: closeStore}, nil

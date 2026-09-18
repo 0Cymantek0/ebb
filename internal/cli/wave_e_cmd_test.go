@@ -215,7 +215,6 @@ func TestParkEndToEndFlagAssertion(t *testing.T) {
 	if w["status"] != "parked" {
 		t.Errorf("workspace status = %v, want parked", w["status"])
 	}
-	_ = stdout
 }
 
 func TestParkJSONEnvelope(t *testing.T) {
