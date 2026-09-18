@@ -72,6 +72,11 @@ type SnapshotStore interface {
 	// Init creates a new empty repository at dir.
 	Init(ctx context.Context, dir string, passfile string) error
 
+	// RepoID returns the backend repository identity (restic: parsed
+	// from `init` stdout or `cat config`; the on-disk config is
+	// encrypted). Seals record it to bind to one specific repository.
+	RepoID(ctx context.Context, repoDir, passfile string) (string, error)
+
 	// Snapshot captures exactly the listed paths (NUL-safe, caller-built
 	// per D003: cwd-relative from a base dir, sibling op dir included)
 	// and returns the backend snapshot ID. Errors must distinguish
