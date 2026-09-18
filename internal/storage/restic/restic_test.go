@@ -761,3 +761,4 @@ func TestDumpFileContextCancellation(t *testing.T) {
 
 // compile-time interface check.
 var _ domain.SnapshotStore = (*Store)(nil)
+var _ domain.TreeTarDumper = (*Store)(nil) // streaming whole-tree readback seam (D007 shape)
