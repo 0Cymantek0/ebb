@@ -422,6 +422,20 @@ func ExpectedTreeFor(entries []domain.Entry, prefix string) (map[string]Expected
 	return out, files
 }
 
+// VerifyCoverage is the exported §11.4 coverage gate behind
+// `ebb verify` and the capsule exporter: the SAME exact-match comparison
+// the capture itself ran (missing/unexpected/duplicate nodes, kind and
+// size mismatches, prefix gating — I04). Sharing it is what keeps a
+// re-verification from being stricter or laxer than the original gate.
+// The returned error is nil or *ErrVerification{Check: "coverage"}.
+func VerifyCoverage(ls []domain.TreeEntry, expected map[string]ExpectedNode, prefixes []string) error {
+	want := make(map[string]expectedNode, len(expected))
+	for p, n := range expected {
+		want[p] = expectedNode{Kind: n.Kind, Size: n.Size}
+	}
+	return verifyCoverage(ls, want, prefixes)
+}
+
 // VerifyReadback is the exported §11.4 readback executor behind
 // `ebb verify --content`: the SAME transport verifyPayload (capture) and
 // reverifyPayload (crash recovery) run, over sets derived by the same

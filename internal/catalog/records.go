@@ -25,6 +25,7 @@ const (
 	OpKindOpen   = "open"
 	OpKindTrim   = "trim"
 	OpKindForget = "forget"
+	OpKindExport = "export" // Wave H: portable-capsule production (§15.2)
 )
 
 // Operation phases — Foundation §12.4 recovery state machine, verbatim.
@@ -41,6 +42,19 @@ const (
 	PhaseFilesReady       = "FILES_READY"
 	PhaseRebuilding       = "REBUILDING"
 	PhaseReady            = "READY"
+)
+
+// Export operations (kind "export", Wave H) produce a portable capsule
+// (Foundation §15.2). They never touch the source workspace, so they
+// carry their own small phase set mirroring the trim precedent: a
+// controlled failure closes CANCELED after removing the capsule's own
+// partial/working artifacts (nothing needs reconciliation); a crash
+// between phases leaves the row active with the .partial file as the
+// recognizable on-disk artifact.
+const (
+	PhaseExportPlanned   = "EXPORT_PLANNED"
+	PhaseExportCopying   = "EXPORT_COPYING"
+	PhaseExportVerifying = "EXPORT_VERIFYING"
 )
 
 // Terminal phases: the operation's reconciliation is over; it is no
@@ -87,6 +101,9 @@ var validPhases = map[string]bool{
 	PhaseTrimPlanned:      true,
 	PhaseTrimSealing:      true,
 	PhaseTrimDone:         true,
+	PhaseExportPlanned:    true,
+	PhaseExportCopying:    true,
+	PhaseExportVerifying:  true,
 }
 
 // terminalPhases are the phases ActiveOperations excludes.
@@ -106,6 +123,7 @@ var validOpKinds = map[string]bool{
 	OpKindOpen:   true,
 	OpKindTrim:   true,
 	OpKindForget: true,
+	OpKindExport: true,
 }
 
 // PinReasonCreation is the reason every snapshot is pinned with at
@@ -183,6 +201,21 @@ type Approval struct {
 	ApprovedBy   string // defaults to "user"
 	ApprovedAt   string // RFC3339Nano UTC
 	RevokedAt    string // RFC3339Nano UTC, "" while live
+}
+
+// Replica is one row of the replicas table: a VERIFIED independent
+// recovery copy of one snapshot (Foundation §15.5). A vault replica
+// carries VaultID + empty Path; a capsule replica (Wave H) carries an
+// empty VaultID (a capsule is not a registered vault) and the capsule
+// file's output path. Scope names the verification that was actually
+// performed, never a free-form "safe=true".
+type Replica struct {
+	ID         domain.ID
+	SnapshotID domain.SnapshotID
+	VaultID    domain.VaultID // "" for capsule replicas
+	VerifiedAt string         // RFC3339Nano UTC
+	Scope      string
+	Path       string // capsule output file (Wave H); "" for vault replicas
 }
 
 // RetentionIntent is one row of the retention_intents table: an

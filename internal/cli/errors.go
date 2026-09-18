@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 
+	"ebb/internal/capsule"
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 	"ebb/internal/lifecycle"
@@ -38,6 +39,15 @@ const (
 	CodeApprovalRequired = "EBB_E_APPROVAL_REQUIRED"
 	CodeApprovalDrift    = "EBB_E_APPROVAL_DRIFT"
 	CodeApprovalDeclined = "EBB_E_APPROVAL_DECLINED"
+	// Export blockers (Wave H, Foundation §15.2): scoped like verify's
+	// not-openable refusals — exit 3, source untouched. The capsule
+	// package owns the codes for the failures it raises; the CLI owns
+	// the eligibility refusals.
+	CodeExportNotExportable = "EBB_E_NOT_EXPORTABLE"
+	// CodeExportPartialStale and CodeExportOutputOccupied are the
+	// capsule-typed blockers (aliased here for the presentation layer).
+	CodeExportPartialStale   = capsule.CodePartialStale
+	CodeExportOutputOccupied = capsule.CodeOutputOccupied
 )
 
 // blockerMessage renders one §5.5 blocker: stable code, reason and a
@@ -114,6 +124,23 @@ func classifyExitCode(err error) int {
 	var sealInvalid *restore.ErrSealInvalid
 	if errors.As(err, &sealInvalid) {
 		return ExitCaptureVerify
+	}
+	// Capsule export (Wave H): a failed export check published nothing
+	// and left the source intact — same honest class as capture verify.
+	var cver *capsule.ErrVerification
+	if errors.As(err, &cver) {
+		return ExitCaptureVerify
+	}
+	if capsule.IsInvalidParams(err) {
+		return ExitUsage
+	}
+	var occupiedOut *capsule.ErrOutputOccupied
+	if errors.As(err, &occupiedOut) {
+		return ExitBlocked
+	}
+	var partial *capsule.ErrPartialExists
+	if errors.As(err, &partial) {
+		return ExitBlocked
 	}
 	// Interrupted/partial operations that require reconciliation.
 	var removalBlocked *lifecycle.ErrRemovalBlocked
@@ -259,6 +286,21 @@ func safeActionFor(err error) string {
 	if errors.As(err, &rebuild) {
 		return fmt.Sprintf(". Safe action: the recovered files are intact at the destination and the snapshot stays pinned; resolve the blocker (install the missing toolchain, fix the action), then `ebb open --resume %s`",
 			rebuild.OperationID)
+	}
+	var cver *capsule.ErrVerification
+	if errors.As(err, &cver) {
+		return ". Safe action: nothing was published and the source snapshot is intact and still pinned; rerun the export after resolving the check failure"
+	}
+	var occupiedOut *capsule.ErrOutputOccupied
+	if errors.As(err, &occupiedOut) {
+		return ". Safe action: choose a different --output path or move the existing file aside; nothing was overwritten"
+	}
+	var partial *capsule.ErrPartialExists
+	if errors.As(err, &partial) {
+		return ". Safe action: inspect the partial (its ebb-export.json names the operation that left it), delete it explicitly, then rerun the export"
+	}
+	if capsule.IsInvalidParams(err) {
+		return ". Safe action: fix the arguments (an existing output directory and a fresh --output path are required)"
 	}
 	return ""
 }
