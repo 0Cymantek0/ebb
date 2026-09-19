@@ -399,9 +399,18 @@ func discoverPayload(ctx context.Context, store Store, repoDir, passfile, srcPay
 // pure derivation `ebb verify` uses (lifecycle.ExpectedTreeFor), plus
 // the op-dir documents with their digest-gated lengths.
 func expectedDestinationTree(p *Params) (map[string]lifecycle.ExpectedNode, []lifecycle.ReadbackFile) {
-	expected, readback := lifecycle.ExpectedTreeFor(p.Evidence.Retained, p.Evidence.WsPrefix)
+	return expectedTreeForEvidence(p.Evidence)
+}
+
+// expectedTreeForEvidence is the evidence-shaped core of
+// expectedDestinationTree, shared by Export (source retained evidence)
+// and Import (capsule-re-derived evidence) so both transports verify a
+// destination payload against ONE derivation — a re-verification that
+// disagreed with the capture's own would be vacuous (Learnings, Wave D).
+func expectedTreeForEvidence(ev restore.Evidence) (map[string]lifecycle.ExpectedNode, []lifecycle.ReadbackFile) {
+	expected, readback := lifecycle.ExpectedTreeFor(ev.Retained, ev.WsPrefix)
 	addDoc := func(name string, length int64, digest string) {
-		path := "/" + p.Evidence.OpDirName + "/" + name
+		path := "/" + ev.OpDirName + "/" + name
 		segs := strings.Split(strings.TrimPrefix(path, "/"), "/")
 		for i := 1; i < len(segs); i++ {
 			expected["/"+strings.Join(segs[:i], "/")] = lifecycle.ExpectedNode{Kind: domain.KindDir}
@@ -409,9 +418,9 @@ func expectedDestinationTree(p *Params) (map[string]lifecycle.ExpectedNode, []li
 		expected[path] = lifecycle.ExpectedNode{Kind: domain.KindFile, Size: length}
 		readback = append(readback, lifecycle.ReadbackFile{SnapPath: path, Digest: digest})
 	}
-	addDoc("manifest.json", p.Evidence.Manifest.ManifestBytes, p.Evidence.Manifest.ManifestDigest)
-	addDoc(p.Evidence.Manifest.InventoryPath, p.Evidence.Manifest.InventoryBytes, p.Evidence.Manifest.InventoryDigest)
-	addDoc("policy.toml", p.Evidence.Manifest.PolicyBytes, p.Evidence.Manifest.PolicyDigest)
+	addDoc("manifest.json", ev.Manifest.ManifestBytes, ev.Manifest.ManifestDigest)
+	addDoc(ev.Manifest.InventoryPath, ev.Manifest.InventoryBytes, ev.Manifest.InventoryDigest)
+	addDoc("policy.toml", ev.Manifest.PolicyBytes, ev.Manifest.PolicyDigest)
 	return expected, readback
 }
 
