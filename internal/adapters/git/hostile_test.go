@@ -15,6 +15,7 @@ package gitadapter
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -327,6 +328,19 @@ func TestHostileFsmonitorDaemonNotSpawned(t *testing.T) {
 	repo := t.TempDir()
 	initRepo(t, repo)
 	writeAndCommit(t, repo, "f.txt", "x\n")
+	// Capability gate for the control arm: it can only prove the
+	// negative where git's builtin daemon EXISTS. Some builds answer
+	// `git fsmonitor--daemon status` with "not supported on this
+	// platform" (observed: Debian trixie git 2.47.3 in the Linux cert
+	// container) — the baseline is then unprovable, so skip with the
+	// reason instead of faking coverage. Where the daemon exists (Git
+	// for Windows 2.49 on the certified host), the arms below run in
+	// full.
+	if out, err := tryGit(t, repo, "fsmonitor--daemon", "status"); err != nil &&
+		strings.Contains(strings.ToLower(out), "not supported") {
+		t.Skipf("git build without builtin fsmonitor--daemon; control arm unprovable: %s",
+			strings.TrimSpace(out))
+	}
 	runGit(t, repo, "config", "core.fsmonitor", "true")
 	daemonState := filepath.Join(repo, ".git", "fsmonitor--daemon")
 
