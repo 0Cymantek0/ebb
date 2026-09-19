@@ -8,9 +8,12 @@
 // was removed), and every snapshot is pinned (I07 — absence of pin
 // records can never license release). An existing non-empty catalog is
 // refused without --force-rebuild, and even then the rebuild only
-// MERGES: duplicates are reported, rows are never overwritten in their
-// identity-bearing fields (the import's ON CONFLICT clauses refresh
-// backend facts only).
+// MERGES: the import COMPARES an already-known snapshot id against the
+// existing row's witness-bearing fields (payload/seal backend ids,
+// vault, manifest/inventory digests, kind — the D017/D020 tamper
+// witness) instead of overwriting them; an exact match is a reported
+// duplicate, a divergent candidate is surfaced as a SUSPICIOUS finding
+// with the row left untouched (Wave J review J4).
 //
 // Exit contract: 0 with a rebuilt catalog; 2 usage (unwired seams, flag
 // mistakes); 3 blocked (non-empty catalog without --force-rebuild); 4 the
@@ -22,16 +25,14 @@ package cli
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
+	"ebb/internal/lifecycle"
 	"ebb/internal/restore"
 	"ebb/internal/vault"
 )
@@ -179,10 +180,12 @@ func rebuildFromVault(ctx context.Context, sess *session, v *vault.Vault, repoDi
 	}
 
 	// Re-register the vault row FIRST (snapshots carry the FK). The row
-	// id derivation mirrors lifecycle's vaultIDFor exactly — both so
-	// merge-discover matches the ids the original captures recorded, and
-	// so rebuilt snapshot rows carry capture's vault_id convention.
-	vaultRowID := rebuiltVaultID(repoID, repoDir)
+	// id comes from lifecycle's single exported authority (VaultIDFor) —
+	// both so merge-discover matches the ids the original captures
+	// recorded, and so rebuilt snapshot rows carry capture's vault_id
+	// convention (Wave J hardening note 1: no second derivation to
+	// drift).
+	vaultRowID := lifecycle.VaultIDFor(repoID, repoDir)
 	if err := sess.cat.RegisterVault(catalog.Vault{
 		ID:   vaultRowID,
 		Path: repoDir, RepoID: repoID,
@@ -194,18 +197,47 @@ func rebuildFromVault(ctx context.Context, sess *session, v *vault.Vault, repoDi
 	byWorkspace := map[domain.WorkspaceID]*rebuildWorkspace{}
 	for i := range disc.Pairs {
 		p := disc.Pairs[i]
-		if existed, _ := snapshotExists(sess, domain.SnapshotID(p.SnapshotID)); existed {
-			details.Duplicates++
-		}
-		if err := sess.cat.ImportDiscoveredSnapshot(p.WorkspaceID, p.WorkspaceName, catalog.Snapshot{
+		existed, _ := snapshotExists(sess, domain.SnapshotID(p.SnapshotID))
+		groupKind := p.Kind // the row's kind once one exists (see the divergence case)
+		switch impErr := sess.cat.ImportDiscoveredSnapshot(p.WorkspaceID, p.WorkspaceName, catalog.Snapshot{
 			ID: p.SnapshotID, CreatedAt: p.CreatedAt,
 			PayloadBackendID: p.PayloadBackendID, SealBackendID: p.SealBackendID,
 			VaultID: vaultRowID, ManifestDigest: p.ManifestDigest,
 			InventoryDigest: p.InventoryDigest, Kind: p.Kind,
 			PinReasons: []string{discovered},
-		}); err != nil {
-			return &restore.ErrVerification{Check: "discovery", Details: []string{
-				fmt.Sprintf("importing discovered snapshot %s: %v", p.SnapshotID, err)}}
+		}); {
+		case impErr == nil && existed:
+			// Benign duplicate: the intact row already carries exactly
+			// these facts.
+			details.Duplicates++
+		case impErr == nil:
+			details.SnapshotsAdopted++
+		default:
+			var div *catalog.ErrWitnessDivergence
+			if !errors.As(impErr, &div) {
+				return &restore.ErrVerification{Check: "discovery", Details: []string{
+					fmt.Sprintf("importing discovered snapshot %s: %v", p.SnapshotID, impErr)}}
+			}
+			// J4: the vault holds a pair claiming a logical id whose
+			// catalog row disagrees on witness fields. The intact row is
+			// the D017/D020 witness and stays untouched; the divergent
+			// pair is refused and reported as suspicious (retained in the
+			// vault, never adopted).
+			backend := p.SealBackendID
+			if backend == "" {
+				backend = p.PayloadBackendID
+			}
+			reasons := append([]string{fmt.Sprintf(
+				"witness divergence: the catalog row for logical snapshot %s disagrees with the pair discovered in the vault; the row was NOT overwritten and the discovered pair was not adopted (vault tampering or a foreign pair suspected)",
+				p.SnapshotID)}, div.Reasons()...)
+			details.Suspicious = append(details.Suspicious, rebuildSuspicious{
+				BackendID:        backend,
+				PayloadBackendID: p.PayloadBackendID,
+				SnapshotID:       string(p.SnapshotID),
+				WorkspaceID:      string(p.WorkspaceID),
+				Reasons:          reasons,
+			})
+			groupKind = div.Existing.Kind
 		}
 		ws := byWorkspace[p.WorkspaceID]
 		if ws == nil {
@@ -215,27 +247,41 @@ func rebuildFromVault(ctx context.Context, sess *session, v *vault.Vault, repoDi
 			details.Workspaces = append(details.Workspaces, *ws)
 		}
 		ws.Snapshots++
-		ws.Kinds = appendKind(ws.Kinds, p.Kind)
-		details.SnapshotsAdopted++
+		ws.Kinds = appendKind(ws.Kinds, groupKind)
 	}
 
 	for _, u := range disc.Unsealed {
-		if existed, _ := snapshotExists(sess, domain.SnapshotID(u.SnapshotID)); existed {
-			details.Duplicates++
-		}
+		existed, _ := snapshotExists(sess, domain.SnapshotID(u.SnapshotID))
 		// §11.3: an unsealed payload is an incomplete operation, not
 		// garbage — recorded pinned with an empty seal id (the shape
 		// forget refuses and open-selection skips), reported, never
 		// adopted as a verified snapshot.
-		if err := sess.cat.ImportDiscoveredSnapshot(u.WorkspaceID, u.WorkspaceName, catalog.Snapshot{
+		switch impErr := sess.cat.ImportDiscoveredSnapshot(u.WorkspaceID, u.WorkspaceName, catalog.Snapshot{
 			ID: u.SnapshotID, CreatedAt: u.CreatedAt,
 			PayloadBackendID: u.PayloadBackendID,
 			VaultID:          vaultRowID, ManifestDigest: u.ManifestDigest,
 			InventoryDigest: u.InventoryDigest, Kind: u.Kind,
 			PinReasons: []string{discovered + ":unsealed"},
-		}); err != nil {
-			return &restore.ErrVerification{Check: "discovery", Details: []string{
-				fmt.Sprintf("recording unsealed payload %s: %v", u.PayloadBackendID, err)}}
+		}); {
+		case impErr == nil && existed:
+			details.Duplicates++
+		case impErr == nil:
+		default:
+			var div *catalog.ErrWitnessDivergence
+			if !errors.As(impErr, &div) {
+				return &restore.ErrVerification{Check: "discovery", Details: []string{
+					fmt.Sprintf("recording unsealed payload %s: %v", u.PayloadBackendID, impErr)}}
+			}
+			details.Suspicious = append(details.Suspicious, rebuildSuspicious{
+				BackendID:        u.PayloadBackendID,
+				PayloadBackendID: u.PayloadBackendID,
+				SnapshotID:       string(u.SnapshotID),
+				WorkspaceID:      string(u.WorkspaceID),
+				Reasons: append([]string{fmt.Sprintf(
+					"witness divergence: the catalog row for logical snapshot %s disagrees with the unsealed payload discovered in the vault; the row was NOT overwritten and the payload was not adopted",
+					u.SnapshotID)}, div.Reasons()...),
+			})
+			continue
 		}
 		details.Unsealed = append(details.Unsealed, rebuildUnsealed{
 			SnapshotID: string(u.SnapshotID), WorkspaceID: string(u.WorkspaceID),
@@ -263,18 +309,6 @@ func snapshotExists(sess *session, id domain.SnapshotID) (bool, error) {
 		return false, nil
 	}
 	return err == nil, err
-}
-
-// rebuiltVaultID mirrors lifecycle's vaultIDFor derivation (capture.go):
-// the stable vault row id for one repository, so rows rebuilt by
-// discovery carry exactly the id the original captures recorded.
-func rebuiltVaultID(repoID, repoDir string) domain.VaultID {
-	abs, err := filepath.Abs(repoDir)
-	if err != nil {
-		abs = repoDir
-	}
-	sum := sha256.Sum256([]byte("ebb:vault:" + repoID + ":" + filepath.Clean(abs)))
-	return domain.VaultID(hex.EncodeToString(sum[:])[:32])
 }
 
 // appendKind adds kind to kinds when absent (report summary helper).

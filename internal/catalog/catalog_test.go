@@ -621,13 +621,25 @@ func TestImportDiscoveredSnapshotAndWorkspacesForVault(t *testing.T) {
 		t.Fatalf("WorkspacesForVault: got %v, want [%s]", forWs, wsID)
 	}
 
-	// Re-import refreshes discovered facts but never disturbs pin state.
+	// Re-import COMPARES, never merges (Wave J J4): a candidate with a
+	// different payload id is a witness divergence, refused with the row
+	// untouched; the exact same facts re-import as a benign duplicate.
+	// Either way the pin state is never disturbed.
 	if err := c.Pin(snapID, "audit-hold"); err != nil {
 		t.Fatalf("Pin: %v", err)
 	}
 	s.PayloadBackendID = "payload-9b"
+	err = c.ImportDiscoveredSnapshot(wsID, "recovered-proj", s)
+	if err == nil {
+		t.Fatal("divergent re-import accepted — the witness is re-anchorable")
+	}
+	var div *ErrWitnessDivergence
+	if !errors.As(err, &div) {
+		t.Fatalf("divergent re-import error is not ErrWitnessDivergence: %v", err)
+	}
+	s.PayloadBackendID = "payload-9"
 	if err := c.ImportDiscoveredSnapshot(wsID, "recovered-proj", s); err != nil {
-		t.Fatalf("re-import: %v", err)
+		t.Fatalf("benign re-import: %v", err)
 	}
 	if snaps, err = c.ListSnapshots(wsID); err != nil {
 		t.Fatalf("ListSnapshots after re-import: %v", err)
@@ -639,8 +651,8 @@ func TestImportDiscoveredSnapshotAndWorkspacesForVault(t *testing.T) {
 	if !got.Pinned || !contains(got.PinReasons, "pin:audit-hold") {
 		t.Fatalf("re-import disturbed pin state: %+v", got)
 	}
-	if got.PayloadBackendID != "payload-9b" {
-		t.Fatalf("re-import did not refresh payload id: %q", got.PayloadBackendID)
+	if got.PayloadBackendID != "payload-9" {
+		t.Fatalf("re-import changed the payload id: %q", got.PayloadBackendID)
 	}
 }
 

@@ -155,12 +155,14 @@ func TestImportPhaseVocabularyClosed(t *testing.T) {
 	}
 }
 
-// TestImportDiscoveredSnapshotRefreshesVaultAndFacts covers the capsule
-// re-import shape (Foundation §15.3): registering the same discovered
-// snapshot id into a different destination vault refreshes vault_id and
-// the discovered backend facts while the pinned state and the pin audit
-// list stay exactly as they were.
-func TestImportDiscoveredSnapshotRefreshesVaultAndFacts(t *testing.T) {
+// TestImportDiscoveredSnapshotNeverOverwritesWitness covers the merge
+// contract (Wave J review J4): re-importing a discovered snapshot id is
+// COMPARED, never merged. An exact re-import is a benign duplicate (nil
+// error, the row and its pin audit completely untouched); a candidate
+// claiming different witness-bearing fields (payload/seal backend ids,
+// vault, digests, kind) is refused with *ErrWitnessDivergence while the
+// existing row — the D017/D020 tamper witness — stays exactly as it was.
+func TestImportDiscoveredSnapshotNeverOverwritesWitness(t *testing.T) {
 	c := open(t)
 	vaultA := domain.VaultID(domain.NewID())
 	vaultB := domain.VaultID(domain.NewID())
@@ -198,7 +200,7 @@ func TestImportDiscoveredSnapshotRefreshesVaultAndFacts(t *testing.T) {
 		t.Fatalf("initially imported snapshot not pinned: %+v", got)
 	}
 
-	// A pin taken between imports must survive the re-import untouched.
+	// A pin taken between imports must survive every re-import untouched.
 	if err := c.Pin(snapID, "audit-hold"); err != nil {
 		t.Fatalf("Pin: %v", err)
 	}
@@ -207,43 +209,67 @@ func TestImportDiscoveredSnapshotRefreshesVaultAndFacts(t *testing.T) {
 		t.Fatalf("GetSnapshot after pin: %v", err)
 	}
 
-	// Re-import the same id into a different destination vault with
-	// refreshed backend ids and digests.
+	// Benign duplicate: the exact same discovered facts re-imported
+	// (discovery running twice over an intact catalog). No error, and
+	// the row is bit-for-bit what it was.
+	if err := c.ImportDiscoveredSnapshot(wsID, "capsule-proj", s); err != nil {
+		t.Fatalf("benign duplicate re-import refused: %v", err)
+	}
+	got, err = c.GetSnapshot(snapID)
+	if err != nil {
+		t.Fatalf("GetSnapshot after benign re-import: %v", err)
+	}
+	if !sameRow(got, before) {
+		t.Fatalf("benign duplicate re-import disturbed the row: before %+v, after %+v", before, got)
+	}
+
+	// Divergence: the same logical id discovered with DIFFERENT
+	// witness-bearing facts (a minted pair, D023's post-loss threat)
+	// must be refused with the row untouched.
 	s.VaultID = vaultB
 	s.PayloadBackendID = "payload-b"
 	s.SealBackendID = "seal-b"
 	s.ManifestDigest = "manifest-b"
 	s.InventoryDigest = "inventory-b"
-	if err := c.ImportDiscoveredSnapshot(wsID, "capsule-proj", s); err != nil {
-		t.Fatalf("re-import: %v", err)
+	s.Kind = SnapshotKindSnapshot
+	err = c.ImportDiscoveredSnapshot(wsID, "capsule-proj", s)
+	if err == nil {
+		t.Fatal("divergent re-import was accepted — the witness was re-anchorable")
 	}
-
-	got, err = c.GetSnapshot(snapID)
-	if err != nil {
-		t.Fatalf("GetSnapshot after re-import: %v", err)
+	var div *ErrWitnessDivergence
+	if !errors.As(err, &div) {
+		t.Fatalf("divergent re-import error is not ErrWitnessDivergence: %v", err)
 	}
-	if got.VaultID != vaultB {
-		t.Fatalf("re-import did not refresh vault_id: got %s, want %s", got.VaultID, vaultB)
+	wantFields := map[string]bool{
+		"payload_backend_id": true, "seal_backend_id": true, "vault_id": true,
+		"manifest_digest": true, "inventory_digest": true, "kind": true,
 	}
-	if got.PayloadBackendID != "payload-b" || got.SealBackendID != "seal-b" {
-		t.Fatalf("re-import did not refresh backend ids: %+v", got)
+	if len(div.Fields) != len(wantFields) {
+		t.Fatalf("divergence fields = %v, want exactly %v", div.Fields, wantFields)
 	}
-	if got.ManifestDigest != "manifest-b" || got.InventoryDigest != "inventory-b" {
-		t.Fatalf("re-import did not refresh digests: %+v", got)
-	}
-	if !got.Pinned {
-		t.Fatal("re-import disturbed pinned state")
-	}
-	if len(got.PinReasons) != len(before.PinReasons) {
-		t.Fatalf("re-import changed the pin audit list: before %v, after %v", before.PinReasons, got.PinReasons)
-	}
-	for i, r := range before.PinReasons {
-		if got.PinReasons[i] != r {
-			t.Fatalf("re-import changed the pin audit list: before %v, after %v", before.PinReasons, got.PinReasons)
+	for _, f := range div.Fields {
+		if !wantFields[f] {
+			t.Fatalf("unexpected divergence field %q (all: %v)", f, div.Fields)
 		}
 	}
+	if len(div.Reasons()) != len(wantFields) {
+		t.Fatalf("reasons = %v, want one per diverging field", div.Reasons())
+	}
 
-	// The row was refreshed, never duplicated.
+	// The intact row is EXACTLY what it was — nothing was overwritten.
+	got, err = c.GetSnapshot(snapID)
+	if err != nil {
+		t.Fatalf("GetSnapshot after divergent re-import: %v", err)
+	}
+	if !sameRow(got, before) {
+		t.Fatalf("divergent re-import disturbed the row: before %+v, after %+v", before, got)
+	}
+	if got.VaultID != vaultA || got.PayloadBackendID != "payload-a" || got.ManifestDigest != "manifest-a" {
+		t.Fatalf("witness re-anchored to vault-derived values: %+v", got)
+	}
+
+	// The row was never duplicated, and vault membership still follows
+	// the untouched row's own vault_id.
 	snaps, err := c.ListSnapshots(wsID)
 	if err != nil {
 		t.Fatalf("ListSnapshots: %v", err)
@@ -251,19 +277,31 @@ func TestImportDiscoveredSnapshotRefreshesVaultAndFacts(t *testing.T) {
 	if len(snaps) != 1 {
 		t.Fatalf("re-import duplicated snapshot: got %d rows", len(snaps))
 	}
-	// Vault membership follows the refreshed vault_id.
-	forA, err := c.WorkspacesForVault(vaultA)
-	if err != nil {
-		t.Fatalf("WorkspacesForVault A: %v", err)
-	}
-	if len(forA) != 0 {
-		t.Fatalf("stale vault membership for A: %v", forA)
-	}
 	forB, err := c.WorkspacesForVault(vaultB)
 	if err != nil {
 		t.Fatalf("WorkspacesForVault B: %v", err)
 	}
-	if len(forB) != 1 || forB[0] != wsID {
-		t.Fatalf("vault membership after refresh: got %v, want [%s]", forB, wsID)
+	if len(forB) != 0 {
+		t.Fatalf("divergent candidate changed vault membership: %v", forB)
 	}
+}
+
+// sameRow compares two snapshot rows including the pin-audit slice
+// (Snapshot embeds a []string, so == is not available).
+func sameRow(a, b Snapshot) bool {
+	if a.ID != b.ID || a.WorkspaceID != b.WorkspaceID || a.CreatedAt != b.CreatedAt ||
+		a.PayloadBackendID != b.PayloadBackendID || a.SealBackendID != b.SealBackendID ||
+		a.VaultID != b.VaultID || a.ManifestDigest != b.ManifestDigest ||
+		a.InventoryDigest != b.InventoryDigest || a.Kind != b.Kind || a.Pinned != b.Pinned {
+		return false
+	}
+	if len(a.PinReasons) != len(b.PinReasons) {
+		return false
+	}
+	for i := range a.PinReasons {
+		if a.PinReasons[i] != b.PinReasons[i] {
+			return false
+		}
+	}
+	return true
 }

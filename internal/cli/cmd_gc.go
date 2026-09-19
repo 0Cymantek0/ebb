@@ -244,14 +244,23 @@ func gcCountCatalogRows(sess *session, vaultID domain.VaultID, refs []domain.Sna
 }
 
 // gcActiveOpMessage renders the (a) refusal: every blocking operation
-// named with its durable phase and its exact reconciliation command.
+// named with its durable phase and a reconciliation command that
+// ACTUALLY WORKS for the blocked op's kind (Wave J review J1: the
+// capsule transports' phases are closed by --cancel, and plain recover
+// there is report-only — the advice must never name a dead end).
 func gcActiveOpMessage(vaultArg string, active []catalog.Operation) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s [gc %s]: %d operation(s) are still active and maintenance must not race them (F38):",
 		CodeGcActiveOperation, vaultArg, len(active))
 	for _, op := range active {
-		fmt.Fprintf(&b, "\n  %s kind %s phase %s — reconcile with `ebb recover %s`",
-			op.ID, op.Kind, op.Phase, op.ID)
+		switch op.Kind {
+		case catalog.OpKindExport, catalog.OpKindImport:
+			fmt.Fprintf(&b, "\n  %s kind %s phase %s — close it with `ebb recover %s --cancel` (safe: the capsule transport owns no removal authority)",
+				op.ID, op.Kind, op.Phase, op.ID)
+		default:
+			fmt.Fprintf(&b, "\n  %s kind %s phase %s — reconcile with `ebb recover %s`",
+				op.ID, op.Kind, op.Phase, op.ID)
+		}
 	}
 	fmt.Fprintf(&b, ". Safe action: reconcile each active operation (or let it finish), then rerun `ebb gc %s`", vaultArg)
 	return b.String()

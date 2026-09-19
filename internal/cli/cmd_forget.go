@@ -17,16 +17,20 @@
 // documented no-op, absent backend ids skip the forget call).
 //
 // Protections: seal-kind rows and unsealed payloads are refused (§11.3
-// review, not forget); the LAST snapshot of a PARKED workspace requires
-// the explicit --last-of-parked acknowledgement (a parked workspace with
-// zero snapshots is unrecoverable-by-Ebb). The interactive confirmation
+// review, not forget); the LAST snapshot of a workspace with NO LOCAL
+// ROOT — PARKED or UNBOUND (rebuilt/imported), the two statuses whose
+// vault copy may be the only Ebb-known recovery copy — requires the
+// explicit --last-of-parked acknowledgement (the flag keeps its Wave F
+// name for compatibility; it acknowledges forgetting the last recovery
+// copy of a workspace with no local root). The interactive confirmation
 // requires typing the exact snapshot id; --yes accepts it for decided
 // invocations.
 //
 // Exit contract: 0 forgotten; 2 unknown id / malformed argument; 3
-// refused (seal kind, unsealed payload, last-of-parked without ack,
-// declined or mismatched confirmation); 5 partial durable state needing
-// a rerun; 7 vault unavailable.
+// refused (seal kind, unsealed payload, last-recovery-copy of a
+// no-local-root workspace without ack, declined or mismatched
+// confirmation); 5 partial durable state needing a rerun; 7 vault
+// unavailable.
 
 package cli
 
@@ -72,7 +76,7 @@ func cmdForget(args []string, streams Streams, deps Deps) int {
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
 	yes := fs.Bool("yes", false, "accept the typed-id confirmation (the obligation being ended is shown first)")
 	lastOfParked := fs.Bool("last-of-parked", false,
-		"acknowledge forgetting the ONLY snapshot of a parked workspace (it becomes unrecoverable by Ebb)")
+		"acknowledge forgetting the ONLY snapshot of a workspace with no local root (parked or UNBOUND — it becomes unrecoverable by Ebb)")
 	if err := fs.Parse(reorderFlags(args)); err != nil {
 		return ExitUsage
 	}
@@ -125,10 +129,16 @@ func cmdForget(args []string, streams Streams, deps Deps) int {
 		return emitFailure(env, *jsonOut, streams, classifyExitCode(lerr),
 			fmt.Sprintf("forget %s: listing the workspace's snapshots: %v", idArg, lerr))
 	}
-	if ws.Status == catalog.WorkspaceParked && len(all) == 1 && !*lastOfParked {
+	// The last-recovery-copy guard covers every status with NO LOCAL
+	// ROOT (Wave J review J8): PARKED and UNBOUND (rebuilt/imported) —
+	// for either, the vault copy may be the only Ebb-known recovery copy
+	// besides a capsule file, and a workspace with zero snapshots is
+	// unrecoverable-by-Ebb. The flag keeps its Wave F name
+	// (--last-of-parked) for compatibility.
+	if (ws.Status == catalog.WorkspaceParked || ws.Status == catalog.WorkspaceUnbound) && len(all) == 1 && !*lastOfParked {
 		return emitFailure(env, *jsonOut, streams, ExitBlocked, blockerMessage(
 			CodeForgetLastOfParked, "forget "+idArg,
-			fmt.Sprintf("this is the ONLY snapshot of parked workspace %q; forgetting it makes the workspace unrecoverable by Ebb", ws.Name),
+			fmt.Sprintf("this is the ONLY snapshot of %s workspace %q (no local root exists); forgetting it makes the workspace unrecoverable by Ebb", ws.Status, ws.Name),
 			"Safe action: reopen it first (`ebb open "+ws.Name+" --to <dir>`), or rerun with --last-of-parked to acknowledge losing the last recovery copy"))
 	}
 
