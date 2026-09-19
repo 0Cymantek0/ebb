@@ -12,6 +12,9 @@ ebb park .        # verified capture, then remove the whole workspace
 ebb open renderer # restore it later — files verified against an independent oracle
 ebb reclaim . --target 15GiB           # trim first; escalate to park only if needed
 ebb forget <snapshot-id>               # deliberately release a recovery copy
+ebb gc <vault>                          # physically reclaim unreferenced vault storage (after forget)
+ebb export <snapshot-id> --output f     # independent encrypted capsule for transfer/archival
+ebb init --rebuild-catalog              # recover the catalog from a surviving vault (F39)
 ebb verify <snapshot-id>               # re-check seal/documents/coverage (--content for full readback)
 ebb status        # what Ebb knows
 ```
@@ -28,7 +31,9 @@ What works, end to end, verified against the real restic 0.19.1 binary (`interna
 - **Open** — restore a parked/captured workspace: seal validated (and cross-checked against the catalog's seal-time digests — a tampered vault cannot publish forged content), files materialized to a private staging dir (links excluded from the backend stage and recreated natively — junctions work unprivileged on Windows), verified against the retained inventory as an independent oracle, then published. Nothing unrelated is ever overwritten.
 - **Rebuild** — after publishing, `open` runs the retained, locally-approved reconstruction actions (e.g. `pnpm install --frozen-lockfile`) at the final destination: exact command definitions are frozen in the snapshot manifest, approvals are recorded once and reused while they match, every attempt is journaled, and protected files are re-verified afterwards (a rebuild that damages preserved content fails loudly — files are never deleted). `--files-only` skips reconstruction; a failed rebuild exits 6 and is resumable (`ebb open --resume`).
 - **Reclaim** — the ordinary "I need space" entry point: plans, executes approved trims, and escalates to a full park only with its own explicit terminal confirmation when the target can't be met otherwise. Exit 8 is an honest shortfall report, never an invitation to weaken policy.
-- **Forget / verify** — deliberate, confirmed release of a pinned snapshot (with a last-recovery-copy guard for parked workspaces) and on-demand evidence re-checks.
+- **Forget / gc / verify** — deliberate, confirmed release of a pinned snapshot (last-recovery-copy guard); gc then asks the backend to physically reclaim unreferenced storage, gated on no active operations and verified to never remove retained snapshots; verify re-checks evidence on demand.
+- **Export** — a portable, independently-encrypted capsule (fresh restic repo inside a ZIP64 container): copy-verified, destination-resealed, and proven to open only with the newly generated passphrase. The source snapshot stays pinned.
+- **Catalog rebuild** — if `catalog.db` is lost, `ebb init --rebuild-catalog` rebuilds workspaces/snapshots from the vault itself (discovered workspaces come back UNBOUND and pinned — never guessed disposable).
 - **Safety architecture** — removal authority lives in one audited file (AST-enforced tripwire); the scanner verifies directory-handle identities during descent (junction-swap attack detected, not followed); recovery-path evidence is validated against the catalog's seal-time digests (a tampered vault cannot steer deletion — independently reviewed, PoC-backed); Git observation runs a hardened, non-executing recipe; no project code ever runs during inspection; vault passwords live in the OS credential store, never in logs or argv.
 
 ## Install / build
@@ -59,8 +64,9 @@ State lives in `os.UserConfigDir()/ebb` (Windows: `%AppData%\ebb`): `catalog.db`
 ## Known limitations (explicit, not hidden)
 
 - Opening a workspace whose preserved set contains **true symlinks** requires the Windows symlink privilege (Developer Mode / elevation) — junctions (the common case, e.g. pnpm-style `node_modules`) recreate unprivileged. A privilege-blocked open fails BEFORE publishing anything, with a precise typed error naming the blocked entries.
-- `gc`, `export`, `import` are not yet implemented.
+- `ebb import` (opening a capsule into a vault) is not yet implemented — capsules can be produced and independently verified, but recovery from one currently requires following the capsule's embedded repo manually.
 - Rebuild executes approved actions with your privileges — there is no sandbox (Foundation §9.5); the approval prompt shows the exact command, tool hash, inputs and outputs before anything runs.
+- Open security-review findings from the Wave G audit (lab/security-review/wave-G/FINDINGS.md): G1 (P2 — a re-capture with an edited Ebbfile can silently reuse a prior approval whose output set was narrower; the fix is scheduled as the next work item) and G2–G4 (P3 — forged-journal resume skip, no vault-overlap check on open destinations, cancel-in-crash-window stranding). All require the attacker to control your project's Ebbfile or catalog; none are remotely exploitable.
 - Hardlink relationships, NTFS alternate data streams, sparse flags and ACLs are captured as inventory facts but not restored (documented per-snapshot in the manifest's `not_promised` capabilities).
 - Linux: builds clean and the platform layer is implemented, but no native Linux test run has certified it; macOS is unsupported.
 - Full §11.4 readback uses one streaming `restic dump --archive tar` subprocess per tree (measured ~17x faster than the former per-file transport on a small fixture; see `docs/BENCHMARKS.md` for the baseline). Very large single files still dominate readback time by bytes.
