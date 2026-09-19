@@ -1,0 +1,567 @@
+// cmdImport implements `ebb import <capsule-file>` (Foundation §15.3,
+// §17.1): register a capsule's retained payload snapshot in a selected
+// destination vault WITHOUT publishing a working directory — the
+// mirror of `ebb export`. The transport is internal/capsule (deep
+// module: capsule.Import); this file owns vault resolution, capsule
+// passphrase sourcing, the duplicate-gate policy (the CLI's catalog
+// knowledge), the operation journal, and the snapshot/replica
+// registration.
+//
+// Passphrase sourcing (§13.1/§15.3: never argv, never logged, never in
+// the JSON envelope): the EBB_CAPSULE_PASSWORD environment variable
+// wins; else ONE prompt through the ReadLine seam when stdin is a
+// terminal (v1 has no hidden-input facility, so the typed line is
+// visible — accepted v1 behavior; the prompt says so implicitly by
+// being a plain line read); else a §5.5 blocked refusal naming the env
+// var and the terminal option. An empty passphrase refuses (capsule
+// itself re-validates).
+//
+// Journal honesty (§12): import has NO workspace yet when the command
+// starts — the logical ids live inside the encrypted capsule — and
+// catalog.BeginOperation requires an existing workspace row (FK).
+// The operation therefore begins LAZILY: capsule verification
+// (container check, headroom, extraction, unlock, seal cross-checks,
+// digest re-derivation) is read-only against durable state and needs
+// no journal; the journal opens at the COPYING boundary — the first
+// destination-vault mutation — under a CLI-MINTED local workspace id.
+// The capsule's internal workspace id names a workspace on the
+// PRODUCING machine; it is reported (capsule_workspace_id), never
+// adopted locally. One consequence, accepted deliberately: the
+// capsule-side operation id (naming the transport's working dir and
+// the destination seal receipt) and the journal operation id are
+// minted separately and differ; every receipt reader checks the id
+// embedded in its own seal directory (I13), and the journal never
+// names the receipt.
+//
+// Import NEVER implies forget, and never imports trust: the snapshot
+// registers pinned (I07) and imported action approvals stay empty even
+// when the source manifest claims they were approved elsewhere
+// (§13.3, §15.3).
+//
+// Exit contract: 0 registered (or already known — the idempotent
+// rerun); 2 bad arguments (unknown vault, missing/invalid capsule
+// file, unwired store seam); 3 blocked before mutation (no passphrase
+// source, same logical id claiming different content, destination
+// headroom, trim-kind capsule); 4 a verification check failed or the
+// copy could not be proven (the destination is rolled back and
+// List-verified by the transport); 7 wrong capsule passphrase or
+// destination vault unavailable; 130 cancelled.
+
+package cli
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"ebb/internal/capsule"
+	"ebb/internal/catalog"
+	"ebb/internal/domain"
+	"ebb/internal/lifecycle"
+	"ebb/internal/vault"
+)
+
+// EnvCapsulePassword is the environment source for the capsule's
+// recovery secret (the passphrase shown once at export time). It
+// mirrors vault.EnvPassword's role: automation supplies the secret
+// without argv exposure. The value never reaches logs or the JSON
+// envelope.
+const EnvCapsulePassword = "EBB_CAPSULE_PASSWORD"
+
+// Import blockers the CLI layer itself raises (Wave I; §5.5 codes).
+const (
+	// CodeImportPassphrase: no capsule passphrase source is available.
+	CodeImportPassphrase = "EBB_E_CAPSULE_PASSPHRASE"
+	// CodeImportIDConflict: the capsule's logical snapshot id is
+	// already registered with a DIFFERENT manifest digest.
+	CodeImportIDConflict = "EBB_E_IMPORT_ID_CONFLICT"
+)
+
+// importDetails is the --json payload of an import (success, dry-run
+// or already-known). The capsule passphrase is NEVER a field.
+type importDetails struct {
+	CapsulePath string `json:"capsule_path"`
+	Vault       string `json:"vault"`
+	VaultID     string `json:"vault_id,omitempty"` // registry id (not the catalog row id)
+	RepoDir     string `json:"repo_dir,omitempty"`
+	DryRun      bool   `json:"dry_run"`
+
+	// Public/declared facts (present in dry-run too).
+	ContainerVersion  int      `json:"container_version,omitempty"`
+	BackendFamily     string   `json:"backend_family,omitempty"`
+	Producer          string   `json:"producer,omitempty"`
+	MinReaderFeatures []string `json:"min_reader_features,omitempty"`
+	RepoBytes         int64    `json:"repo_bytes,omitempty"`
+	RepoEntries       int64    `json:"repo_entries,omitempty"`
+	CapsuleBytes      int64    `json:"capsule_bytes,omitempty"`
+
+	// Dry-run headroom estimate against the destination volume.
+	FreeBytes     int64 `json:"free_bytes,omitempty"`
+	HeadroomKnown bool  `json:"headroom_known,omitempty"`
+
+	// Verified facts (from the capsule's own bytes).
+	Workspace   string `json:"workspace,omitempty"`    // manifest main-root prefix (D003)
+	WorkspaceID string `json:"workspace_id,omitempty"` // CLI-minted LOCAL workspace id
+	SnapshotID  string `json:"snapshot_id,omitempty"`  // LOGICAL snapshot id from the capsule
+	Kind        string `json:"kind,omitempty"`
+	CreatedAt   string `json:"created_at,omitempty"`
+	// CapsuleWorkspaceID is the capsule-internal workspace id (the
+	// PRODUCER machine's identity); reported for traceability only.
+	CapsuleWorkspaceID string `json:"capsule_workspace_id,omitempty"`
+
+	AlreadyKnown     bool   `json:"already_known,omitempty"`
+	ManifestDigest   string `json:"manifest_digest,omitempty"`
+	InventoryDigest  string `json:"inventory_digest,omitempty"`
+	PreservedBytes   int64  `json:"preserved_bytes,omitempty"`
+	PreservedEntries int64  `json:"preserved_entries,omitempty"`
+
+	// Destination identities (empty on dry-run and already-known — the
+	// vault was not touched).
+	VaultRowID           string   `json:"vault_row_id,omitempty"` // catalog vault-row id the snapshot binds
+	DestinationPayloadID string   `json:"destination_payload_id,omitempty"`
+	DestinationSealID    string   `json:"destination_seal_id,omitempty"`
+	OperationID          string   `json:"operation_id,omitempty"`
+	Checks               []string `json:"checks,omitempty"`
+}
+
+func cmdImport(args []string, streams Streams, deps Deps) int {
+	fs := flag.NewFlagSet("import", flag.ContinueOnError)
+	fs.SetOutput(streams.Err)
+	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
+	vaultArg := fs.String("vault", "", "destination vault (name or id; default: the registry's default vault)")
+	dryRun := fs.Bool("dry-run", false,
+		"verify the container and print the public-metadata plan (declared totals, headroom) without extracting, unlocking or registering anything")
+	if err := fs.Parse(reorderFlags(args, "vault")); err != nil {
+		return ExitUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(streams.Err, "ebb import: takes exactly one capsule file (produced by `ebb export`)")
+		return ExitUsage
+	}
+	capsulePath := fs.Arg(0)
+	// The file argument is validated up front: a missing or non-regular
+	// file is an argument mistake (exit 2), decided before any
+	// passphrase sourcing or vault unlock.
+	if fi, err := os.Stat(capsulePath); err != nil {
+		fmt.Fprintf(streams.Err, "ebb import: capsule %s: %v\n", capsulePath, err)
+		return ExitUsage
+	} else if !fi.Mode().IsRegular() {
+		fmt.Fprintf(streams.Err, "ebb import: capsule %s is not a regular file\n", capsulePath)
+		return ExitUsage
+	}
+
+	env := newEnvelope("import", "error")
+	sess, err := openSession(deps)
+	if err != nil {
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err), err.Error())
+	}
+	defer sess.close()
+	ctx, stop := commandContext(deps)
+	defer stop()
+
+	var v *vault.Vault
+	if *vaultArg != "" {
+		v, err = sess.resolveVault(*vaultArg)
+	} else {
+		v, err = sess.defaultVault()
+	}
+	if err != nil {
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err), err.Error())
+	}
+
+	details := importDetails{
+		CapsulePath: capsulePath, Vault: v.Name, VaultID: v.ID,
+		RepoDir: v.RepoDir, DryRun: *dryRun,
+	}
+
+	if *dryRun {
+		// §15.3 "show that cost before extraction", public half only:
+		// structural container verification, declared totals, headroom
+		// estimate. No vault unlock, no extraction, no registration —
+		// the destination vault contributes only its volume.
+		info, ierr := capsule.ReadPublicInfo(capsulePath)
+		if ierr != nil {
+			return emitFailure(env, *jsonOut, streams, classifyExitCode(ierr),
+				fmt.Sprintf("import %s: %s", capsulePath, codedWithSafeAction(ierr)))
+		}
+		details.fillPublic(info)
+		details.FreeBytes, details.HeadroomKnown = importHeadroom(deps, v.RepoDir)
+		env.Outcome = "ok"
+		env.Conditions = []string{"dry-run", "container-verified", "unlock-happens-at-import"}
+		if details.HeadroomKnown && details.FreeBytes < 2*details.RepoBytes {
+			env.Warnings = append(env.Warnings, fmt.Sprintf(
+				"destination volume holds %s free, but v1 budgets approximately %s for this import (extraction plus the copy; the capsule declares %s of repository) — the real import will refuse unless space is freed or another vault is chosen",
+				HumanBytes(details.FreeBytes), HumanBytes(2*details.RepoBytes), HumanBytes(details.RepoBytes)))
+		}
+		env.Details = details
+		emit(env, *jsonOut, streams, renderImportHuman(details))
+		return ExitOK
+	}
+
+	cErr := sess.withVaultPassfileOf(ctx, v, func(repoDir, passfile string) error {
+		capStore, ok := sess.store.(capsule.Store)
+		if !ok {
+			return usageError(fmt.Errorf("import: the snapshot store does not support cross-repository copy %w", ErrNotIntegrated))
+		}
+		passphrase, perr := capsulePassphrase(deps, streams)
+		if perr != nil {
+			return perr
+		}
+		destRepoID, rerr := sess.store.RepoID(ctx, repoDir, passfile)
+		if rerr != nil {
+			return fmt.Errorf("import: destination vault identity: %w", rerr)
+		}
+		return runImport(ctx, sess, capStore, repoDir, passfile, destRepoID, capsulePath, passphrase, streams, &details)
+	})
+	if cErr != nil {
+		code := classifyExitCode(cErr)
+		env.Details = details
+		if details.OperationID != "" {
+			env.OperationID = details.OperationID
+			env.SnapshotID = details.SnapshotID
+			env.WorkspaceID = details.WorkspaceID
+		}
+		return emitFailure(env, *jsonOut, streams, code,
+			fmt.Sprintf("import %s: %s", capsulePath, codedWithSafeAction(cErr)))
+	}
+
+	env.Outcome = "ok"
+	env.Details = details
+	env.SnapshotID = details.SnapshotID
+	env.WorkspaceID = details.WorkspaceID
+	if details.AlreadyKnown {
+		env.Conditions = []string{"already-known", "nothing-to-do"}
+		emit(env, *jsonOut, streams, renderImportHuman(details))
+		return ExitOK
+	}
+	env.OperationID = details.OperationID
+	env.Conditions = []string{"registered", "pinned-by-creation", "import-never-implies-forget"}
+	env.Warnings = append(env.Warnings,
+		"imported actions are UNTRUSTED: rebuild approvals start empty (§13.3)")
+	if details.PreservedBytes > 0 {
+		env.Bytes = &BytesSummary{Preserved: details.PreservedBytes}
+	}
+	emit(env, *jsonOut, streams, renderImportHuman(details))
+	return ExitOK
+}
+
+// runImport performs the real import inside the vault closure: the
+// duplicate-gate policy (capsule's Known callback), the lazy journal
+// (the copying-boundary Phase hook), the transport itself, and on
+// success the catalog registration — workspace row (renamed to the
+// manifest's name), vault row, pinned snapshot row, replica receipt,
+// DONE.
+func runImport(ctx context.Context, sess *session, capStore capsule.Store,
+	repoDir, passfile, destRepoID, capsulePath, passphrase string,
+	streams Streams, details *importDetails) error {
+
+	// The import's LOCAL workspace identity: minted here, registered at
+	// the copying boundary (the journal's FK) and at success (the
+	// snapshot row). The capsule's own workspace id stays report-only.
+	wsLocal := domain.WorkspaceID(domain.NewID())
+	// The capsule-side operation id names the transport's working dir
+	// and the destination seal receipt; the journal operation id is
+	// minted by catalog.BeginOperation at the copying boundary (see the
+	// file comment for why the two intentionally differ).
+	capsuleOpID := domain.OperationID(domain.NewID())
+
+	var (
+		opID  domain.OperationID
+		phase = catalog.PhaseImportPlanned // failClose tracks from here (export's pattern)
+	)
+	// beginJournal opens the workspace row and the operation and walks
+	// onto the import vocabulary. It runs at the copying boundary —
+	// after capsule verification, before the first destination-vault
+	// mutation. On a partial failure the caller's failClose closes
+	// whatever was opened (opID is set the moment BeginOperation
+	// succeeds).
+	beginJournal := func() error {
+		if err := sess.cat.UpsertWorkspace(catalog.Workspace{
+			ID:     wsLocal,
+			Name:   provisionalImportWorkspaceName(capsulePath),
+			Status: catalog.WorkspaceUnbound,
+		}); err != nil {
+			return fmt.Errorf("import: journal workspace: %w", err)
+		}
+		id, err := sess.cat.BeginOperation(wsLocal, catalog.OpKindImport, capsulePath, "", "")
+		if err != nil {
+			return fmt.Errorf("import: begin operation: %w", err)
+		}
+		opID = id
+		details.OperationID = string(opID)
+		details.WorkspaceID = string(wsLocal)
+		steps := [][2]string{
+			{catalog.PhasePlanned, catalog.PhaseImportPlanned},
+			{catalog.PhaseImportPlanned, catalog.PhaseImportCopying},
+		}
+		for _, s := range steps {
+			if err := sess.cat.AdvanceOperation(opID, s[0], s[1]); err != nil {
+				return fmt.Errorf("import: journal: %w", err)
+			}
+		}
+		phase = catalog.PhaseImportCopying
+		return nil
+	}
+	// failClose mirrors export's discipline: record the failure on the
+	// journal without a transition, then one CAS advance to CANCELED.
+	// A failure before the journal opened (pre-verification) has
+	// nothing to close.
+	failClose := func(failErr error) error {
+		if opID == "" {
+			return failErr
+		}
+		_ = sess.cat.FailOperation(opID, phase, failErr.Error())
+		if aerr := sess.cat.AdvanceOperation(opID, phase, catalog.PhaseCanceled); aerr != nil {
+			return fmt.Errorf("%w (additionally closing the import operation: %v)", failErr, aerr)
+		}
+		return failErr
+	}
+
+	res, ierr := capsule.Import(ctx, capsule.ImportParams{
+		Store:        capStore,
+		CapsulePath:  capsulePath,
+		Passphrase:   passphrase,
+		DestRepoDir:  repoDir,
+		DestPassfile: passfile,
+		DestRepoID:   destRepoID,
+		OperationID:  capsuleOpID,
+		EbbVersion:   Version,
+		Progress:     streams.Err,
+		FreeSpace:    nil, // production default (build-tagged stdlib probe)
+		// The duplicate gate is CLI-owned policy — the catalog is
+		// knowledge internal/capsule deliberately does not have:
+		// not-found proceeds; same id + same re-derived manifest digest
+		// is the idempotent rerun (AlreadyKnown, no vault mutation);
+		// same id + different digest refuses.
+		Known: func(snapshotID, manifestDigest string) (bool, error) {
+			snap, gerr := sess.cat.GetSnapshot(domain.SnapshotID(snapshotID))
+			if gerr != nil {
+				if errors.Is(gerr, catalog.ErrNotFound) {
+					return false, nil
+				}
+				return false, fmt.Errorf("import: reading the catalog for snapshot %s: %w", snapshotID, gerr)
+			}
+			if snap.ManifestDigest == manifestDigest {
+				return true, nil
+			}
+			return false, blockedError(fmt.Errorf(
+				"%s [import %s]: snapshot %s is already registered with manifest digest %s, but this capsule carries %s — the same logical id claims different content. Safe action: inspect the capsule (`ebb inspect %s`) and the registered snapshot (`ebb status`); refusing to overwrite",
+				CodeImportIDConflict, capsulePath, snapshotID, snap.ManifestDigest, manifestDigest, capsulePath))
+		},
+		Phase: func(step string) error {
+			switch step {
+			case capsule.PhaseExtracting:
+				// Pre-verification work (container check, headroom,
+				// extraction, unlock, evidence re-derivation): read-only
+				// against durable state — the journal opens at the
+				// copying boundary below (see the file comment).
+				return nil
+			case capsule.PhaseCopying:
+				return beginJournal()
+			case capsule.PhaseVerifying:
+				if opID == "" {
+					return errors.New("import: journal: verifying step without an open operation")
+				}
+				if err := sess.cat.AdvanceOperation(opID, catalog.PhaseImportCopying, catalog.PhaseImportVerifying); err != nil {
+					return fmt.Errorf("import: journal: %w", err)
+				}
+				phase = catalog.PhaseImportVerifying
+			}
+			return nil
+		},
+	})
+	if ierr != nil {
+		return failClose(fmt.Errorf("import %s: %w", capsulePath, ierr))
+	}
+	details.fillResult(res)
+
+	if res.AlreadyKnown {
+		// The gate recognized the logical snapshot with the same
+		// manifest digest: the destination vault was not touched, no
+		// rows were written (the journal never opened) — exit 0.
+		return nil
+	}
+
+	// Registration order (FKs): rename the workspace to the manifest's
+	// name (the boundary row carried the capsule file's name), ensure
+	// the catalog's vault row (the same derivation capture uses), then
+	// the pinned snapshot row, the replica receipt, and DONE.
+	if err := sess.cat.UpsertWorkspace(catalog.Workspace{
+		ID: wsLocal, Name: res.WorkspaceName, Status: catalog.WorkspaceUnbound,
+	}); err != nil {
+		return failClose(fmt.Errorf("import: register workspace: %w", err))
+	}
+	vaultRowID := lifecycle.VaultIDFor(destRepoID, repoDir)
+	details.VaultRowID = string(vaultRowID)
+	if err := sess.cat.RegisterVault(catalog.Vault{
+		ID: vaultRowID, Path: repoDir, RepoID: destRepoID,
+	}); err != nil {
+		return failClose(fmt.Errorf("import: register vault row: %w", err))
+	}
+	if err := sess.cat.ImportDiscoveredSnapshot(wsLocal, res.WorkspaceName, catalog.Snapshot{
+		ID:               res.LogicalSnapshotID,
+		WorkspaceID:      wsLocal,
+		CreatedAt:        res.CreatedAt,
+		PayloadBackendID: res.DestinationPayload,
+		SealBackendID:    res.DestinationSeal,
+		VaultID:          vaultRowID,
+		ManifestDigest:   res.ManifestDigest,
+		InventoryDigest:  res.InventoryDigest,
+		Kind:             res.Kind,
+		Pinned:           true, // recorded pinned by construction (I07)
+	}); err != nil {
+		return failClose(fmt.Errorf("import: register snapshot %s: %w", res.LogicalSnapshotID, err))
+	}
+	if _, rerr := sess.cat.RecordReplica(catalog.Replica{
+		SnapshotID: res.LogicalSnapshotID,
+		VerifiedAt: domain.FormatTime(time.Now().UTC()),
+		Scope:      "capsule-import:" + strings.Join(res.Checks, "+") + "+local-seal-readback",
+		Path:       capsulePath,
+	}); rerr != nil {
+		return failClose(fmt.Errorf("import: record replica: %w", rerr))
+	}
+	if aerr := sess.cat.AdvanceOperation(opID, catalog.PhaseImportVerifying, catalog.PhaseDone); aerr != nil {
+		return failClose(fmt.Errorf("import: close operation DONE: %w", aerr))
+	}
+	return nil
+}
+
+// capsulePassphrase sources the capsule's recovery secret (§13.1):
+// the environment wins; else one prompt through the ReadLine seam
+// when stdin is a terminal (v1 has no hidden-input facility — the
+// line echoes while typed; accepted v1 behavior); else a §5.5 refusal
+// naming both options. The value is returned to the caller only.
+func capsulePassphrase(deps Deps, streams Streams) (string, error) {
+	if pw := os.Getenv(EnvCapsulePassword); pw != "" {
+		return pw, nil
+	}
+	if deps.StdinIsTerminal != nil && deps.StdinIsTerminal() && deps.ReadLine != nil {
+		fmt.Fprint(streams.Err, "capsule passphrase: ")
+		line, err := deps.ReadLine()
+		if err != nil {
+			return "", blockedError(fmt.Errorf(
+				"%s: the capsule passphrase could not be read: %v. Safe action: set %s and rerun `ebb import`",
+				CodeImportPassphrase, err, EnvCapsulePassword))
+		}
+		pw := strings.TrimSpace(line)
+		if pw == "" {
+			return "", blockedError(fmt.Errorf(
+				"%s: an empty passphrase cannot unlock a capsule. Safe action: supply the passphrase shown at export time (set %s, or run in a terminal and enter it)",
+				CodeImportPassphrase, EnvCapsulePassword))
+		}
+		return pw, nil
+	}
+	return "", blockedError(fmt.Errorf(
+		"%s: importing a capsule requires its recovery passphrase, and no source is available (stdin is not a terminal and %s is unset). Safe action: set %s to the passphrase shown at export time, or run `ebb import` in a terminal to be prompted once",
+		CodeImportPassphrase, EnvCapsulePassword, EnvCapsulePassword))
+}
+
+// provisionalImportWorkspaceName labels the workspace row opened at
+// the copying boundary, before the capsule's manifest has been able
+// to name it (the verified name arrives with the import result). The
+// row is renamed to the manifest's main-root prefix on success.
+func provisionalImportWorkspaceName(capsulePath string) string {
+	return filepath.Base(capsulePath)
+}
+
+// importHeadroom estimates free bytes on the destination volume for
+// the dry-run plan (the real import re-measures inside its preflight).
+// known=false when no probe seam is wired or the probe fails — the
+// plan then reports the headroom as unknown instead of guessing.
+func importHeadroom(deps Deps, repoDir string) (free int64, known bool) {
+	if deps.NewProbe == nil {
+		return 0, false
+	}
+	vu, err := deps.NewProbe().VolumeUsage(repoDir)
+	if err != nil || vu.FreeToCaller < 0 {
+		return 0, false
+	}
+	return vu.FreeToCaller, true
+}
+
+// fillPublic copies the capsule's public metadata into the details.
+func (d *importDetails) fillPublic(info capsule.PublicInfo) {
+	d.ContainerVersion = info.ContainerVersion
+	d.BackendFamily = info.BackendFamily
+	d.Producer = info.Producer
+	d.MinReaderFeatures = info.MinReaderFeatures
+	d.RepoBytes = info.RepoBytes
+	d.RepoEntries = info.RepoEntries
+	d.CapsuleBytes = info.CapsuleBytes
+}
+
+// fillResult copies the transport's verified facts into the details.
+// The passphrase never appears — capsule.ImportResult does not carry
+// it and never will.
+func (d *importDetails) fillResult(res capsule.ImportResult) {
+	d.SnapshotID = string(res.LogicalSnapshotID)
+	d.Workspace = res.WorkspaceName
+	d.CapsuleWorkspaceID = string(res.WorkspaceID)
+	d.Kind = res.Kind
+	d.CreatedAt = res.CreatedAt
+	d.AlreadyKnown = res.AlreadyKnown
+	d.ManifestDigest = res.ManifestDigest
+	d.InventoryDigest = res.InventoryDigest
+	d.PreservedBytes = res.PreservedBytes
+	d.PreservedEntries = res.PreservedEntries
+	if res.RepoBytes > 0 {
+		d.RepoBytes = res.RepoBytes
+	}
+	if res.DestinationPayload != "" {
+		d.DestinationPayloadID = res.DestinationPayload
+	}
+	if res.DestinationSeal != "" {
+		d.DestinationSealID = res.DestinationSeal
+	}
+	if len(res.Checks) > 0 {
+		d.Checks = res.Checks
+	}
+}
+
+// renderImportHuman renders the import report (dry-run, already-known
+// or full success). The §13.3 trust warning is part of every
+// successful registration report.
+func renderImportHuman(d importDetails) string {
+	var b strings.Builder
+	line := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
+	if d.DryRun {
+		line("import dry-run for capsule %s into vault %q (%s)\n", d.CapsulePath, d.Vault, d.RepoDir)
+		line("  container verified structurally: version %d, backend %s, producer %s\n",
+			d.ContainerVersion, d.BackendFamily, d.Producer)
+		line("  declared repository: %s across %d entries; capsule file %s\n",
+			HumanBytes(d.RepoBytes), d.RepoEntries, HumanBytes(d.CapsuleBytes))
+		if d.HeadroomKnown {
+			line("  headroom: %s free on the destination volume (v1 budgets ~%s: the extraction plus the copy into the vault)\n",
+				HumanBytes(d.FreeBytes), HumanBytes(2*d.RepoBytes))
+		} else {
+			line("  headroom: unknown (the destination volume could not be probed)\n")
+		}
+		line("  unlock happens at import (%s or a terminal prompt); nothing was extracted, unlocked or registered\n",
+			EnvCapsulePassword)
+		return b.String()
+	}
+	if d.AlreadyKnown {
+		line("import %s: snapshot %s is already registered with manifest digest %s; nothing to do\n",
+			d.CapsulePath, d.SnapshotID, d.ManifestDigest)
+		line("  the destination vault was not touched; no new rows were written\n")
+		return b.String()
+	}
+	line("imported snapshot %s of workspace %q into vault %q\n", d.SnapshotID, d.Workspace, d.Vault)
+	line("  capsule: %s (declared repository %s across %d entries)\n",
+		d.CapsulePath, HumanBytes(d.RepoBytes), d.RepoEntries)
+	line("  workspace %q [%s] created %s — registered UNBOUND (no working directory was published)\n",
+		d.Workspace, d.Kind, d.CreatedAt)
+	line("  preserved: %s across %d entries\n", HumanBytes(d.PreservedBytes), d.PreservedEntries)
+	line("  destination payload %s\n    local seal %s (new destination seal, F43)\n",
+		d.DestinationPayloadID, d.DestinationSealID)
+	line("  digests: manifest %s / inventory %s\n", d.ManifestDigest, d.InventoryDigest)
+	line("  checks: %s\n", strings.Join(d.Checks, ", "))
+	line("  stays pinned; import never implies forget\n")
+	line("  imported actions are UNTRUSTED: rebuild approvals start empty (§13.3)\n")
+	return b.String()
+}

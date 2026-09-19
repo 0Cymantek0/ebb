@@ -154,6 +154,32 @@ func classifyExitCode(err error) int {
 	if errors.As(err, &partial) {
 		return ExitBlocked
 	}
+	// Capsule import (Wave I, §15.3): the wrong capsule passphrase is
+	// an auth failure (7); a file that is not a usable capsule is an
+	// argument mistake (2 — the file argument is wrong, not the
+	// system); headroom and trim-kind refusals are blocks (3, nothing
+	// extracted); an unprovable copy is an integrity failure (4, the
+	// destination was rolled back and List-verified by the transport).
+	var capsUnlock *capsule.ErrCapsuleUnlock
+	if errors.As(err, &capsUnlock) {
+		return ExitVault
+	}
+	var notCapsule *capsule.ErrNotACapsule
+	if errors.As(err, &notCapsule) {
+		return ExitUsage
+	}
+	var importSpace *capsule.ErrImportSpace
+	if errors.As(err, &importSpace) {
+		return ExitBlocked
+	}
+	var trimCapsule *capsule.ErrTrimCapsule
+	if errors.As(err, &trimCapsule) {
+		return ExitBlocked
+	}
+	var copyIntegrity *capsule.ErrCopyIntegrity
+	if errors.As(err, &copyIntegrity) {
+		return ExitCaptureVerify
+	}
 	// Interrupted/partial operations that require reconciliation.
 	var removalBlocked *lifecycle.ErrRemovalBlocked
 	if errors.As(err, &removalBlocked) {
@@ -329,6 +355,18 @@ func safeActionFor(err error) string {
 	var partial *capsule.ErrPartialExists
 	if errors.As(err, &partial) {
 		return ". Safe action: inspect the partial (its ebb-export.json names the operation that left it), delete it explicitly, then rerun the export"
+	}
+	var capsUnlock *capsule.ErrCapsuleUnlock
+	if errors.As(err, &capsUnlock) {
+		return ". Safe action: nothing was imported; supply the capsule's recovery passphrase (shown once at export time) via EBB_CAPSULE_PASSWORD or a terminal prompt"
+	}
+	var notCapsule *capsule.ErrNotACapsule
+	if errors.As(err, &notCapsule) {
+		return ". Safe action: pass a capsule produced by `ebb export`; nothing was imported and the file was not modified"
+	}
+	var copyIntegrity *capsule.ErrCopyIntegrity
+	if errors.As(err, &copyIntegrity) {
+		return ". Safe action: everything this import created in the destination vault was forgotten and List-verified gone; inspect the vault (`ebb doctor`) and rerun the import"
 	}
 	if capsule.IsInvalidParams(err) {
 		return ". Safe action: fix the arguments (an existing output directory and a fresh --output path are required)"

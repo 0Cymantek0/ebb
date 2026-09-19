@@ -218,6 +218,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdVerify(args[1:], streams, deps)
 	case "export":
 		return cmdExport(args[1:], streams, deps)
+	case "import":
+		return cmdImport(args[1:], streams, deps)
 	case "status":
 		return cmdStatus(args[1:], streams, deps)
 	case "doctor":
@@ -293,6 +295,8 @@ commands:
   verify <snapshot-id>       refresh retained-snapshot evidence (coverage; --content adds full readback)
   export <snapshot-id> --output <file>
                              produce an independent encrypted capsule (the source stays pinned)
+  import <file>               register a capsule's snapshot into a vault without opening it
+                             (the snapshot stays pinned; imported approvals start empty)
   status [workspace]         show local recorded state (workspaces, snapshots, operations)
   doctor                     report supported capabilities and configuration problems
 
@@ -342,5 +346,12 @@ verify flags:
 export flags:
   --output <file>            capsule output path (required; never overwritten)
   --dry-run                  check eligibility and print the plan without creating anything
+
+import flags:
+  --vault <name>             destination vault (name or id; default: the registry's default vault)
+  --dry-run                  verify the container and print the public plan (declared totals,
+                            headroom) without extracting, unlocking or registering anything
+                            (the capsule passphrase comes from EBB_CAPSULE_PASSWORD or one
+                            terminal prompt; it is never taken from argv)
 `)
 }
