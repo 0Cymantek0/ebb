@@ -43,9 +43,9 @@ const (
 	checkSealReadback    = "destination-seal-readback-complete"
 
 	sealScope = "capsule-export"
-	// ProducerEbb mirrors lifecycle.ProducerEbbVersion (the capsule
-	// package cannot import internal/cli for the version constant; the
-	// CLI passes its own version via Params.EbbVersion when available).
+	// ProducerEbb is the capsule format's own producer stamp (scoped to
+	// the seal format, not the build version — the CLI passes the build
+	// version via Params.EbbVersion, sourced from internal/version).
 	ProducerEbb = "ebb capsule v1"
 )
 

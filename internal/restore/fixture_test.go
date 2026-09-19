@@ -40,6 +40,7 @@ type fixtureSpec struct {
 	kind            string   // catalog snapshot kind; default "park"
 	omitPayloadID   bool     // catalog row without a payload backend id
 	noSealID        bool     // catalog row without a seal backend id
+	legacyNoDigests bool     // catalog row recorded without seal-time digests (pre-D017 shape, constructed at creation — never by re-importing over a witnessed row)
 	receiptPayload  string   // override receipt.PayloadBackendID
 	extraReceiptFld bool     // inject an unknown field into the receipt JSON
 	extraInvLine    bool     // inject an unknown field into inventory line 1
@@ -244,10 +245,14 @@ func buildFixture(t *testing.T, spec fixtureSpec) *fixture {
 	if spec.noSealID {
 		sealRef = ""
 	}
+	manifestRef, inventoryRef := f.manifestDigest, f.inventoryDigest
+	if spec.legacyNoDigests {
+		manifestRef, inventoryRef = "", ""
+	}
 	if _, err := f.cat.RecordSnapshot(catalog.Snapshot{
 		ID: f.snapID, WorkspaceID: f.wsID,
 		PayloadBackendID: payloadRef, SealBackendID: sealRef,
-		ManifestDigest: f.manifestDigest, InventoryDigest: f.inventoryDigest,
+		ManifestDigest: manifestRef, InventoryDigest: inventoryRef,
 		Kind: f.snapshotKind(spec),
 	}); err != nil {
 		t.Fatalf("fixture snapshot row: %v", err)

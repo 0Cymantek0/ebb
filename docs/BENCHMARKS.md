@@ -36,7 +36,7 @@ be touched. No network is used.
 | OS | Windows 11 (10.0.26200), NTFS system volume, Git Bash shell |
 | CPU | Intel64 Family 6 Model 151 Stepping 2 (12 logical CPUs) |
 | Device class | SSD (assumed; no autodetection in v1) |
-| ebb | 0.1.0-dev (`lifecycle.ProducerEbbVersion`) |
+| ebb | 0.1.0-dev (build-version var, now `internal/version.Version`) |
 | Backend | restic 0.19.1 (windows/amd64, go1.26.4), local repository in scratch |
 | Go | go1.27.1 windows/amd64 |
 | Total harness runtime | 804.3 s (13 m 24 s) at default scale 1.0 |

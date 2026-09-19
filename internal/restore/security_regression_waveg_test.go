@@ -176,17 +176,10 @@ func TestSealDigestCrossCheckRefusesForgedPair(t *testing.T) {
 // seal-time digests cannot witness anything and must refuse (D017
 // posture — the same rule lifecycle applies to retained documents).
 func TestSealDigestCrossCheckRefusesLegacyRow(t *testing.T) {
-	f := buildFixture(t, fixtureSpec{})
-	// Wipe the row's digests (models a pre-D017 catalog): the discovery
-	// import path refreshes digests without touching the pin state.
-	if err := f.cat.ImportDiscoveredSnapshot(f.wsID, f.wsPrefix, catalog.Snapshot{
-		ID: f.snapID, WorkspaceID: f.wsID,
-		PayloadBackendID: f.payloadID, SealBackendID: f.sealID,
-		ManifestDigest: "", InventoryDigest: "",
-		Kind: catalog.SnapshotKindPark,
-	}); err != nil {
-		t.Fatalf("blank seal-time digests: %v", err)
-	}
+	// A pre-D017 catalog row (no seal-time digests) is CONSTRUCTED at
+	// creation via the fixture spec — the J4 witness-preserving merge
+	// rightly refuses to blank a witnessed row by re-importing over it.
+	f := buildFixture(t, fixtureSpec{legacyNoDigests: true})
 
 	dest := filepath.Join(f.parent, "restored")
 	_, oerr := f.open(context.Background(), newOpener(f), Options{Destination: dest, FilesOnly: true})
