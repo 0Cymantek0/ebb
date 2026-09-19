@@ -853,3 +853,83 @@ func TestWorkspaceUpsertRoundTrip(t *testing.T) {
 		t.Fatal("invalid operation kind accepted")
 	}
 }
+
+// TestEnsureWorkspaceNeverModifies — the capsule-import identity
+// adoption primitive (§16.1): EnsureWorkspace creates the row once
+// (UNBOUND, no root) and every later call is a NO-OP — a differing name
+// never renames, and a LIVE row's status is never clobbered (the exact
+// never-modify semantics ImportDiscoveredSnapshot's workspace insert
+// uses).
+func TestEnsureWorkspaceNeverModifies(t *testing.T) {
+	c := open(t)
+	id := domain.WorkspaceID(domain.NewID())
+
+	// Creates once.
+	if err := c.EnsureWorkspace(id, "capsule-ws"); err != nil {
+		t.Fatalf("EnsureWorkspace: %v", err)
+	}
+	got, err := c.GetWorkspace(id)
+	if err != nil {
+		t.Fatalf("GetWorkspace: %v", err)
+	}
+	if got.Name != "capsule-ws" || got.Status != WorkspaceUnbound || got.RootPath != "" || got.RootIdentity != "" {
+		t.Fatalf("ensured workspace fields: %+v", got)
+	}
+	if got.CreatedAt == "" {
+		t.Fatal("ensured workspace has no created_at")
+	}
+	first := got
+
+	// Second call with a DIFFERENT name no-ops entirely.
+	if err := c.EnsureWorkspace(id, "renamed-elsewhere"); err != nil {
+		t.Fatalf("second EnsureWorkspace: %v", err)
+	}
+	got, err = c.GetWorkspace(id)
+	if err != nil {
+		t.Fatalf("GetWorkspace after second call: %v", err)
+	}
+	if got != first {
+		t.Fatalf("second EnsureWorkspace modified the row: %+v (was %+v)", got, first)
+	}
+
+	// Never touches status: a LIVE row stays LIVE, name and root intact.
+	live := domain.WorkspaceID(domain.NewID())
+	if err := c.UpsertWorkspace(Workspace{
+		ID: live, Name: "declared", RootPath: `D:\ws`, Status: WorkspaceLive,
+	}); err != nil {
+		t.Fatalf("UpsertWorkspace: %v", err)
+	}
+	if err := c.EnsureWorkspace(live, "capsule-ws"); err != nil {
+		t.Fatalf("EnsureWorkspace over a live row: %v", err)
+	}
+	got, err = c.GetWorkspace(live)
+	if err != nil {
+		t.Fatalf("GetWorkspace live: %v", err)
+	}
+	if got.Status != WorkspaceLive || got.Name != "declared" || got.RootPath != `D:\ws` {
+		t.Fatalf("EnsureWorkspace clobbered a live row: %+v", got)
+	}
+
+	// Argument mistakes refuse.
+	if err := c.EnsureWorkspace("", "n"); err == nil {
+		t.Fatal("empty id accepted")
+	}
+	if err := c.EnsureWorkspace(domain.WorkspaceID(domain.NewID()), ""); err == nil {
+		t.Fatal("empty name accepted")
+	}
+
+	// Exactly one workspace row was created by this test's Ensure calls.
+	wss, err := c.ListWorkspaces()
+	if err != nil {
+		t.Fatalf("ListWorkspaces: %v", err)
+	}
+	var ensured int
+	for _, w := range wss {
+		if w.ID == id || w.ID == live {
+			ensured++
+		}
+	}
+	if ensured != 2 {
+		t.Fatalf("workspace rows for id/live = %d, want 2 (no duplicates)", ensured)
+	}
+}

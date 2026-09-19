@@ -44,6 +44,34 @@ func (c *Catalog) UpsertWorkspace(w Workspace) error {
 	})
 }
 
+// EnsureWorkspace inserts the workspace row when the id does not exist —
+// status UNBOUND, created_at now, no root — and does NOTHING when it
+// already does: the exact never-modify semantics ImportDiscoveredSnapshot's
+// workspace insert uses (a LIVE/UNBOUND existing row is never clobbered,
+// and an existing row's name is never changed by this call, even when
+// name differs). It is the capsule-import path's identity-adoption
+// primitive (Foundation §16.1 identity continuity): the capsule's logical
+// workspace id is ADOPTED locally, and adopting must never disturb a row
+// another registration already owns. Contrast UpsertWorkspace, the
+// deliberate rebind for locally-declared workspaces.
+func (c *Catalog) EnsureWorkspace(id domain.WorkspaceID, name string) error {
+	if id == "" {
+		return errors.New("catalog: workspace id required")
+	}
+	if name == "" {
+		return errors.New("catalog: workspace name required")
+	}
+	return withTx(c.db, func(tx *sql.Tx) error {
+		const q = `INSERT INTO workspaces (id, name, created_at, root_path, root_identity, status)
+			VALUES (?, ?, ?, NULL, NULL, ?)
+			ON CONFLICT(id) DO NOTHING`
+		if _, err := tx.Exec(q, string(id), name, domain.FormatTime(time.Now()), WorkspaceUnbound); err != nil {
+			return fmt.Errorf("catalog: ensure workspace %s: %w", id, err)
+		}
+		return nil
+	})
+}
+
 // ListWorkspaces returns every workspace row, ordered by name then id.
 // It is the catalog-side listing behind `ebb status` and the CLI's
 // workspace-name resolution for `ebb open <name>` (names are labels, not

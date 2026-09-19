@@ -27,6 +27,11 @@ package capsule
 //	  trust a claimed digest), refuse trim-kind payloads, and close the
 //	  replication loop (the payload's manifest identities must equal the
 //	  seal's source claims)
+//	→ identity hook (params.Identified): invoked ONCE here — capsule
+//	  verification done, trim gate passed, replication loop closed, no
+//	  gate or mutation run yet. The CLI adopts the capsule's LOGICAL
+//	  workspace id here (its EnsureWorkspace); an error aborts with
+//	  nothing mutated
 //	→ duplicate gate (params.Known — the CLI's catalog knowledge):
 //	  already-known manifests return WITHOUT any vault mutation
 //	→ copy the payload through the backend into the destination vault,
@@ -39,7 +44,18 @@ package capsule
 //	  §16.4 receiptDoc wire form, re-declared here as a local strict
 //	  writer (the cross-package frozen-format contract restore uses as
 //	  a reader; pinned by a golden test against lifecycle's own writer)
-//	  — then read it back byte-exact
+//	  — then read it back byte-exact. The seal records the CAPTURE's
+//	  operation id (derived from the payload's frozen op dir) in its
+//	  staging-dir name, its operation_id field and its ebb-op tag, NOT
+//	  the import's own transport op id: every lifecycle-shaped receipt
+//	  consumer (restore's loadSeal→loadDocuments, discovery's
+//	  requireOpDir) re-derives the payload's frozen .ebb-op-<32hex> dir
+//	  from the RECEIPT's operation_id, so the I13 dir==receipt rule
+//	  holds for the imported pair exactly as for a native capture, and
+//	  the pair loads under loadSeal/loadDocuments/DiscoverVault
+//	  unchanged. Provenance of the import itself stays in
+//	  Verification.Scope ("capsule-import"), ToolVersions and the
+//	  caller's journal (the import operation id).
 //	→ on any failure at or after the copy, best-effort Forget of what
 //	  this import created in the destination vault, List-verified gone
 //	  (D015: forget of a nonexistent id exits 0 silently — verify by
@@ -105,8 +121,13 @@ type ImportParams struct {
 	// identity (required; the caller resolves it once through
 	// Store.RepoID — the same contract as export's SourceRepoID).
 	DestRepoID string
-	// OperationID journals this import (also recorded in the new local
-	// seal receipt and its staging dir name).
+	// OperationID journals this import: it names the transport's owned
+	// working directory (.ebb-import-<opID>). It is deliberately NOT the
+	// id the new local seal records — the seal carries the CAPTURE's
+	// operation id so the imported pair behaves exactly like a native
+	// capture under every lifecycle-shaped receipt consumer (see
+	// writeImportSeal); the import's own identity stays in
+	// Verification.Scope, ToolVersions and the caller's journal.
 	OperationID domain.OperationID
 	// Phase is an optional journal hook invoked at each step boundary.
 	Phase func(step string) error
@@ -122,13 +143,42 @@ type ImportParams struct {
 	// statfs — see freespace_*.go). Injectable for tests and unusual
 	// mounts.
 	FreeSpace func(path string) (int64, error)
+	// Identified is an optional hook invoked ONCE after capsule
+	// verification and the trim gate — the replication loop is closed,
+	// the payload's logical identities are settled — and BEFORE the
+	// Known duplicate gate and any destination-vault mutation. The CLI
+	// uses it to adopt the capsule's LOGICAL workspace id (identity
+	// continuity, §16.1: multiple snapshots of one producer workspace
+	// must group under ONE workspace) by ensuring the workspace row
+	// exists while nothing has been mutated yet; an error aborts the
+	// import with zero vault mutations.
+	Identified func(id ImportIdentity) error
 	// Known is the CLI-owned duplicate gate: invoked after capsule
-	// verification, before ANY destination-vault mutation. Return
-	// (true, nil) when the logical snapshot is already registered with
-	// THIS manifest digest → the import returns AlreadyKnown without
-	// touching the vault; return an error to refuse (e.g. same id,
-	// different digest); (false, nil) proceeds.
+	// verification (and after Identified), before ANY destination-vault
+	// mutation. Return (true, nil) when the logical snapshot is already
+	// registered with THIS manifest digest → the import returns
+	// AlreadyKnown without touching the vault; return an error to
+	// refuse (e.g. same id, different digest); (false, nil) proceeds.
 	Known func(snapshotID, manifestDigest string) (bool, error)
+}
+
+// ImportIdentity is the verified logical identity of the payload a
+// capsule carries, reported to ImportParams.Identified after capsule
+// verification (every field re-derived from the payload's own bytes and
+// cross-checked against the capsule seal) and before any gate or
+// mutation.
+type ImportIdentity struct {
+	// SnapshotID / WorkspaceID are the manifest's logical identities —
+	// the workspace id is the one the CLI ADOPTS locally.
+	SnapshotID  string
+	WorkspaceID string
+	// WorkspaceName is the manifest main-root backend prefix (D003).
+	WorkspaceName string
+	// Kind is park|snapshot (trim was refused before the hook fires).
+	Kind string
+	// ManifestDigest is the re-derived manifest digest (equal to the
+	// capsule seal's claim).
+	ManifestDigest string
 }
 
 // ImportResult reports one completed (or already-known) import.
@@ -337,6 +387,19 @@ func importUnlocked(ctx context.Context, params *ImportParams, workDir, extracte
 	res.InventoryDigest = ev.Manifest.InventoryDigest
 	res.PreservedEntries = ev.PreservedEntries
 	res.PreservedBytes = ev.PreservedBytes
+
+	// ---- identity hook: before every gate, before any mutation -------
+	if params.Identified != nil {
+		if ierr := params.Identified(ImportIdentity{
+			SnapshotID:     string(ev.SnapshotID),
+			WorkspaceID:    string(ev.WorkspaceID),
+			WorkspaceName:  ev.WsPrefix,
+			Kind:           ev.Manifest.Kind,
+			ManifestDigest: ev.Manifest.ManifestDigest,
+		}); ierr != nil {
+			return fmt.Errorf("capsule: the identity hook refused the import (nothing was mutated): %w", ierr)
+		}
+	}
 
 	// ---- duplicate gate: nothing below this point runs when known ---
 	if params.Known != nil {
@@ -706,6 +769,9 @@ func asCapsuleEvidence(err error) error {
 const (
 	checkContainer = "container-verified"
 	importScope    = "capsule-import"
+	// opDirPrefix is the payload's frozen op-dir prefix (lifecycle's
+	// shape, D003): ".ebb-op-<32hex>".
+	opDirPrefix = ".ebb-op-"
 )
 
 // importReceiptDoc is lifecycle's §16.4 seal-receipt wire form
@@ -768,19 +834,46 @@ func marshalImportReceipt(d importReceiptDoc) ([]byte, error) {
 	return append(b, '\n'), nil
 }
 
+// captureOpID derives the CAPTURE's operation id from the payload's
+// frozen op dir name (".ebb-op-<32hex>", located by tree shape when the
+// evidence was loaded and bound to the manifest's own meta-root claim).
+// The local import seal must record THIS id — not the import's own
+// transport op id — because every lifecycle-shaped receipt consumer
+// (restore's loadSeal→loadDocuments, discovery's requireOpDir)
+// re-derives the payload's frozen op dir from the RECEIPT's operation_id
+// field: with the capture's id in the seal dir name, the receipt's
+// operation_id and the ebb-op tag, the I13 dir==receipt rule holds for
+// the imported pair exactly as for a native capture.
+func captureOpID(ev restore.Evidence) (domain.OperationID, error) {
+	id, ok := strings.CutPrefix(ev.OpDirName, opDirPrefix)
+	if !ok || !isHex32(id) {
+		return "", &ErrVerification{Check: "capsule-documents", Details: []string{
+			fmt.Sprintf("the payload's frozen op dir %q is not %s<32hex>; the local seal cannot record the capture's operation id",
+				ev.OpDirName, opDirPrefix)}}
+	}
+	return domain.OperationID(id), nil
+}
+
 // writeImportSeal stages the receipt under the owned working dir,
 // captures it as a small snapshot in the DESTINATION vault
 // (cwd-relative, the D003 shape writeDestinationSeal uses) and reads
-// it back byte-exact. The returned id is non-empty whenever the seal
-// SNAPSHOT exists — including the readback-failure returns — so the
-// caller's rollback can forget it.
+// it back byte-exact. The seal carries the CAPTURE's operation id (see
+// captureOpID) in its staging-dir name, its operation_id field and its
+// ebb-op tag — the import's own operation id names only the transport
+// working dir. The returned id is non-empty whenever the seal SNAPSHOT
+// exists — including the readback-failure returns — so the caller's
+// rollback can forget it.
 func writeImportSeal(ctx context.Context, params *ImportParams, workDir string, ev restore.Evidence, dstPayloadID string) (string, error) {
-	sealDir := filepath.Join(workDir, sealDirPrefix+string(params.OperationID))
+	capOpID, err := captureOpID(ev)
+	if err != nil {
+		return "", err
+	}
+	sealDir := filepath.Join(workDir, sealDirPrefix+string(capOpID))
 	if err := os.MkdirAll(sealDir, 0o700); err != nil {
 		return "", fmt.Errorf("capsule: seal staging dir: %w", err)
 	}
 	receipt := buildImportReceipt(ev, params.DestRepoID, dstPayloadID,
-		string(params.OperationID), params.now(),
+		string(capOpID), params.now(),
 		[]string{checkCoverage, checkPayloadReadback, checkSealReadback, checkContainer}, params.EbbVersion)
 	sealBytes, err := marshalImportReceipt(receipt)
 	if err != nil {
@@ -791,7 +884,7 @@ func writeImportSeal(ctx context.Context, params *ImportParams, workDir string, 
 	}
 	ref, err := params.Store.Snapshot(ctx, params.DestRepoDir, filepath.Dir(sealDir),
 		[]string{filepath.Base(sealDir)}, params.DestPassfile, map[string]string{
-			"ebb-op":   string(params.OperationID),
+			"ebb-op":   string(capOpID),
 			"ebb-kind": "seal",
 			"ws":       string(ev.WorkspaceID),
 		})

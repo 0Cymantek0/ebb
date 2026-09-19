@@ -159,7 +159,10 @@ func TestImportHappyPath(t *testing.T) {
 			t.Errorf("destination payload tags = %v", tags)
 		}
 		tags := fx.store.snapTags(fx.dstRepoDir, res.DestinationSeal)
-		if tags["ebb-kind"] != "seal" || tags["ebb-op"] != string(fx.impOpID) || tags["ws"] != string(fx.wsID) {
+		// The seal carries the CAPTURE's operation id (the payload's
+		// frozen op dir id, fx.expOpID) — not the import's transport op
+		// id — so every lifecycle-shaped receipt consumer agrees.
+		if tags["ebb-kind"] != "seal" || tags["ebb-op"] != string(fx.expOpID) || tags["ws"] != string(fx.wsID) {
 			t.Errorf("destination seal tags = %v", tags)
 		}
 		for _, id := range seedIDs {
@@ -170,8 +173,9 @@ func TestImportHappyPath(t *testing.T) {
 	})
 
 	t.Run("local seal receipt wire form", func(t *testing.T) {
+		// The receipt lives under .ebb-seal-<CAPTURE op id> (fx.expOpID).
 		raw, err := fx.store.dumpFrom(fx.dstRepoDir, fx.dstPassfile, res.DestinationSeal,
-			"/"+sealDirPrefix+string(fx.impOpID)+"/"+sealDocName)
+			"/"+sealDirPrefix+string(fx.expOpID)+"/"+sealDocName)
 		if err != nil {
 			t.Fatalf("dump import receipt: %v", err)
 		}
@@ -186,7 +190,7 @@ func TestImportHappyPath(t *testing.T) {
 		assertJSONField(t, doc, "payload_backend_id", `"`+res.DestinationPayload+`"`)
 		assertJSONField(t, doc, "manifest_digest", `"`+fx.manifestDigest+`"`)
 		assertJSONField(t, doc, "inventory_digest", `"`+fx.inventoryDigest+`"`)
-		assertJSONField(t, doc, "operation_id", `"`+string(fx.impOpID)+`"`)
+		assertJSONField(t, doc, "operation_id", `"`+string(fx.expOpID)+`"`)
 		assertJSONField(t, doc, "retention", `"pinned"`)
 		if string(doc["required_features"]) != "[]" {
 			t.Errorf("required_features = %s, want []", doc["required_features"])
@@ -237,6 +241,151 @@ func keysOf(m map[string]json.RawMessage) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestImportPairLoadsThroughProductEvidencePath — the e2e lesson made
+// cheap: after a fake Import, the product's own verification path
+// (restore.LoadRetainedEvidence — `ebb verify`'s loader, including the
+// D017 catalog-row digest witness and the I13 op-dir re-derivation from
+// the RECEIPT's operation id) must accept the imported pair over a
+// hand-built catalog row built from the import result alone. This is
+// the default-suite reproducer for the seal op-id bug: when the local
+// seal recorded the IMPORT's op id, loadDocuments looked for the
+// payload's frozen documents under .ebb-op-<import op id> and the dump
+// refused.
+func TestImportPairLoadsThroughProductEvidencePath(t *testing.T) {
+	impOp := newImportOpID(t)
+	fx := buildImportFixture(t, impOp, capsuleSpec{})
+	res, err := fx.runImport(nil)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+
+	// The row exactly what the CLI registers after a real import.
+	row := catalog.Snapshot{
+		ID:               res.LogicalSnapshotID,
+		WorkspaceID:      res.WorkspaceID,
+		PayloadBackendID: res.DestinationPayload,
+		SealBackendID:    res.DestinationSeal,
+		ManifestDigest:   res.ManifestDigest,
+		InventoryDigest:  res.InventoryDigest,
+		Kind:             res.Kind,
+		CreatedAt:        res.CreatedAt,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ev, err := restore.LoadRetainedEvidence(ctx, fx.store,
+		restore.VaultRef{RepoDir: fx.dstRepoDir, Passfile: fx.dstPassfile},
+		res.LogicalSnapshotID, row)
+	if err != nil {
+		t.Fatalf("LoadRetainedEvidence over the imported pair (the ebb verify path): %v", err)
+	}
+	// The re-loaded evidence agrees with the capsule-side derivation on
+	// every fact both establish, and the receipt names the CAPTURE's op
+	// id (the payload's frozen op dir — fx.expOpID), never the import's.
+	if ev.Manifest.ManifestDigest != fx.manifestDigest || ev.Manifest.InventoryDigest != fx.inventoryDigest {
+		t.Errorf("re-loaded digests = %s/%s, want the fixture's %s/%s",
+			ev.Manifest.ManifestDigest, ev.Manifest.InventoryDigest, fx.manifestDigest, fx.inventoryDigest)
+	}
+	if ev.PreservedEntries != res.PreservedEntries || ev.PreservedBytes != res.PreservedBytes {
+		t.Errorf("re-loaded preserved = %d/%d, want the import's %d/%d",
+			ev.PreservedEntries, ev.PreservedBytes, res.PreservedEntries, res.PreservedBytes)
+	}
+	if ev.WsPrefix != fx.wsPrefix || ev.OpDirName != fx.opDir {
+		t.Errorf("re-loaded prefixes = %q/%q, want %q/%q", ev.WsPrefix, ev.OpDirName, fx.wsPrefix, fx.opDir)
+	}
+	if ev.Receipt.OperationID != string(fx.expOpID) {
+		t.Errorf("receipt operation_id = %q, want the CAPTURE's %q (the payload's frozen op dir id)",
+			ev.Receipt.OperationID, fx.expOpID)
+	}
+	if ev.Receipt.Scope != importScope {
+		t.Errorf("receipt scope = %q, want %q (the import's provenance)", ev.Receipt.Scope, importScope)
+	}
+}
+
+// TestImportIdentifiedHookContract — the identity-adoption hook fires
+// ONCE, after capsule verification and the trim gate, BEFORE the Known
+// duplicate gate and any destination-vault mutation, carrying the
+// payload's own logical identity; an error aborts with zero
+// destination-vault calls.
+func TestImportIdentifiedHookContract(t *testing.T) {
+	t.Run("fires once after verification, before Known, with verified identity", func(t *testing.T) {
+		impOp := newImportOpID(t)
+		fx := buildImportFixture(t, impOp, capsuleSpec{})
+		var calls []string // ordered hook trace: "identified" then "known"
+		res, err := fx.runImport(func(p *ImportParams) {
+			p.Identified = func(id ImportIdentity) error {
+				calls = append(calls, "identified")
+				if id.SnapshotID != string(fx.snapID) || id.WorkspaceID != string(fx.wsID) {
+					t.Errorf("Identified ids = %s/%s, want the manifest's %s/%s",
+						id.SnapshotID, id.WorkspaceID, fx.snapID, fx.wsID)
+				}
+				if id.WorkspaceName != fx.wsPrefix || id.Kind != catalog.SnapshotKindPark {
+					t.Errorf("Identified name/kind = %q/%q, want %q/%q",
+						id.WorkspaceName, id.Kind, fx.wsPrefix, catalog.SnapshotKindPark)
+				}
+				if id.ManifestDigest != fx.manifestDigest {
+					t.Errorf("Identified manifest digest = %s, want the re-derived %s", id.ManifestDigest, fx.manifestDigest)
+				}
+				return nil
+			}
+			p.Known = func(snapshotID, manifestDigest string) (bool, error) {
+				calls = append(calls, "known")
+				return false, nil
+			}
+		})
+		if err != nil {
+			t.Fatalf("Import: %v", err)
+		}
+		if res.AlreadyKnown {
+			t.Fatal("AlreadyKnown = true despite the Known gate's miss")
+		}
+		if strings.Join(calls, ",") != "identified,known" {
+			t.Errorf("hook order = %v, want identified before known", calls)
+		}
+	})
+
+	t.Run("already-known path fires Identified exactly once too", func(t *testing.T) {
+		impOp := newImportOpID(t)
+		fx := buildImportFixture(t, impOp, capsuleSpec{})
+		var identified, known int
+		_, err := fx.runImport(func(p *ImportParams) {
+			p.Identified = func(ImportIdentity) error { identified++; return nil }
+			p.Known = func(string, string) (bool, error) { known++; return true, nil }
+		})
+		if err != nil {
+			t.Fatalf("Import: %v", err)
+		}
+		if identified != 1 || known != 1 {
+			t.Errorf("identified/known calls = %d/%d, want 1/1", identified, known)
+		}
+	})
+
+	t.Run("error aborts with zero vault mutations", func(t *testing.T) {
+		impOp := newImportOpID(t)
+		fx := buildImportFixture(t, impOp, capsuleSpec{})
+		hookErr := errors.New("catalog: workspace row refused")
+		_, err := fx.runImport(func(p *ImportParams) {
+			p.Identified = func(ImportIdentity) error { return hookErr }
+			p.Known = func(string, string) (bool, error) {
+				t.Error("Known fired despite the Identified refusal")
+				return false, nil
+			}
+		})
+		if err == nil || !strings.Contains(err.Error(), "identity hook refused") {
+			t.Fatalf("err = %v, want the identity-hook refusal", err)
+		}
+		if !errors.Is(err, hookErr) {
+			t.Errorf("the hook's own error must surface wrapped, not swallowed: %v", err)
+		}
+		if calls := fx.store.callsOn(fx.dstRepoDir); len(calls) > 0 {
+			t.Errorf("destination vault was contacted: %v", calls)
+		}
+		if ids := fx.store.snapIDs(fx.dstRepoDir); len(ids) != 1 {
+			t.Errorf("destination holds %d snapshots after the refusal, want only the seed", len(ids))
+		}
+		assertNoImportScratch(t, fx)
+	})
 }
 
 // TestImportParamsValidation — caller mistakes refuse before anything is
@@ -562,14 +711,18 @@ func TestImportPostCopyReadbackFailureRollsBack(t *testing.T) {
 
 // TestImportSealReadbackMismatchRollsBack — a receipt that does not
 // read back byte-exact refuses, and BOTH artifacts the import created
-// (payload + seal snapshot) are forgotten List-verified.
+// (payload + seal snapshot) are forgotten List-verified. The tamper key
+// is the seal's tree path, whose dir embeds the CAPTURE's op id.
 func TestImportSealReadbackMismatchRollsBack(t *testing.T) {
 	impOp := newImportOpID(t)
 	fx := buildImportFixture(t, impOp, capsuleSpec{})
 	seedIDs := fx.store.snapIDs(fx.dstRepoDir)
-	fx.store.dumpTamper["/"+sealDirPrefix+string(impOp)+"/"+sealDocName] = func(b []byte) []byte {
-		return append([]byte("not the receipt: "), b...)
-	}
+	// The tamper is scoped to the DESTINATION repository: after the
+	// capture-op-id fix the local seal's tree path equals the capsule's
+	// embedded seal path (.ebb-seal-<capture op id>/receipt.json), so a
+	// repo-wide tamper would also corrupt the capsule-side seal read.
+	fx.store.tamperDumpIn(fx.dstRepoDir, "/"+sealDirPrefix+string(fx.expOpID)+"/"+sealDocName,
+		func(b []byte) []byte { return append([]byte("not the receipt: "), b...) })
 
 	_, err := fx.runImport(nil)
 	var ve *ErrVerification
