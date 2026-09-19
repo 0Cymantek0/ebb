@@ -111,9 +111,13 @@ func TestValidateEnvKeyCaseFoldDuplicate(t *testing.T) {
 }
 
 func TestValidateGraph(t *testing.T) {
+	// mk gives each definition its own output root (overlapping outputs
+	// across definitions are a graph-level rejection of their own — see
+	// the overlap subtests below).
 	mk := func(id string, deps ...string) actions.Definition {
 		d := validDef()
 		d.ID = id
+		d.Outputs = []string{"out-" + id}
 		d.DependsOn = deps
 		return d
 	}
@@ -163,6 +167,34 @@ func TestValidateGraph(t *testing.T) {
 		bad.Timeout = 0
 		if err := actions.ValidateGraph([]actions.Definition{mk("a"), bad}); err == nil {
 			t.Fatal("expected member validation error")
+		}
+	})
+	// G1 amplifier regression: two definitions in one graph whose
+	// declared outputs overlap (same path OR containment) race for the
+	// same tree and each silently widens the other's F36 exclusion —
+	// the reader-side twin of policy's capture-time output-conflict
+	// rule.
+	t.Run("cross-definition same output", func(t *testing.T) {
+		a, b := mk("a"), mk("b")
+		b.Outputs = []string{"out-a"}
+		err := actions.ValidateGraph([]actions.Definition{a, b})
+		if err == nil || !strings.Contains(err.Error(), `definitions "a" and "b" declare overlapping outputs ("out-a" and "out-a")`) {
+			t.Fatalf("expected cross-definition output-overlap error, got: %v", err)
+		}
+	})
+	t.Run("cross-definition nested output", func(t *testing.T) {
+		a, b := mk("a"), mk("b")
+		b.Outputs = []string{"out-a/dist"}
+		err := actions.ValidateGraph([]actions.Definition{a, b})
+		if err == nil || !strings.Contains(err.Error(), "declare overlapping outputs") {
+			t.Fatalf("expected containment overlap error, got: %v", err)
+		}
+	})
+	t.Run("disjoint outputs accepted", func(t *testing.T) {
+		a, b := mk("a"), mk("b")
+		b.Outputs = []string{"out-a-extra"} // adjacent spelling, NOT under out-a
+		if err := actions.ValidateGraph([]actions.Definition{a, b}); err != nil {
+			t.Fatalf("disjoint output roots must validate: %v", err)
 		}
 	})
 }

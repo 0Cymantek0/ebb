@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"ebb/internal/catalog"
+	"ebb/internal/pathcanon"
 )
 
 // ---- F6: bidirectional canonical preflight overlap (I06) ------------------
@@ -176,7 +177,8 @@ func TestPreflightCleanLayoutStillPasses(t *testing.T) {
 	}
 }
 
-// TestCanonicalPathCollapsesAliases: canonicalPath resolves junctions
+// TestCanonicalPathCollapsesAliases: pathcanon.CanonicalPath (the shared
+// canonicalizer behind preflight) resolves junctions
 // (and chains of them) to the final target path.
 func TestCanonicalPathCollapsesAliases(t *testing.T) {
 	if runtime.GOOS != "windows" {
@@ -196,14 +198,14 @@ func TestCanonicalPathCollapsesAliases(t *testing.T) {
 	if out, jerr := exec.Command("cmd", "/c", "mklink", "/J", link2, link).CombinedOutput(); jerr != nil {
 		t.Fatalf("mklink /J: %v\n%s", jerr, out)
 	}
-	want := canonicalPath(ws)
-	if got := canonicalPath(filepath.Join(link, "ws")); got != want {
+	want := pathcanon.CanonicalPath(ws)
+	if got := pathcanon.CanonicalPath(filepath.Join(link, "ws")); got != want {
 		t.Errorf("canonical(junction alias) = %q, want %q", got, want)
 	}
-	if got := canonicalPath(filepath.Join(link2, "ws")); got != want {
+	if got := pathcanon.CanonicalPath(filepath.Join(link2, "ws")); got != want {
 		t.Errorf("canonical(chained junction alias) = %q, want %q", got, want)
 	}
-	if got := canonicalPath(filepath.Join(base, "missing", "tail")); got != filepath.Join(canonicalPath(base), "missing", "tail") {
+	if got := pathcanon.CanonicalPath(filepath.Join(base, "missing", "tail")); got != filepath.Join(pathcanon.CanonicalPath(base), "missing", "tail") {
 		t.Errorf("missing path fell back to %q", got)
 	}
 }

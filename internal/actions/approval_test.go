@@ -36,8 +36,9 @@ func newBaseAction() baseAction {
 	return baseAction{def: def, tool: tool, digests: digests}
 }
 
-// approvalFor builds the approval that exactly covers b. The digest map
-// is deep-copied so later mutations of b cannot alias into the approval.
+// approvalFor builds the approval that exactly covers b (including the
+// §7.3 working root and output ownership). The digest map is deep-copied
+// so later mutations of b cannot alias into the approval.
 func approvalFor(b baseAction) *actions.Approval {
 	digests := make(map[string]string, len(b.digests))
 	for k, v := range b.digests {
@@ -47,6 +48,8 @@ func approvalFor(b baseAction) *actions.Approval {
 		ActionID:     b.def.ID,
 		ArgvDigest:   actions.ArgvDigest(b.def.Argv),
 		Tool:         b.tool,
+		WorkingRoot:  b.def.WorkingRoot,
+		Outputs:      actions.CanonicalOutputs(b.def.Outputs),
 		InputDigests: digests,
 		EnvAllow:     actions.CanonicalEnvAllow(b.def.EnvAllow),
 		Network:      b.def.Network,
@@ -89,6 +92,20 @@ func TestApprovalMatchesDriftMatrix(t *testing.T) {
 			name:     "tool sha",
 			mutate:   func(b *baseAction) { b.tool.SHA256 = strings64("ff") },
 			wantDiff: "tool sha256:",
+		},
+		{
+			// G1b regression: the working root is approval-authorized
+			// state (Foundation §7.3).
+			name:     "working root",
+			mutate:   func(b *baseAction) { b.def.WorkingRoot = "attacker-shipped-dir" },
+			wantDiff: `working root: approved "", current "attacker-shipped-dir"`,
+		},
+		{
+			// G1 regression: drifted Outputs widen the F36 exclusion set;
+			// the drift must surface as a stale approval.
+			name:     "outputs widened",
+			mutate:   func(b *baseAction) { b.def.Outputs = append(b.def.Outputs, "notes") },
+			wantDiff: `outputs: approved [node_modules], current [node_modules notes]`,
 		},
 		{
 			name:     "input digest",

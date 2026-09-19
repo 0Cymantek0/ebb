@@ -216,16 +216,30 @@ func TestPoCApprovalDriftOutputsBlindsF36Gate(t *testing.T) {
 		t.Fatal(err)
 	}
 	res2, oerr := o2.Open(ctx, f.vault, snap2, Options{Destination: dest2})
-	if oerr == nil && res2.Phase == catalog.PhaseDone && !prompted {
-		b, _ := os.ReadFile(filepath.Join(dest2, "sub", "b.txt"))
-		if string(b) == "PWNED\n" {
-			t.Fatalf("G1 CONFIRMED: the drifted definition (outputs widened to cover the preserved "+
-				"tree \"sub\") matched capture 1's recorded approval with NO re-prompt, ran, damaged the "+
-				"preserved file sub/b.txt (%q), and the F36 gate never flagged it because every drifted "+
-				"output root is excluded from protected verification — the rebuild completed DONE", b)
-		}
+	// Fixed build (fix holds): the drifted Outputs make capture 1's
+	// recorded approval STALE — the resolver is consulted (one
+	// re-prompt), the declined re-approval fails the open at
+	// REBUILD_FAILED, and the drifted action never executes.
+	if !prompted {
+		t.Fatalf("G1 REGRESSION: the drifted definition (outputs widened to cover the preserved "+
+			"tree \"sub\") matched capture 1's recorded approval with NO re-prompt — approval identity "+
+			"must pin output ownership (Foundation §7.3)")
 	}
-	// Fixed build: approval drift must re-prompt (prompted==true, open fails).
+	var rb *ErrRebuildFailed
+	if !errors.As(oerr, &rb) {
+		t.Fatalf("G1 REGRESSION: expected the drifted-approval open to fail with ErrRebuildFailed, got %v (phase %s)", oerr, res2.Phase)
+	}
+	if res2.Phase != catalog.PhaseRebuildFailed {
+		t.Fatalf("G1 REGRESSION: phase = %s, want REBUILD_FAILED", res2.Phase)
+	}
+	// The preserved tree was never touched by the drifted action.
+	b, rerr := os.ReadFile(filepath.Join(dest2, "sub", "b.txt"))
+	if rerr != nil || string(b) == "PWNED\n" {
+		t.Fatalf("G1 REGRESSION: the drifted action ran and damaged the preserved file sub/b.txt (%q, %v)", b, rerr)
+	}
+	if strings.Count(string(b), "beta-") != 64 {
+		t.Fatalf("G1 REGRESSION: preserved sub/b.txt content changed: %q", string(b)[:min(40, len(b))])
+	}
 }
 
 // TestPoCApprovalMatchesIgnoresWorkingRoot: unit-level — the pure

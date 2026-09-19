@@ -114,6 +114,12 @@ func classifyExitCode(err error) int {
 	if errors.As(err, &occupied) {
 		return ExitBlocked
 	}
+	var vaultOverlap *restore.ErrVaultOverlap
+	if errors.As(err, &vaultOverlap) {
+		// The open-side I06 twin (G3): the destination overlaps the vault
+		// through a direct or alias spelling; blocked before any staging.
+		return ExitBlocked
+	}
 	var space *restore.ErrInsufficientSpace
 	if errors.As(err, &space) {
 		return ExitBlocked
@@ -155,6 +161,12 @@ func classifyExitCode(err error) int {
 	}
 	var journalMismatch *lifecycle.ErrJournalMismatch
 	if errors.As(err, &journalMismatch) {
+		return ExitInterrupted
+	}
+	var cancelRefused *lifecycle.ErrCancelRefused
+	if errors.As(err, &cancelRefused) {
+		// --cancel was refused inside the quarantine-rename crash window
+		// (G4): the workspace is mid-rename and only Recover reconciles.
 		return ExitInterrupted
 	}
 	var publishBlocked *restore.ErrPublishBlocked
@@ -260,6 +272,14 @@ func safeActionFor(err error) string {
 	var occupied *restore.ErrDestinationOccupied
 	if errors.As(err, &occupied) {
 		return ". Safe action: choose a different --to destination or move the occupant aside; nothing was overwritten"
+	}
+	var vaultOverlap *restore.ErrVaultOverlap
+	if errors.As(err, &vaultOverlap) {
+		return ". Safe action: choose a destination outside the vault repository (and not containing it); nothing was staged"
+	}
+	var cancelRefused *lifecycle.ErrCancelRefused
+	if errors.As(err, &cancelRefused) {
+		return fmt.Sprintf(". Safe action: run `ebb recover %s` — it adopts-or-reports the quarantine tree by identity; the sibling was not touched", cancelRefused.OperationID)
 	}
 	var space *restore.ErrInsufficientSpace
 	if errors.As(err, &space) {

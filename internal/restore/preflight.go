@@ -15,10 +15,12 @@ import (
 
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
+	"ebb/internal/pathcanon"
 )
 
-// preflight validates the requested destination and the destination
-// volume's peak space. Accepted destination states:
+// preflight validates the requested destination, its separation from
+// the vault (I06, the open-side twin of lifecycle's capture preflight),
+// and the destination volume's peak space. Accepted destination states:
 //
 //   - absent (the normal case; publish renames onto the absent path);
 //   - an existing EMPTY directory (removed at publish time, only if
@@ -29,8 +31,10 @@ import (
 // the occupant — including files previously published by an Ebb open
 // operation, which must be reconciled, not overwritten), a missing
 // parent (restore never creates directory structure outside its own
-// staging), and insufficient free space vs the preserved file bytes.
-func (o *Opener) preflight(ctx context.Context, wsID domain.WorkspaceID, destOpt string, docs payloadDocs) (string, error) {
+// staging), any overlap with the vault repository or passfile in either
+// direction and through alias spellings, and insufficient free space vs
+// the preserved file bytes.
+func (o *Opener) preflight(ctx context.Context, wsID domain.WorkspaceID, vault VaultRef, destOpt string, docs payloadDocs) (string, error) {
 	if ctx.Err() != nil {
 		return "", ctx.Err()
 	}
@@ -40,6 +44,9 @@ func (o *Opener) preflight(ctx context.Context, wsID domain.WorkspaceID, destOpt
 	dest := filepath.Clean(destOpt)
 	if !filepath.IsAbs(dest) {
 		return "", &ErrInvalidOptions{Detail: fmt.Sprintf("destination %q must be an absolute path", destOpt)}
+	}
+	if err := checkVaultOverlap(dest, vault); err != nil {
+		return "", err
 	}
 	parent := filepath.Dir(dest)
 	if fi, err := os.Stat(parent); err != nil {
@@ -96,6 +103,41 @@ func (o *Opener) preflight(ctx context.Context, wsID domain.WorkspaceID, destOpt
 		return "", &ErrInsufficientSpace{Destination: dest, Free: usage.FreeToCaller, Needed: docs.preservedBytes}
 	}
 	return dest, nil
+}
+
+// checkVaultOverlap enforces the open-side half of I06 ("Root/vault/
+// operation paths cannot overlap through aliases unnoticed" — Wave G
+// review finding G3): the destination — and with it the
+// .ebb-stage-<opID> staging sibling, which shares the destination's
+// parent and therefore lies inside the vault exactly when the
+// destination does — must lie OUTSIDE the vault repository, must not
+// CONTAIN the vault repository (publishing over the backend's tree),
+// and must not contain the vault passfile. Comparisons run on
+// canonicalized paths through the same junction-aware canonicalizer
+// lifecycle's capture preflight uses (internal/pathcanon; symlink,
+// junction and 8.3/case alias spellings collapse), so restore and
+// capture can never disagree about what overlaps. The canonicalizer's
+// documented residual (subst drives and not-yet-existing paths stay
+// lexical) applies here exactly as it does on the capture side.
+func checkVaultOverlap(dest string, vault VaultRef) error {
+	destCanon := pathcanon.CanonicalPath(dest)
+	repoCanon := pathcanon.CanonicalPath(vault.RepoDir)
+	if destCanon == repoCanon {
+		return &ErrVaultOverlap{Destination: dest, VaultPath: vault.RepoDir, Detail: "the destination IS the vault repository"}
+	}
+	if pathcanon.UnderPath(repoCanon, destCanon) {
+		return &ErrVaultOverlap{Destination: dest, VaultPath: vault.RepoDir,
+			Detail: "the destination lies inside the repository, so the staging sibling, the published tree and the live backend state would interleave unnoticed"}
+	}
+	if pathcanon.UnderPath(destCanon, repoCanon) {
+		return &ErrVaultOverlap{Destination: dest, VaultPath: vault.RepoDir,
+			Detail: "the destination would contain the repository, so publishing would swallow the live backend"}
+	}
+	if pathcanon.UnderPath(destCanon, pathcanon.CanonicalPath(vault.Passfile)) {
+		return &ErrVaultOverlap{Destination: dest, VaultPath: vault.Passfile,
+			Detail: "the destination would contain the passfile holding the vault unlock secret"}
+	}
+	return nil
 }
 
 // publishedOpenAt reports the id and phase of the open operation that

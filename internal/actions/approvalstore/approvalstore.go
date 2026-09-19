@@ -16,6 +16,19 @@
 // UI/coordinator code; Matches only compares. An empty or missing
 // document approves nothing.
 //
+// Migration (Wave G review finding G1): the recorded approval identity
+// gained the working root and output ownership
+// (actions.Approval.WorkingRoot/Outputs, Foundation §7.3). Documents
+// written before those fields existed still parse (the new fields are
+// simply absent → empty), but their records compare STALE against every
+// definition — actions.ApprovalMatches treats missing output coverage
+// as drift, never as a silent match. There is no rewrite step: the
+// store is a rebuildable cache of trust decisions, and one honest
+// re-prompt per previously approved action is the entire migration cost.
+// (The document schema version stays 1: the on-disk shape only gained
+// optional fields, and old readers that re-approve rewrite the file
+// with the new fields populated.)
+//
 // Deletion authority: the only filesystem mutations here are the
 // temporary file and the rename that replaces this store's own document.
 // It never removes or renames anything else. The actions package proper
@@ -150,6 +163,8 @@ func (f *FileApprover) Approve(def actions.Definition, tool actions.ToolIdentity
 		ActionID:     def.ID,
 		ArgvDigest:   actions.ArgvDigest(def.Argv),
 		Tool:         tool,
+		WorkingRoot:  def.WorkingRoot,
+		Outputs:      actions.CanonicalOutputs(def.Outputs),
 		InputDigests: copyDigests(inputDigests),
 		EnvAllow:     actions.CanonicalEnvAllow(def.EnvAllow),
 		Network:      def.Network,

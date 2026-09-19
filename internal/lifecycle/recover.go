@@ -156,7 +156,10 @@ func (c *Coordinator) ResumeRemoval(ctx context.Context, vault VaultRef, opID do
 // It applies only to phases where Ebb removal never started (PLANNED,
 // CAPTURING, PAYLOAD_COMMITTED, SEALED, TRIM_PLANNED); a mid-removal
 // operation (QUARANTINED/REMOVING/REMOVAL_BLOCKED/TRIM_SEALING) must be
-// reconciled (Recover/ResumeRemoval), never abandoned mid-walk.
+// reconciled (Recover/ResumeRemoval), never abandoned mid-walk. A SEALED
+// operation whose deterministic quarantine sibling exists (the §12.2
+// step-7 rename crash window, ANY identity — G4) is likewise refused:
+// only Recover may reconcile that state.
 //
 // Cancel never releases recovery obligations (I07): a sealed P/S pair
 // stays pinned — deliberate release is `ebb forget`, never cancel.
@@ -191,16 +194,48 @@ func (c *Coordinator) CancelOperation(ctx context.Context, vault VaultRef, opID 
 // time and stays pinned untouched (no second, unsealed row is recorded
 // for it); the Ebb-owned local scratch (op/seal dirs, journal) is
 // cleaned because its content lives in the retained snapshots.
+//
+// G4 (Wave G review): the deterministic quarantine sibling is probed
+// FIRST, with the same construction recoverSealed uses. If it EXISTS —
+// regardless of identity, and it is never touched — the operation is in
+// (or past) the §12.2 step-7 rename crash window and canceling would
+// strand the user's entire tree at an opaque path with no durable
+// pointer while deleting the very scratch that names it. Refuse with
+// *ErrCancelRefused; `ebb recover <op>` is the reconciliation path (it
+// adopts-or-reports by native identity). Only when no sibling exists
+// may the cancel proceed — and the report then claims "live root
+// intact" only when the root is actually present.
 func (c *Coordinator) cancelSealed(op catalog.Operation, rep RecoveryReport) (RecoveryReport, error) {
+	parent := filepath.Dir(filepath.Clean(op.SourceRoot))
+	quar := quarantinePath(parent, op.ID)
+	if _, qerr := os.Lstat(quar); qerr == nil {
+		return rep, &ErrCancelRefused{OperationID: op.ID, Quarantine: quar}
+	} else if !os.IsNotExist(qerr) {
+		return rep, fmt.Errorf("lifecycle: cancel %s: probe quarantine sibling %s: %w", op.ID, quar, qerr)
+	}
+
 	if err := c.cat.AdvanceOperation(op.ID, catalog.PhaseSealed, catalog.PhaseCanceled); err != nil {
 		return rep, fmt.Errorf("lifecycle: cancel %s: %w", op.ID, err)
 	}
 	rep.PhaseAfter = catalog.PhaseCanceled
-	rep.Actions = append(rep.Actions, "canceled the sealed operation (live root intact; removal never started)")
+	if _, rerr := os.Lstat(op.SourceRoot); rerr == nil {
+		rep.Actions = append(rep.Actions, "canceled the sealed operation (live root intact; removal never started)")
+	} else if os.IsNotExist(rerr) {
+		// Honest report (the G4 blind spot): no quarantine sibling, no
+		// live root — the tree left this operation's tracked location by
+		// some other route and cancel must not claim otherwise.
+		rep.Actions = append(rep.Actions, fmt.Sprintf(
+			"canceled the sealed operation; the live root %s is ABSENT and no quarantine sibling exists — its content is no longer at the location this operation tracked (the retained P/S pair is the recovery copy)", op.SourceRoot))
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+			"live root %s not found at cancel time; nothing was renamed to the quarantine path by this operation", op.SourceRoot))
+	} else {
+		rep.Actions = append(rep.Actions, "canceled the sealed operation (removal never started; root presence could not be verified)")
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+			"live root %s could not be probed (%v); its presence was not verified", op.SourceRoot, rerr))
+	}
 	rep.Actions = append(rep.Actions, "retained P/S pair stays pinned (I07 — deliberate release is `ebb forget`, never cancel)")
 	rep.Remaining = append(rep.Remaining, fmt.Sprintf(
 		"sealed pair (payload %s) remains retained and pinned; end it deliberately with ebb forget when no longer needed", op.PayloadSnap))
-	parent := filepath.Dir(filepath.Clean(op.SourceRoot))
 	if err := removeEbbOwned(filepath.Join(parent, opDirName(op.ID))); err != nil {
 		rep.Warnings = append(rep.Warnings, fmt.Sprintf("cleanup op dir failed: %v", err))
 	}

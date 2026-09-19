@@ -91,7 +91,13 @@ func (o *Opener) runRebuild(ctx context.Context, opID domain.OperationID, dest s
 		return nil, o.rebuildFailed(opID, nil, "action definitions invalid", err)
 	}
 
-	// Resume: never auto-re-run a succeeded action.
+	// Resume: never auto-re-run a succeeded action — but a journaled
+	// success is only trusted when reality agrees: every declared output
+	// root must still be PRESENT on disk (os.Stat of the declared roots,
+	// the same existence rule the Runner enforces per attempt). A
+	// missing output — a forged action_runs row (catalog-write attacker),
+	// or outputs removed after the journaled run — re-runs the action
+	// (Wave G review finding G2: consult reality, not journals).
 	var reports []ActionReport
 	toRun := defs
 	if resume {
@@ -102,7 +108,7 @@ func (o *Opener) runRebuild(ctx context.Context, opID domain.OperationID, dest s
 		if len(succeeded) > 0 {
 			toRun = make([]actions.Definition, 0, len(defs))
 			for _, d := range defs {
-				if succeeded[d.ID] {
+				if succeeded[d.ID] && outputsPresent(dest, d) {
 					reports = append(reports, ActionReport{ID: d.ID, Status: ActionSkipped, Skipped: true})
 					continue
 				}
@@ -245,6 +251,20 @@ func (o *Opener) inputDigests(dest string, def actions.Definition) (map[string]s
 		digests[rel] = d
 	}
 	return digests, nil
+}
+
+// outputsPresent reports whether every declared output root of def
+// exists under dest (os.Stat, following links the same way the Runner's
+// own post-run existence check does). Deliberately existence-only, cheap
+// and digest-free: its job is to refuse trusting a journaled success
+// whose tree is absent, not to re-verify the action's work.
+func outputsPresent(dest string, def actions.Definition) bool {
+	for _, rel := range def.Outputs {
+		if _, err := os.Stat(filepath.Join(dest, filepath.FromSlash(rel))); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // verifyProtected is the F36 gate: every retained inventory entry NOT
