@@ -30,7 +30,9 @@ package capsule
 // extraction discipline to our own package: only the bounded set of
 // regular files/directories below the declared repo prefix is accepted;
 // absolute names, traversal, backslashes, drive-alias spellings, Windows
-// device-name basenames, duplicate names, names differing only by case,
+// device-name basenames, duplicate names, names differing only by case
+// (including against the directories other entries' paths imply, and
+// implied directories that would merge by case on the primary platform),
 // the Win32 illegal-character set (* ? < > | " and C0 controls),
 // over-long path components, non-STORED methods, length inconsistencies
 // and declared-total mismatches are all rejected.
@@ -407,6 +409,143 @@ func caseFold(name string) string {
 	return strings.ToLower(name)
 }
 
+// impliedDirRef names the first entry whose path implied a directory, and
+// the real (unfolded) spelling that entry used for it — what the
+// fold-namespace refusals name in their errors.
+type impliedDirRef struct {
+	spelling string // the implied directory as spelled by the implier entry
+	entry    string // the first entry whose path implied it
+}
+
+// foldNamespace is the case-folded namespace of one container: every
+// entry name AND every directory those entries' paths imply (each proper
+// path-prefix directory of each repo entry — extraction materializes
+// these via os.MkdirAll, so they participate in every collision the
+// filesystem will see). It detects, host-agnostically, the J6 class
+// (two entries differing only by case) and the three residuals of the
+// same class found when J6 was fixed:
+//
+//   - exact file-vs-implied-directory conflict (entry "repo/ab" plus
+//     entry "repo/ab/x"): unguarded pre-fix — verify accepted it and
+//     extraction failed on EVERY platform with an opaque,
+//     order-dependent error (live-probed on Win11 26200: file-first
+//     gives `mkdir ...: The system cannot find the path specified`,
+//     dir-first gives `open ...: is a directory`; the case-sensitive
+//     family gives ENOTDIR / EISDIR). Refused with the pair named.
+//   - case collision between an entry and another entry's implied
+//     directory (entry "repo/Ab" plus entry "repo/ab/x"): verify
+//     accepted it; the case-insensitive primary platform failed the
+//     second operation with the same opaque order-dependent error while
+//     the case-sensitive family extracted cleanly — the J6 divergence,
+//     one level up. Refused with the pair named.
+//   - case collision between two IMPLIED directories (entries
+//     "repo/Ab/x" plus "repo/ab/y"): live-probed, extraction succeeds
+//     with a nil error on BOTH platform families, but the extracted
+//     tree SHAPES diverge — the case-insensitive primary platform MERGES
+//     the directories (one `Ab` holding both files; MkdirAll's Stat sees
+//     the fold-equal directory and is a no-op) while a case-sensitive
+//     platform keeps both (WSL ext4 probe: `Ab` and `ab` coexist, one
+//     file each). No error fires anywhere, so the pre-fix gates were
+//     structurally blind to it; per D028 a capsule must be judged
+//     identically everywhere, and an extraction whose artifact shape
+//     depends on the host is not. Refused with the pair named.
+type foldNamespace struct {
+	entryExact  map[string]bool          // exact entry names
+	entryFolded map[string]string        // folded entry name -> first real spelling
+	dirExact    map[string]impliedDirRef // exact implied directory -> first implier
+	dirFolded   map[string]impliedDirRef // folded implied directory -> first implier
+}
+
+func newFoldNamespace(n int) *foldNamespace {
+	return &foldNamespace{
+		entryExact:  make(map[string]bool, n),
+		entryFolded: make(map[string]string, n),
+		dirExact:    make(map[string]impliedDirRef),
+		dirFolded:   make(map[string]impliedDirRef),
+	}
+}
+
+// add folds one entry name — and, for repo entries, every directory its
+// path implies — into the namespace, refusing every collision class the
+// filesystem would refuse or silently reshape. The caller is expected to
+// have refused exact duplicate entry names already (the container's own
+// "duplicate entry name" gate), so entry-vs-entry here is the fold check
+// only. A path can never collide with ITS OWN implied directories (an
+// ancestor is a proper prefix, and caseFold is per-rune, so unequal rune
+// counts never fold equal), which is why self-collisions need no special
+// case.
+func (n *foldNamespace) add(name string, isRepo bool) error {
+	fold := caseFold(name)
+	// J6: two entries differing only by case.
+	if first, clash := n.entryFolded[fold]; clash {
+		return fmt.Errorf(
+			"capsule: case-collision entries %q and %q differ only by case (folded form %q); the case-insensitive primary platform cannot hold both files, so the container is refused on every platform (D028: a capsule is judged identically everywhere)",
+			first, name, fold)
+	}
+	// Exact file-vs-implied-directory conflict: loud on every platform,
+	// but pre-fix only as an opaque order-dependent extraction error.
+	if ref, clash := n.dirExact[name]; clash {
+		return fmt.Errorf(
+			"capsule: file/directory conflict — entry %q names a file while the path of entry %q passes through %q as a directory; no platform can hold both, and extraction fails with an opaque order-dependent error — refusing with the pair named (D028: a capsule is judged identically everywhere)",
+			name, ref.entry, name)
+	}
+	// Case collision between this entry (a file) and an implied directory.
+	if ref, clash := n.dirFolded[fold]; clash {
+		return fmt.Errorf(
+			"capsule: case-collision — entry %q names a file while the path of entry %q passes through the implied directory %q, which differs from it only by case (folded form %q); the case-insensitive primary platform cannot hold a file and a directory whose names fold together (extraction refuses with an opaque, order-dependent error) — refusing on every platform (D028: a capsule is judged identically everywhere)",
+			name, ref.entry, ref.spelling, fold)
+	}
+	n.entryExact[name] = true
+	n.entryFolded[fold] = name
+	if !isRepo {
+		return nil
+	}
+	// Fold every implied directory of this entry into the namespace:
+	// "repo/ab/cd/x" implies "repo", "repo/ab", "repo/ab/cd" — each a
+	// full path prefix, because that is what extraction materializes
+	// (os.MkdirAll of the parent) and what a fold-equal name would
+	// collide with on the filesystem.
+	prefix := name
+	for {
+		i := strings.LastIndexByte(prefix, '/')
+		if i < 0 {
+			break
+		}
+		prefix = prefix[:i]
+		dir := prefix
+		dfold := caseFold(dir)
+		// The implied directory is exactly an existing entry (a file).
+		if _, clash := n.entryExact[dir]; clash {
+			return fmt.Errorf(
+				"capsule: file/directory conflict — the path of entry %q passes through %q as a directory while entry %q names a file there; no platform can hold both, and extraction fails with an opaque order-dependent error — refusing with the pair named (D028: a capsule is judged identically everywhere)",
+				name, dir, dir)
+		}
+		// The implied directory collides by case with an existing entry.
+		if first, clash := n.entryFolded[dfold]; clash {
+			return fmt.Errorf(
+				"capsule: case-collision — the path of entry %q passes through the implied directory %q, which differs from entry %q only by case (folded form %q); the case-insensitive primary platform cannot hold a file and a directory whose names fold together (extraction refuses with an opaque, order-dependent error) — refusing on every platform (D028: a capsule is judged identically everywhere)",
+				name, dir, first, dfold)
+		}
+		// The implied directory collides by case with a DIFFERENTLY
+		// spelled implied directory: extraction succeeds silently on
+		// both platform families but merges the directories on the
+		// case-insensitive one — a tree-shape divergence, refused per
+		// the foldNamespace doc comment's probe evidence.
+		if prev, clash := n.dirFolded[dfold]; clash && prev.spelling != dir {
+			return fmt.Errorf(
+				"capsule: case-collision — entries %q and %q imply the directories %q and %q, which differ only by case (folded form %q); extraction succeeds without error on both platform families but MERGES the directories on the case-insensitive primary platform while a case-sensitive one keeps both — a cross-platform tree-shape divergence — refusing on every platform (D028: a capsule is judged identically everywhere)",
+				prev.entry, name, prev.spelling, dir, dfold)
+		}
+		if _, clash := n.dirExact[dir]; !clash {
+			n.dirExact[dir] = impliedDirRef{spelling: dir, entry: name}
+		}
+		if _, clash := n.dirFolded[dfold]; !clash {
+			n.dirFolded[dfold] = impliedDirRef{spelling: dir, entry: name}
+		}
+	}
+	return nil
+}
+
 // containerCheck is the verified view of one written package.
 type containerCheck struct {
 	Bootstrap bootstrapDoc
@@ -435,15 +574,15 @@ func verifyPackage(partialPath string) (containerCheck, error) {
 	}
 
 	seen := make(map[string]bool, len(zr.File))
-	// J6 (wave-J review): duplicate detection additionally folds names
-	// case-insensitively (caseFold above documents the chosen rule). Two
-	// entries that differ only by case extract as two distinct files on a
-	// case-sensitive filesystem but collide on the case-insensitive
-	// primary platform (the second O_EXCL create fails with an opaque
-	// "file exists"), so D028's judged-identically-everywhere rule is
-	// broken between verify and extract. The container itself is
-	// therefore refused — on every host, with the colliding pair named.
-	seenFolded := make(map[string]string, len(zr.File))
+	// J6 (wave-J review) + residuals: the fold-namespace check refuses,
+	// host-agnostically and with the colliding pair named, entries that
+	// differ only by case, file-vs-implied-directory conflicts, entries
+	// that case-collide with another entry's implied directory, and
+	// implied directories that would MERGE by case on the primary
+	// platform (a silent cross-platform tree-shape divergence — see the
+	// foldNamespace doc comment for the probe evidence behind each
+	// class). D028: a capsule is judged identically everywhere.
+	folds := newFoldNamespace(len(zr.File))
 	var gotRepoEntries int64
 	var gotRepoBytes int64
 	var out containerCheck
@@ -452,13 +591,10 @@ func verifyPackage(partialPath string) (containerCheck, error) {
 			return containerCheck{}, fmt.Errorf("capsule: duplicate entry name %q in container", zf.Name)
 		}
 		seen[zf.Name] = true
-		if first, clash := seenFolded[caseFold(zf.Name)]; clash {
-			return containerCheck{}, fmt.Errorf(
-				"capsule: case-collision entries %q and %q differ only by case (folded form %q); the case-insensitive primary platform cannot hold both files, so the container is refused on every platform (D028: a capsule is judged identically everywhere)",
-				first, zf.Name, caseFold(zf.Name))
-		}
-		seenFolded[caseFold(zf.Name)] = zf.Name
 		isRepo := strings.HasPrefix(zf.Name, repoPrefix+"/")
+		if err := folds.add(zf.Name, isRepo); err != nil {
+			return containerCheck{}, err
+		}
 		if err := validateEntryName(zf.Name, isRepo); err != nil {
 			return containerCheck{}, err
 		}
@@ -609,11 +745,13 @@ func extractRepository(containerPath, dstDir string, maxBytes int64) error {
 	}
 	budget := uint64(maxBytes) // maxBytes >= 0 here, so the conversion is safe
 	var written uint64
-	// Defense in depth (J6): verifyPackage already refused case-colliding
-	// names; the same fold is enforced here so a caller that skips verify
-	// gets the same named refusal instead of a platform-divergent
-	// mid-extraction error.
-	seenFolded := make(map[string]string)
+	// Defense in depth (J6 + residuals): verifyPackage already refused
+	// every fold-namespace collision; the SAME namespace check runs here
+	// (via the shared foldNamespace helper — no duplicated logic;
+	// verify-side stays the authority) so a caller that skips verify gets
+	// the same named refusal instead of a platform-divergent or silently
+	// platform-shaped mid-extraction result.
+	folds := newFoldNamespace(len(zr.File))
 	for _, zf := range zr.File {
 		if !strings.HasPrefix(zf.Name, repoPrefix+"/") {
 			continue // the two public documents are not repository content
@@ -622,12 +760,9 @@ func extractRepository(containerPath, dstDir string, maxBytes int64) error {
 		if err := validateEntryName(zf.Name, true); err != nil {
 			return err
 		}
-		if first, clash := seenFolded[caseFold(zf.Name)]; clash {
-			return fmt.Errorf(
-				"capsule: case-collision entries %q and %q differ only by case; the case-insensitive primary platform cannot hold both files (D028: judged identically everywhere)",
-				first, zf.Name)
+		if err := folds.add(zf.Name, true); err != nil {
+			return err
 		}
-		seenFolded[caseFold(zf.Name)] = zf.Name
 		target := filepath.Join(dstDir, filepath.FromSlash(rel))
 		// Defense in depth: the joined target must still resolve inside
 		// dstDir lexically after cleaning (validateEntryName already
