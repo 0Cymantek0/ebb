@@ -11,6 +11,7 @@ package restore
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"ebb/internal/catalog"
@@ -34,6 +35,10 @@ type ManifestFacts struct {
 	Producer    string
 	Scope       string
 	Consistency string
+	// Kind is the snapshot kind derived from the frozen manifest contract
+	// (kindFromContract): trim-removal-plan scope → trim,
+	// stopped-writers-asserted consistency → park, otherwise snapshot.
+	Kind string
 	// InventoryPath is the accounting document this capture sealed
 	// (inventory.jsonl, or removal-manifest.json for a trim).
 	InventoryPath  string
@@ -101,6 +106,7 @@ func LoadRetainedEvidence(ctx context.Context, store domain.SnapshotStore, vault
 			Producer:        docs.manifest.Producer,
 			Scope:           docs.manifest.Contract.Scope,
 			Consistency:     docs.manifest.Contract.Consistency,
+			Kind:            kindFromContract(docs.manifest.Contract.Scope, docs.manifest.Contract.Consistency),
 			InventoryPath:   docs.manifest.Inventory.Path,
 			InventoryCount:  docs.manifest.Inventory.Count,
 			ManifestDigest:  receipt.ManifestDigest,
@@ -115,5 +121,81 @@ func LoadRetainedEvidence(ctx context.Context, store domain.SnapshotStore, vault
 		PreservedBytes:   docs.preservedBytes,
 		WsPrefix:         docs.wsPrefix,
 		OpDirName:        opDirName(receipt.OperationID),
+	}, nil
+}
+
+// LoadCapsuleEvidence loads and verifies the retained evidence of one
+// payload held in a capsule's embedded repository WITHOUT a lifecycle
+// seal receipt and WITHOUT a catalog row — the `ebb import` path of
+// Foundation §15.3. A capsule's embedded seal is a DIFFERENT document
+// (the destination seal of internal/capsule/seal.go), so the caller
+// supplies only the two digests that seal declares
+// (wantManifestDigest / wantInventoryDigest) plus the payload's backend
+// id; everything else is re-derived from the payload's own bytes through
+// the backend by the same shared trust core discovery uses
+// (loadPayloadEvidence): the op dir is located by tree shape
+// (.ebb-op-<32hex>/manifest.json — the destination seal's operation id
+// belongs to the export, not to the payload's frozen op dir, so it is
+// deliberately NOT consulted), both documents are dumped and
+// digest-gated against the declared values, and the manifest is
+// strict-parsed (schema version, required features, well-formed logical
+// identities). I12 discipline throughout: a claimed digest is only ever
+// compared against bytes read through the backend, and any mismatch —
+// or a missing, ambiguous, malformed or inconsistent payload shape —
+// refuses.
+//
+// The returned Evidence carries the identities and facts taken FROM the
+// payload's own manifest: SnapshotID/WorkspaceID are the manifest's
+// (the CALLER compares them against the capsule seal's replication
+// claims — this loader takes no position on foreign identity fields),
+// and Manifest.ManifestDigest / Manifest.InventoryDigest are the
+// digests re-computed over the dumped bytes (equal to the want-digests
+// on success).
+//
+// Receipt is the ZERO ReceiptFacts: no lifecycle receipt exists or was
+// consulted on this path, and callers MUST NOT cite it as verification
+// evidence (an imported snapshot gains a fresh LOCAL seal through the
+// import protocol instead — Foundation §15.3).
+//
+// Failures are the typed restore errors: *ErrVerification{Check:
+// "documents"} carrying the shared core's concrete refusal detail
+// lines (same wording family as the discovery path's suspicious
+// findings); the caller decides the exit outcome.
+func LoadCapsuleEvidence(ctx context.Context, store domain.SnapshotStore, vault VaultRef, payloadBackendID, wantManifestDigest, wantInventoryDigest string) (Evidence, error) {
+	if !isFullBackendID(payloadBackendID) {
+		return Evidence{}, &ErrVerification{Check: "documents", Details: []string{
+			fmt.Sprintf("payload backend id %q is not a full 64-hex backend id", payloadBackendID)}}
+	}
+	ev, err := loadPayloadEvidence(ctx, store, vault, payloadBackendID, payloadClaims{
+		manifestDigest:  wantManifestDigest,
+		inventoryDigest: wantInventoryDigest,
+		claimant:        "destination seal",
+	})
+	if err != nil {
+		return Evidence{}, &ErrVerification{Check: "documents", Details: evidenceDetails(err)}
+	}
+	return Evidence{
+		SnapshotID:  ev.snapshotID,
+		WorkspaceID: ev.workspaceID,
+		Manifest: ManifestFacts{
+			CreatedAt:       ev.manifest.CreatedAt,
+			Producer:        ev.manifest.Producer,
+			Scope:           ev.manifest.Contract.Scope,
+			Consistency:     ev.manifest.Contract.Consistency,
+			Kind:            ev.kind,
+			InventoryPath:   ev.manifest.Inventory.Path,
+			InventoryCount:  ev.manifest.Inventory.Count,
+			ManifestDigest:  ev.manifestDigest,
+			InventoryDigest: ev.inventoryDigest,
+			PolicyDigest:    ev.manifest.Policy.FrozenDigest,
+			ManifestBytes:   ev.manifestLen,
+			InventoryBytes:  ev.manifest.Inventory.Bytes,
+			PolicyBytes:     int64(len(ev.manifest.Policy.Frozen)),
+		},
+		Retained:         ev.retained,
+		PreservedEntries: ev.preservedEntries,
+		PreservedBytes:   ev.preservedBytes,
+		WsPrefix:         ev.wsPrefix,
+		OpDirName:        ev.opDir,
 	}, nil
 }
