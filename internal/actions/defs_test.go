@@ -1,6 +1,7 @@
 package actions_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -254,5 +255,27 @@ func TestCanonicalEnvAllow(t *testing.T) {
 	_ = actions.CanonicalEnvAllow(in)
 	if in[0] != "B" || in[1] != "A" {
 		t.Fatalf("CanonicalEnvAllow mutated its input: %v", in)
+	}
+}
+
+// TestValidateEnvAllowDenylistedSecretKey (G1c): an action asking for
+// one of Ebb's own secret-bearing environment keys is definitionally
+// unapprovable — Definition.Validate refuses it outright, before any
+// prompt or approval record can exist.
+func TestValidateEnvAllowDenylistedSecretKey(t *testing.T) {
+	d := validDef()
+	d.EnvAllow = []string{"EBB_VAULT_PASSWORD"}
+	err := d.Validate()
+	var denied *actions.ErrEnvDenylisted
+	if !errors.As(err, &denied) {
+		t.Fatalf("want ErrEnvDenylisted, got %v", err)
+	}
+	if denied.Key != "EBB_VAULT_PASSWORD" || denied.ActionID != d.ID {
+		t.Fatalf("denied error carries %+v", denied)
+	}
+	// Ordinary keys are unaffected.
+	d.EnvAllow = []string{"SOME_TOOL_HOME"}
+	if err := d.Validate(); err != nil {
+		t.Fatalf("ordinary env key must validate: %v", err)
 	}
 }

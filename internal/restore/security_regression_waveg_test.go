@@ -16,8 +16,11 @@ import (
 	"testing"
 	"time"
 
+	"ebb/internal/actions"
+	"ebb/internal/actions/approvalstore"
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
+	"ebb/internal/platform"
 )
 
 // forgeSelfConsistentPair rewrites P and S into an attacker-authored,
@@ -248,4 +251,135 @@ func splitLines(b []byte) []string {
 		out = append(out, string(b[start:]))
 	}
 	return out
+}
+
+// ---- G2: a journaled success is only trusted when reality agrees ------
+
+// TestResumeForgedSucceededRunWithAbsentOutputsIsReRun (Wave G review
+// finding G2, default-suite twin of the tagged PoC): a "succeeded"
+// action_runs row forged by a catalog-write attacker must NOT make
+// --resume skip the action while its declared outputs are absent — the
+// action is re-run (consult reality, not journals).
+func TestResumeForgedSucceededRunWithAbsentOutputsIsReRun(t *testing.T) {
+	f := buildFixture(t, fixtureSpec{recipeGroup: true, defArgv: []string{"go", "version"}})
+	dest := filepath.Join(f.parent, "opened")
+	failing := &fakeRunner{fn: func(def actions.Definition) (actions.Result, error) {
+		return actions.Result{ExitCode: 1}, nil // fails, creates no output
+	}}
+	o, _ := newRebuildOpener(f, failing, false)
+	res, oerr := o.Open(context.Background(), f.vault, f.snapID, Options{Destination: dest})
+	if oerr == nil || res.Phase != catalog.PhaseRebuildFailed {
+		t.Fatalf("first open should land at REBUILD_FAILED (fixture problem): %v (phase %s)", oerr, res.Phase)
+	}
+	opID := res.OperationID
+
+	// The attacker (catalog write) forges a successful run.
+	runID, rerr := f.cat.StartActionRun(opID, "node-dependencies")
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if ferr := f.cat.FinishActionRun(runID, catalog.ActionRunSucceeded, 0, "forged by catalog-write attacker"); ferr != nil {
+		t.Fatal(ferr)
+	}
+
+	// Resume with a runner that succeeds and materializes its outputs.
+	retry := &fakeRunner{}
+	store := approvalstore.New(filepath.Join(f.parent, "approvals.json"))
+	o2, err := New(Dependencies{
+		Store: f.store, Cat: f.cat, Probe: f.probe, CreateLink: platform.CreateLink,
+		Runner: retry, Approver: store, Approve: func(ctx context.Context, pending []PendingApproval) error {
+			for _, p := range pending {
+				if _, aerr := store.Approve(p.Def, p.Tool, p.InputDigests, "test"); aerr != nil {
+					return aerr
+				}
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2, rerr := o2.ResumeRebuild(context.Background(), f.vault, opID)
+	if rerr != nil || res2.Phase != catalog.PhaseDone {
+		t.Fatalf("resume must re-run the forged-skipped action to completion: %v (phase %s)", rerr, res2.Phase)
+	}
+	for _, a := range res2.Actions {
+		if a.ID == "node-dependencies" && a.Skipped {
+			t.Fatal("the action was skipped on a forged row while its outputs were absent")
+		}
+	}
+	if len(retry.calls) == 0 {
+		t.Fatal("the runner never executed: the forged row was trusted over reality")
+	}
+	if _, serr := os.Stat(filepath.Join(dest, "node_modules")); serr != nil {
+		t.Fatalf("re-run action did not materialize its output: %v", serr)
+	}
+}
+
+// ---- G3: the open-side I06 vault-overlap preflight ---------------------
+
+// TestOpenRefusesDestinationInsideVaultRepository (Wave G review finding
+// G3, default-suite twin of the tagged PoC): a destination inside the
+// vault repository — staging sibling included — is refused BEFORE any
+// side effect, with the typed ErrVaultOverlap.
+func TestOpenRefusesDestinationInsideVaultRepository(t *testing.T) {
+	f := buildFixture(t, fixtureSpec{})
+	if err := os.MkdirAll(f.vault.RepoDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(f.vault.RepoDir, "restored-ws")
+	o, err := New(Dependencies{Store: f.store, Cat: f.cat, Probe: f.probe, CreateLink: platform.CreateLink})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, oerr := o.Open(context.Background(), f.vault, f.snapID, Options{Destination: dest, FilesOnly: true})
+	var overlap *ErrVaultOverlap
+	if !errors.As(oerr, &overlap) {
+		t.Fatalf("open into the vault repository must fail with ErrVaultOverlap, got %v", oerr)
+	}
+	if _, serr := os.Lstat(dest); serr == nil {
+		t.Fatalf("something was published at %s despite the overlap refusal", dest)
+	}
+	des, _ := os.ReadDir(f.vault.RepoDir)
+	for _, de := range des {
+		if strings.HasPrefix(de.Name(), stagePrefix) {
+			t.Fatalf("staging leftover %s inside the vault repository despite the refusal", de.Name())
+		}
+	}
+}
+
+// TestCheckVaultOverlapDirections covers every direction of the overlap
+// rule as a unit: clean layout passes; destination inside the repo,
+// destination containing the repo, and destination containing the
+// passfile are each refused.
+func TestCheckVaultOverlapDirections(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "vault", "repo")
+	pass := filepath.Join(base, "vault", "pass.txt")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pass, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	v := VaultRef{RepoDir: repo, Passfile: pass}
+
+	if err := checkVaultOverlap(filepath.Join(base, "ws"), v); err != nil {
+		t.Fatalf("clean layout must pass: %v", err)
+	}
+	var overlap *ErrVaultOverlap
+	if err := checkVaultOverlap(filepath.Join(repo, "ws"), v); !errors.As(err, &overlap) {
+		t.Fatalf("dest inside repo: want ErrVaultOverlap, got %v", err)
+	}
+	outer := filepath.Join(base, "outer")
+	if err := os.MkdirAll(filepath.Join(outer, "vault", "repo"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	v2 := VaultRef{RepoDir: filepath.Join(outer, "vault", "repo"), Passfile: pass}
+	if err := checkVaultOverlap(outer, v2); !errors.As(err, &overlap) {
+		t.Fatalf("dest containing repo: want ErrVaultOverlap, got %v", err)
+	}
+	if err := checkVaultOverlap(base, VaultRef{RepoDir: filepath.Join(base, "other-repo"), Passfile: pass}); !errors.As(err, &overlap) {
+		t.Fatalf("dest containing passfile: want ErrVaultOverlap, got %v", err)
+	}
 }

@@ -269,3 +269,27 @@ func strings64(seed string) string {
 	}
 	return string(out)
 }
+
+// TestApprovalMatchesLegacyRecordWithoutOutputsIsStale (G1 migration):
+// approvals persisted before the working-root/output fields existed
+// carry no output ownership. They must compare STALE against every
+// definition — never silently honored — with a drift line naming the
+// migration; one re-approval records the fields.
+func TestApprovalMatchesLegacyRecordWithoutOutputsIsStale(t *testing.T) {
+	b := newBaseAction()
+	tool := actions.ToolIdentity{Name: b.def.Argv[0], ResolvedPath: `C:	ools	ool.exe`, SHA256: strings64("aa")}
+	legacy := actions.Approval{
+		ActionID: b.def.ID, ArgvDigest: actions.ArgvDigest(b.def.Argv), Tool: tool,
+		WorkingRoot: "", Outputs: nil, // pre-G1 record: fields absent
+		InputDigests: map[string]string{"package.json": b.digests["package.json"]},
+		EnvAllow:     actions.CanonicalEnvAllow(b.def.EnvAllow),
+		Network:      b.def.Network,
+	}
+	stale := actions.ApprovalMatches(&legacy, b.def, tool, b.digests)
+	if stale == nil {
+		t.Fatal("a legacy approval without output ownership must not silently match")
+	}
+	if !strings.Contains(strings.Join(stale.Diff, "; "), "not covered by the recorded approval") {
+		t.Fatalf("drift does not name the migration: %v", stale.Diff)
+	}
+}

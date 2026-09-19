@@ -40,6 +40,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -221,8 +222,8 @@ func TestPoCApprovalDriftOutputsBlindsF36Gate(t *testing.T) {
 	// re-prompt), the declined re-approval fails the open at
 	// REBUILD_FAILED, and the drifted action never executes.
 	if !prompted {
-		t.Fatalf("G1 REGRESSION: the drifted definition (outputs widened to cover the preserved "+
-			"tree \"sub\") matched capture 1's recorded approval with NO re-prompt — approval identity "+
+		t.Fatalf("G1 REGRESSION: the drifted definition (outputs widened to cover the preserved " +
+			"tree \"sub\") matched capture 1's recorded approval with NO re-prompt — approval identity " +
 			"must pin output ownership (Foundation §7.3)")
 	}
 	var rb *ErrRebuildFailed
@@ -253,13 +254,22 @@ func TestPoCApprovalMatchesIgnoresWorkingRoot(t *testing.T) {
 	drifted := approved
 	drifted.WorkingRoot = "attacker-shipped-dir"
 	tool := actions.ToolIdentity{Name: "go", ResolvedPath: `C:\go\bin\go.exe`, SHA256: "cafebabe"}
+	// The recorded approval covers EVERYTHING the definition pins —
+	// including outputs — so the ONLY drift is the working root. A fix
+	// that merely treats legacy output-less records as stale would pass
+	// this by accident only; this construction isolates the field.
 	appr := &actions.Approval{
 		ActionID: "build", ArgvDigest: actions.ArgvDigest(approved.Argv), Tool: tool,
+		WorkingRoot: ".", Outputs: actions.CanonicalOutputs(approved.Outputs),
 		InputDigests: map[string]string{}, EnvAllow: nil, Network: actions.NetworkNone,
 	}
-	if stale := actions.ApprovalMatches(appr, drifted, tool, map[string]string{}); stale == nil {
-		t.Fatalf("G1b CONFIRMED: ApprovalMatches accepted a WorkingRoot drift (%q -> %q); "+
+	stale := actions.ApprovalMatches(appr, drifted, tool, map[string]string{})
+	if stale == nil {
+		t.Fatalf("G1b REGRESSION: ApprovalMatches accepted a WorkingRoot drift (%q -> %q); "+
 			"Foundation §7.3 pins the working root as approval-authorized state", approved.WorkingRoot, drifted.WorkingRoot)
+	}
+	if !strings.Contains(strings.Join(stale.Diff, "; "), "working root") {
+		t.Fatalf("G1b REGRESSION: drift reported but does not name the working root: %v", stale.Diff)
 	}
 }
 
@@ -273,8 +283,11 @@ func TestPoCPoisonedActionRunJournalSkipsRebuild(t *testing.T) {
 	ctx := context.Background()
 	store := approvalstore.New(filepath.Join(f.parent, "approvals.json"))
 	dest := filepath.Join(f.parent, "opened")
+	resumeRuns := 0
 	failing := &fakeRunner{fn: func(def actions.Definition) (actions.Result, error) {
-		// Fails without creating any output.
+		// Fails without creating any output; the resume-side instance
+		// counts its invocations so the flip can prove the action was
+		// actually re-run rather than silently skipped.
 		return actions.Result{ExitCode: 1}, nil
 	}}
 	resolver := func(ctx context.Context, pending []PendingApproval) error {
@@ -307,9 +320,14 @@ func TestPoCPoisonedActionRunJournalSkipsRebuild(t *testing.T) {
 		t.Fatal(ferr)
 	}
 
+	resumeRunner := &fakeRunner{fn: func(def actions.Definition) (actions.Result, error) {
+		resumeRuns++
+		// Fails without creating any output.
+		return actions.Result{ExitCode: 1}, nil
+	}}
 	o2, err := New(Dependencies{
 		Store: f.store, Cat: f.cat, Probe: f.probe, CreateLink: platform.CreateLink,
-		Runner: failing, Approver: store, Approve: func(ctx context.Context, p []PendingApproval) error {
+		Runner: resumeRunner, Approver: store, Approve: func(ctx context.Context, p []PendingApproval) error {
 			return errors.New("no approval should be needed for a skipped action")
 		},
 	})
@@ -317,20 +335,22 @@ func TestPoCPoisonedActionRunJournalSkipsRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	res2, rerr := o2.ResumeRebuild(ctx, f.vault, opID)
-	if rerr == nil && res2.Phase == catalog.PhaseDone {
-		if _, serr := os.Lstat(filepath.Join(dest, "node_modules")); os.IsNotExist(serr) {
-			skipped := false
-			for _, a := range res2.Actions {
-				if a.ID == "node-dependencies" && a.Skipped {
-					skipped = true
-				}
-			}
-			if skipped {
-				t.Fatalf("G2 CONFIRMED: a forged succeeded action_runs row made --resume skip the action; " +
-					"the rebuild completed DONE/ready with node_modules never built and no check (F36 or " +
-					"otherwise) verifying output presence for skipped actions")
-			}
+	// Fixed build (fix holds): the journaled success is only trusted when
+	// reality agrees — the declared output root node_modules does NOT
+	// exist, so the action is RE-RUN (consult reality, not journals). The
+	// failing runner therefore fails it again: REBUILD_FAILED, no Skipped
+	// report, and the runner really executed.
+	if rerr == nil || res2.Phase != catalog.PhaseRebuildFailed {
+		t.Fatalf("G2 REGRESSION: --resume trusted the forged succeeded row (phase %s, err %v) — "+
+			"a skipped action whose declared outputs are absent must be re-run", res2.Phase, rerr)
+	}
+	for _, a := range res2.Actions {
+		if a.ID == "node-dependencies" && a.Skipped {
+			t.Fatalf("G2 REGRESSION: the action was skipped on a forged action_runs row while its outputs were absent")
 		}
+	}
+	if resumeRuns == 0 {
+		t.Fatalf("G2 REGRESSION: the runner never executed on resume")
 	}
 }
 
@@ -350,21 +370,22 @@ func TestPoCOpenPublishesInsideVaultRepository(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, oerr := o.Open(context.Background(), f.vault, f.snapID, Options{Destination: dest, FilesOnly: true})
-	if oerr == nil {
-		if _, serr := os.Lstat(filepath.Join(dest, "a.txt")); serr == nil {
-			// Any staging leftovers inside the repo?
-			stageLeft := ""
-			des, _ := os.ReadDir(f.vault.RepoDir)
-			for _, de := range des {
-				if len(de.Name()) > len(stagePrefix) && de.Name()[:len(stagePrefix)] == stagePrefix {
-					stageLeft = de.Name()
-				}
-			}
-			t.Fatalf("G3 CONFIRMED: open accepted a destination INSIDE the vault repository %s "+
-				"(published a.txt there; phase %s; staging leftovers in repo: %q) — the capture-side I06 "+
-				"overlap preflight has no open-side twin, so restore and vault state interleave unnoticed",
-				f.vault.RepoDir, res.Phase, stageLeft)
+	_, oerr := o.Open(context.Background(), f.vault, f.snapID, Options{Destination: dest, FilesOnly: true})
+	// Fixed build (fix holds): the open-side I06 twin refuses BEFORE any
+	// staging side effect — typed ErrVaultOverlap, and the vault
+	// repository is left exactly as it was (no published tree, no
+	// .ebb-stage-* sibling inside it).
+	var overlap *ErrVaultOverlap
+	if !errors.As(oerr, &overlap) {
+		t.Fatalf("G3 REGRESSION: open into the vault repository must fail with ErrVaultOverlap, got %v", oerr)
+	}
+	if _, serr := os.Lstat(dest); serr == nil {
+		t.Fatalf("G3 REGRESSION: something was published at %s despite the overlap refusal", dest)
+	}
+	des, _ := os.ReadDir(f.vault.RepoDir)
+	for _, de := range des {
+		if strings.HasPrefix(de.Name(), stagePrefix) {
+			t.Fatalf("G3 REGRESSION: staging leftover %s inside the vault repository despite the overlap refusal", de.Name())
 		}
 	}
 }

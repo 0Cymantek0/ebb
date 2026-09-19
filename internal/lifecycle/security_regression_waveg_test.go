@@ -552,3 +552,49 @@ func TestResumeRecordsWriterAssertionSource(t *testing.T) {
 		t.Fatalf("operation row lacks the durable resume note (last_error = %q)", op.LastError)
 	}
 }
+
+// TestCancelSealedRefusedWhenQuarantineSiblingExists (G4 regression,
+// Wave G review): in the §12.2 step-7 crash window (phase SEALED, root
+// renamed to the quarantine sibling, nothing committed), the explicit
+// cancel must REFUSE — existence-only probe, sibling untouched, phase
+// unchanged — because canceling would strand the tree at an opaque path
+// with no durable pointer while deleting the scratch that names it.
+// `ebb recover <op>` is the reconciliation path.
+func TestCancelSealedRefusedWhenQuarantineSiblingExists(t *testing.T) {
+	h := newHarness(t)
+	root := h.workspace("ws")
+	ws := newWSID()
+
+	c := h.coord()
+	st, err := c.capture(context.Background(), h.vault, root, parkOpts(ws), catalog.OpKindPark, catalog.SnapshotKindPark)
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	defer st.journal.close()
+	if got := h.phaseOf(t, st.opID); got != catalog.PhaseSealed {
+		t.Fatalf("phase = %s, want SEALED", got)
+	}
+	// The crash point: the quarantine rename happened, nothing after.
+	quar := quarantinePath(st.parent, st.opID)
+	if err := renameToQuarantine(root, quar); err != nil {
+		t.Fatal(err)
+	}
+
+	_, cerr := h.coord().CancelOperation(context.Background(), h.vault, st.opID)
+	if cerr == nil {
+		t.Fatal("cancel accepted an operation whose quarantine sibling exists")
+	}
+	var refused *ErrCancelRefused
+	if !errors.As(cerr, &refused) {
+		t.Fatalf("refusal is not ErrCancelRefused: %v", cerr)
+	}
+	if refused.Quarantine != quar {
+		t.Fatalf("refusal names quarantine %q, want %q", refused.Quarantine, quar)
+	}
+	if got := h.phaseOf(t, st.opID); got != catalog.PhaseSealed {
+		t.Fatalf("phase changed by the refused cancel: %s", got)
+	}
+	if _, serr := os.Lstat(quar); serr != nil {
+		t.Fatalf("the refusal must never touch the sibling: %v", serr)
+	}
+}
