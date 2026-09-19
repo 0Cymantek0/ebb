@@ -47,6 +47,7 @@ import (
 	"ebb/internal/domain"
 	"ebb/internal/pathcanon"
 	"ebb/internal/policy"
+	"ebb/internal/version"
 )
 
 // Store is the storage seam this package drives. It is satisfied by
@@ -173,13 +174,17 @@ func New(d Dependencies) (*Coordinator, error) {
 }
 
 // Producer identity recorded in every manifest/receipt (Foundation
-// §16.1: records declare their producer). ProducerEbbVersion must stay
-// in lockstep with internal/cli.Version.
-const (
-	ProducerEbbVersion = "0.1.0-dev"
-	ProducerBackend    = "restic 0.19.1"
-	producerString     = "ebb " + ProducerEbbVersion + "; " + ProducerBackend
-)
+// §16.1: records declare their producer). The ebb half is read from
+// internal/version.Version at freeze time — the single build-version
+// authority also reported by `ebb version` — so a link-time-stamped
+// release binary records its real version instead of a second
+// hard-coded copy that could drift out of lockstep.
+const ProducerBackend = "restic 0.19.1"
+
+// producerString renders the producer identity frozen into manifests.
+func producerString() string {
+	return "ebb " + version.Version + "; " + ProducerBackend
+}
 
 // Ebb-owned sibling names (D003: the op dir is a sibling of the owned
 // root on the same volume). All are dot-prefixed and carry the operation

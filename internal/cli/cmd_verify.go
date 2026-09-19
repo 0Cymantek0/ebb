@@ -39,6 +39,7 @@ import (
 	"ebb/internal/domain"
 	"ebb/internal/lifecycle"
 	"ebb/internal/restore"
+	"ebb/internal/version"
 )
 
 // verifyCheck is one named check's outcome (§4.1).
@@ -148,7 +149,7 @@ func cmdVerify(args []string, streams Streams, deps Deps) int {
 	rep := verifyReport{details: verifyDetails{
 		Workspace: ws.Name, Kind: snap.Kind, CreatedAt: snap.CreatedAt,
 		Scope: scope, Checks: []verifyCheck{},
-		ToolVersions: map[string]string{"ebb": Version, "restic-target": ResticTarget},
+		ToolVersions: map[string]string{"ebb": version.Version, "restic-target": ResticTarget},
 	}}
 
 	cErr := sess.withVaultPassfile(ctx, func(repoDir, passfile string) error {

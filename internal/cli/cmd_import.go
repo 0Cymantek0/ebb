@@ -68,6 +68,7 @@ import (
 	"ebb/internal/domain"
 	"ebb/internal/lifecycle"
 	"ebb/internal/vault"
+	"ebb/internal/version"
 )
 
 // EnvCapsulePassword is the environment source for the capsule's
@@ -325,7 +326,7 @@ func runImport(ctx context.Context, sess *session, capStore capsule.Store,
 		DestPassfile: passfile,
 		DestRepoID:   destRepoID,
 		OperationID:  capsuleOpID,
-		EbbVersion:   Version,
+		EbbVersion:   version.Version,
 		Progress:     streams.Err,
 		FreeSpace:    nil, // production default (build-tagged stdlib probe)
 		// Identity adoption (§16.1): the capsule's logical workspace id

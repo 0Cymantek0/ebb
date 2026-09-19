@@ -11,6 +11,7 @@ import (
 	"ebb/internal/domain"
 	"ebb/internal/planner"
 	"ebb/internal/policy"
+	"ebb/internal/version"
 )
 
 // cmdVersion implements `ebb version`.
@@ -27,7 +28,7 @@ func cmdVersion(args []string, streams Streams) int {
 	}
 
 	details := map[string]string{
-		"version":       Version,
+		"version":       version.Version,
 		"restic_target": ResticTarget,
 		"go_version":    goVersion(),
 	}
@@ -41,7 +42,7 @@ func cmdVersion(args []string, streams Streams) int {
 		return ExitOK
 	}
 	fmt.Fprintf(streams.Err, "ebb %s\nrestic target: %s\ngo: %s\n",
-		Version, ResticTarget, goVersion())
+		version.Version, ResticTarget, goVersion())
 	return ExitOK
 }
 

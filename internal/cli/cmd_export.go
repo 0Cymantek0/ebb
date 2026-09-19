@@ -39,6 +39,7 @@ import (
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 	"ebb/internal/restore"
+	"ebb/internal/version"
 )
 
 // exportDetails is the --json payload of an export (success or dry-run).
@@ -280,7 +281,7 @@ func runExport(ctx context.Context, sess *session, repoDir, passfile string,
 		SourceRepoID:   srcRepoID,
 		OutputPath:     outputPath,
 		OperationID:    opID,
-		EbbVersion:     Version,
+		EbbVersion:     version.Version,
 		Progress:       streams.Err,
 		Phase: func(step string) error {
 			switch step {
