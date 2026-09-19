@@ -41,10 +41,26 @@ What works, end to end, verified against the real restic 0.19.1 binary (`interna
 
 Requires Go ≥ 1.27 and restic 0.19.x on PATH (scoop: `scoop install go restic`; winget/choco equivalents work).
 
+From source:
+
 ```sh
 go build -o ebb ./cmd/ebb
 go test ./...          # full suite (~4-5 min; the restic acceptance suite auto-skips without restic)
 ```
+
+`scripts/verify.sh` is the canonical verification gate (gofmt, `go vet`, the full test suite, and a GOOS=linux cross-compile build/vet — everything the project runs before accepting a change):
+
+```sh
+bash scripts/verify.sh
+```
+
+Release builds (`scripts/release.sh <version>`) cross-compile CGO-free, stripped, version-stamped binaries for windows/amd64 and linux/amd64 (the platforms Ebb builds for today; macOS is unsupported — override the matrix with `EBB_RELEASE_TARGETS` once that changes) into `dist/<version>/`, with checksummed zip/tar.gz archives and a `SHA256SUMS.txt`. The script refuses a dirty working tree unless `EBB_RELEASE_DIRTY=1` is set:
+
+```sh
+scripts/release.sh v0.1.0
+```
+
+There is no official distribution channel yet — Ebb is pre-release, and where binaries are published (and whether the pinned restic backend ships alongside them) is still an open decision. Building from source is the supported path today.
 
 State lives in `os.UserConfigDir()/ebb` (Windows: `%AppData%\ebb`): `catalog.db` (SQLite operation journal + snapshot index) and `vaults.json`. Vault data goes wherever you point `ebb init` (default `<cfgdir>/vault`, restic-encrypted).
 

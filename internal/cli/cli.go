@@ -37,8 +37,11 @@ const (
 	ExitCancelled     = 130 // controlled user cancellation
 )
 
-// Version is the Ebb build version reported by `ebb version`.
-const Version = "0.1.0-dev"
+// Version is the Ebb build version reported by `ebb version` and
+// recorded in receipts. It is a var so cmd/ebb can thread the
+// ldflags-stamped build version in at process start; the default marks
+// a non-release build.
+var Version = "0.1.0-dev"
 
 // ResticTarget is the backend version this build is conformant with
 // (D002/D003; probed against restic 0.19.1).
