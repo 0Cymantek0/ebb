@@ -13,3 +13,4 @@ graphify-out/cache/
 
 # probe scratch (regenerable fixtures)
 lab/git-probe/scratch/
+.zcodeignore
