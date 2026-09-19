@@ -9,6 +9,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -346,5 +348,182 @@ func TestWalkRepoFilesRejectsLinks(t *testing.T) {
 	}
 	if _, err := walkRepoFiles(root); err == nil {
 		t.Error("link inside repo accepted by the walk")
+	}
+}
+
+// ---- wave-J fix regressions (default suite) ----------------------------
+
+// TestValidateEntryNameRejectsWin32IllegalChars guards the J5 fix: the
+// full Win32 illegal-character class — `* ? < > | "` and every C0
+// control character — is refused host-agnostically, with the error
+// naming the character class, because such a name can never be created
+// on the primary supported platform and must not pass the verify gate.
+func TestValidateEntryNameRejectsWin32IllegalChars(t *testing.T) {
+	for _, c := range []string{"*", "?", "<", ">", "|", `"`} {
+		name := "repo/data/ab" + c + "c"
+		err := validateEntryName(name, true)
+		if err == nil || !strings.Contains(err.Error(), "illegal filename character") {
+			t.Errorf("illegal char %q: err = %v (must refuse and name the class)", c, err)
+		}
+	}
+	for c := byte(0x01); c < 0x20; c++ { // 0x00 is caught by the whole-name NUL check
+		name := "repo/data/ab" + string(rune(c)) + "c"
+		err := validateEntryName(name, true)
+		if err == nil || !strings.Contains(err.Error(), "C0 control character") {
+			t.Errorf("C0 control %#04x: err = %v (must refuse and name the class)", c, err)
+		}
+	}
+	// The same class is refused in non-repo (top-level) names too.
+	for _, name := range []string{"bo*otstrap.json", "ebb-\x1fexport.json"} {
+		if err := validateEntryName(name, false); err == nil {
+			t.Errorf("top-level name %q with illegal character accepted", name)
+		}
+	}
+	// Adjacent benign names stay accepted (no over-rejection).
+	for _, name := range []string{"repo/data/ab'c", "repo/data/ab;c", "repo/data/ab=c"} {
+		if err := validateEntryName(name, true); err != nil {
+			t.Errorf("benign name %q rejected: %v", name, err)
+		}
+	}
+}
+
+// TestValidateEntryNameSegmentUTF16Limit guards the hardening-note-3 fix:
+// a single path segment longer than 255 UTF-16 code units (the NTFS
+// per-component limit) is refused at verify with the limit named. The
+// length is judged in UTF-16 units, not bytes, so non-ASCII segments
+// near the limit are judged correctly.
+func TestValidateEntryNameSegmentUTF16Limit(t *testing.T) {
+	// Boundary: exactly 255 units passes, 256 ASCII refuses.
+	if err := validateEntryName("repo/data/"+strings.Repeat("a", 255), true); err != nil {
+		t.Errorf("255-unit segment rejected: %v", err)
+	}
+	err := validateEntryName("repo/data/"+strings.Repeat("a", 256), true)
+	if err == nil || !strings.Contains(err.Error(), "255") {
+		t.Errorf("256-unit segment: err = %v (must refuse and name the 255-unit limit)", err)
+	}
+	// Astral characters occupy TWO UTF-16 units each: 127 of them are
+	// 508 bytes but only 254 units (must PASS — byte length is not the
+	// limit), while 128 are 256 units (must REFUSE).
+	if err := validateEntryName("repo/data/"+strings.Repeat("\U0001F600", 127), true); err != nil {
+		t.Errorf("508-byte/254-unit segment rejected: %v", err)
+	}
+	if err := validateEntryName("repo/data/"+strings.Repeat("\U0001F600", 128), true); err == nil {
+		t.Error("256-unit astral segment accepted (UTF-16 length not enforced)")
+	}
+	// The limit applies per SEGMENT: a long full name of short segments
+	// stays portable.
+	if err := validateEntryName("repo/"+strings.Repeat("d/", 200)+"f", true); err != nil {
+		t.Errorf("long name of short segments rejected: %v", err)
+	}
+}
+
+// TestVerifyPackageRejectsCaseCollisions guards the J6 fix: a container
+// holding two entry names that differ only by case is refused at verify
+// on EVERY platform, with the colliding pair named, because the
+// case-insensitive primary platform cannot hold both files.
+func TestVerifyPackageRejectsCaseCollisions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.zip")
+	docs := validDocs(2, 10)
+	docs["repo/data/Ab"] = []byte("upper")
+	docs["repo/data/ab"] = []byte("lower")
+	craftZip(t, path, docs, zip.Store, nil)
+	_, err := verifyPackage(path)
+	if err == nil {
+		t.Fatal("case-collision container accepted at verify")
+	}
+	for _, want := range []string{"repo/data/Ab", "repo/data/ab", "case-collision"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not name %q: %v", want, err)
+		}
+	}
+	// No over-rejection: mixed-case names WITHOUT a collision verify
+	// fine, in the same directory and across segments.
+	path2 := filepath.Join(t.TempDir(), "ok.zip")
+	docs2 := validDocs(2, 4)
+	docs2["repo/Data/Ab"] = []byte("xy")
+	docs2["repo/Data/cd"] = []byte("zw")
+	craftZip(t, path2, docs2, zip.Store, nil)
+	if _, err := verifyPackage(path2); err != nil {
+		t.Errorf("mixed-case but collision-free container refused: %v", err)
+	}
+}
+
+// TestVerifyPackageRejectsAbsurdDeclaredRepoBytes guards the J7
+// companion gate: a declared repository byte total at or above 2^62 is
+// refused at verify ("not a real repository") so the import preflight's
+// `2 * RepoBytes` headroom arithmetic can never overflow.
+func TestVerifyPackageRejectsAbsurdDeclaredRepoBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.zip")
+	boot, _ := json.Marshal(bootstrapDoc{
+		SchemaVersion: 1, Producer: "ebb test", ContainerVersion: 1,
+		BackendFamily: "restic", RepoRoot: "repo", MinReaderFeatures: []string{"zip64"},
+	})
+	exp, _ := json.Marshal(exportManifestDoc{
+		SchemaVersion: 1, Kind: exportDocKind, OperationID: "op", SourceSnapshotID: "snap",
+		StartedAt: "t", State: exportStateRun, ContainerVersion: 1,
+		RepoEntries: 1, RepoBytes: int64(1) << 62,
+	})
+	docs := map[string][]byte{
+		"bootstrap.json":  append(boot, '\n'),
+		"ebb-export.json": append(exp, '\n'),
+		"repo/config":     []byte("ab"),
+	}
+	craftZip(t, path, docs, zip.Store, nil)
+	_, err := verifyPackage(path)
+	if err == nil || !strings.Contains(err.Error(), "not a real repository") {
+		t.Errorf("absurd declared repo_bytes: err = %v (must refuse at the plausibility ceiling)", err)
+	}
+	// Just below the ceiling the gate stays open (the totals cross-check
+	// is what refuses the mismatch — not the ceiling).
+	exp2, _ := json.Marshal(exportManifestDoc{
+		SchemaVersion: 1, Kind: exportDocKind, OperationID: "op", SourceSnapshotID: "snap",
+		StartedAt: "t", State: exportStateRun, ContainerVersion: 1,
+		RepoEntries: 1, RepoBytes: int64(1)<<62 - 1,
+	})
+	docs["ebb-export.json"] = append(exp2, '\n')
+	path2 := filepath.Join(t.TempDir(), "y.zip")
+	craftZip(t, path2, docs, zip.Store, nil)
+	if _, err := verifyPackage(path2); err == nil || strings.Contains(err.Error(), "not a real repository") {
+		t.Errorf("boundary declared repo_bytes: err = %v (must refuse on totals, not on the ceiling)", err)
+	}
+}
+
+// TestExtractRepositorySaturatingBudget guards the J7 fix: the remaining
+// allowance saturates instead of overflowing, so a MaxInt64 budget
+// extracts the REAL bytes exactly like the MaxInt64-1 control (pre-fix
+// it silently truncated every entry to zero bytes with a nil error),
+// while over-budget and negative budgets still refuse.
+func TestExtractRepositorySaturatingBudget(t *testing.T) {
+	dir := t.TempDir()
+	body := "hello"
+	path := writeRawCapsule(t, dir, map[string]string{
+		"bootstrap.json":  minimalBootstrap(),
+		"repo/data/a":     body,
+		"repo/data/b":     body,
+		"ebb-export.json": minimalExportDoc(2, 2*int64(len(body))),
+	})
+	for _, budget := range []int64{math.MaxInt64 - 1, math.MaxInt64} {
+		dst := filepath.Join(dir, fmt.Sprintf("out-%d", budget))
+		if err := extractRepository(path, dst, budget); err != nil {
+			t.Fatalf("budget %d: %v", budget, err)
+		}
+		for _, f := range []string{"data/a", "data/b"} {
+			b, err := os.ReadFile(filepath.Join(dst, filepath.FromSlash(f)))
+			if err != nil || string(b) != body {
+				t.Errorf("budget %d: %s = %q (%v) — real bytes must extract", budget, f, b, err)
+			}
+		}
+	}
+	// Over-budget detection is intact: a budget below the true content
+	// refuses with the named budget error.
+	dst := filepath.Join(dir, "over")
+	if err := extractRepository(path, dst, int64(len(body))); err == nil ||
+		!strings.Contains(err.Error(), "exceeded the verified byte budget") {
+		t.Errorf("over-budget: err = %v (must refuse with the named budget error)", err)
+	}
+	// A negative budget is refused outright instead of silently writing
+	// nothing.
+	if err := extractRepository(path, filepath.Join(dir, "neg"), -1); err == nil {
+		t.Error("negative budget accepted")
 	}
 }

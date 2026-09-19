@@ -11,6 +11,7 @@ package capsule
 // totals, STORED methods) on purpose.
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -19,14 +20,17 @@ import (
 	"testing"
 )
 
-// J5 — validateEntryName misses the Win32 ILLEGAL-CHARACTER class. A
-// container entry whose segment contains `*` (or `? < > | "` or a C0
-// control character) passes every gate in verifyPackage — name
-// validation, method, length, declared totals — so the container is
-// declared "structurally verified", but no filesystem write with that
-// name can ever succeed on Windows (ERROR_INVALID_NAME, live-probed in
-// lab/security-review/wave-J/winnameprobe). The refusal surfaces only
-// at extractRepository, deep inside the import, as an opaque I/O error.
+// J5 — validateEntryName must reject the full Win32 ILLEGAL-CHARACTER
+// class host-agnostically. A container entry whose segment contains `*`
+// (or `? < > | "` or a C0 control character) must be refused by
+// verifyPackage — with an error naming the character class — because no
+// filesystem write with that name can ever succeed on Windows
+// (ERROR_INVALID_NAME, live-probed in
+// lab/security-review/wave-J/winnameprobe). Pre-fix, the refusal
+// surfaced only at extractRepository, deep inside the import, as an
+// opaque I/O error naming neither the defect class nor the gate.
+// Post-fix contract: verifyPackage REFUSES the container and the error
+// names the illegal-character / C0-control class.
 func TestJ5_IllegalCharEntriesPassVerifyButCannotExtract(t *testing.T) {
 	for _, name := range []string{
 		"repo/data/ab*c",    // wildcard: illegal in Win32 filenames
@@ -42,38 +46,39 @@ func TestJ5_IllegalCharEntriesPassVerifyButCannotExtract(t *testing.T) {
 		}
 		path := writeRawCapsule(t, dir, entries)
 
-		// The gate under test: verifyPackage ACCEPTS the container.
-		if _, verr := verifyPackage(path); verr != nil {
-			t.Logf("[%s] verifyPackage refused: %v", name, verr)
+		// The gate under test: verifyPackage must REFUSE the container,
+		// and the refusal must name the character class (not trip some
+		// unrelated earlier gate — the wave-C vacuous-PASS lesson).
+		_, verr := verifyPackage(path)
+		if verr == nil {
+			t.Errorf("J5 [%s]: verifyPackage ACCEPTED an entry name Windows can never create — the container "+
+				"is declared structurally verified yet cannot extract on the primary supported platform "+
+				"(verify/extract contract disagreement; regression of the J5 fix)", name)
 			continue
 		}
-		t.Logf("[%s] verifyPackage ACCEPTED the container (declared totals and methods all check out)", name)
-
-		dst := filepath.Join(dir, "out")
-		exErr := extractRepository(path, dst, 1<<62)
-		if exErr == nil {
-			t.Errorf("J5 [%s]: extraction SUCCEEDED where verify accepted — unexpected on this platform", name)
+		want := "illegal filename character"
+		if strings.Contains(name, "\x01") {
+			want = "C0 control character"
+		}
+		if !strings.Contains(verr.Error(), want) {
+			t.Errorf("J5 [%s]: verifyPackage refused the container but the error does not name the character class (%q): %v", name, want, verr)
 			continue
 		}
-		if runtime.GOOS == "windows" && !strings.Contains(exErr.Error(), name[strings.LastIndex(name, "/")+1:]) {
-			t.Logf("[%s] extraction refused (message does not name the entry): %v", name, exErr)
-		} else {
-			t.Logf("[%s] extraction refused: %v", name, exErr)
-		}
-		t.Errorf("J5 [%s]: verifyPackage accepted an entry name Windows can never create — the container "+
-			"is declared structurally verified yet cannot extract on the primary supported platform "+
-			"(verify/extract contract disagreement; refusal is loud but late and misattributed as an I/O error)", name)
+		t.Logf("[%s] refused at verify, class named: %v", name, verr)
 	}
 }
 
-// J6 — case-collision containers. Two entries differing only by ASCII
-// case (repo/data/Ab, repo/data/ab) are not duplicates to verifyPackage
-// (exact-string dedup), and each name is individually portable, so the
-// container verifies — but on a case-INSENSITIVE filesystem (default
-// NTFS, live-probed: second O_EXCL create fails with "file exists") the
-// extraction refuses at the second entry, while on Linux both extract.
+// J6 — case-collision entries. Two entries differing only by ASCII case
+// (repo/data/Ab, repo/data/ab) are not duplicates to exact-string dedup,
+// and each name is individually portable, so pre-fix the container
+// verified — but on a case-INSENSITIVE filesystem (default NTFS,
+// live-probed: second O_EXCL create fails with "file exists") the
+// extraction refused at the second entry, while Linux extracted both.
 // D028's own rule — "a capsule is judged identically on every platform"
-// — is broken between verify (accepts) and extract (Windows refuses).
+// — was broken between verify (accepts) and extract (Windows refuses).
+// Post-fix contract (per the finding's fix directive): verifyPackage
+// REFUSES the case-collision container on EVERY platform, with an error
+// naming the colliding pair.
 func TestJ6_CaseCollisionEntriesAcceptedAtVerifyDivergeAtExtract(t *testing.T) {
 	dir := t.TempDir()
 	entries := map[string]string{
@@ -84,46 +89,44 @@ func TestJ6_CaseCollisionEntriesAcceptedAtVerifyDivergeAtExtract(t *testing.T) {
 	}
 	path := writeRawCapsule(t, dir, entries)
 
-	if _, verr := verifyPackage(path); verr != nil {
-		t.Fatalf("J6 harness: verifyPackage refused the case-collision container before the gate under test: %v", verr)
+	_, verr := verifyPackage(path)
+	if verr == nil {
+		t.Fatalf("J6 REGRESSION: verifyPackage ACCEPTED the case-collision container (entries Ab + ab, " +
+			"declared totals match) — the J6 fix requires a named refusal on every platform")
 	}
-	t.Log("J6: verifyPackage ACCEPTED the case-collision container (entries Ab + ab, declared totals match)")
+	// The refusal must name the colliding pair, not just the container.
+	for _, want := range []string{"repo/data/Ab", "repo/data/ab", "case-collision"} {
+		if !strings.Contains(verr.Error(), want) {
+			t.Errorf("J6: verifyPackage refusal does not name %q: %v", want, verr)
+		}
+	}
+	t.Logf("J6: refused at verify on %s, pair named: %v", runtime.GOOS, verr)
 
+	// Defense in depth: a caller that skips verify gets the same named
+	// refusal at extract (not a platform-divergent mid-extraction error).
 	dst := filepath.Join(dir, "out")
 	exErr := extractRepository(path, dst, 1<<62)
-	switch runtime.GOOS {
-	case "windows":
-		if exErr == nil {
-			t.Fatalf("J6: extraction of a case-collision container SUCCEEDED on Windows — expected the second O_EXCL create to collide")
-		}
-		if !strings.Contains(exErr.Error(), "ab") {
-			t.Logf("(extraction refusal message: %v)", exErr)
-		}
-		t.Errorf("J6 CONFIRMED: the case-collision container verified clean and then failed deep inside extraction "+
-			"on the case-insensitive filesystem (%v) — verify and extract disagree about the same container, "+
-			"and the refusal names neither the collision nor the offending pair", exErr)
-	case "linux", "darwin":
-		if exErr != nil {
-			t.Fatalf("J6: unexpected extraction failure on a case-sensitive filesystem: %v", exErr)
-		}
-		t.Log("J6 (case-sensitive host): both entries extracted as distinct files — the SAME container that " +
-			"Windows refuses, demonstrating the platform-divergent judgment D028 said a capsule must not have")
-	default:
-		t.Skipf("J6: no case-sensitivity contract pinned for %s", runtime.GOOS)
+	if exErr == nil {
+		t.Fatalf("J6 REGRESSION: extractRepository accepted the case-collision container on %s — the skip-verify defense-in-depth fold is gone", runtime.GOOS)
 	}
+	if !strings.Contains(exErr.Error(), "repo/data/Ab") || !strings.Contains(exErr.Error(), "repo/data/ab") {
+		t.Errorf("J6: extraction refusal does not name the colliding pair: %v", exErr)
+	}
+	t.Logf("J6: refused at extract (defense in depth), pair named: %v", exErr)
 }
 
-// J7 — the HI-2 byte-budget arithmetic overflows at maxBytes ==
-// math.MaxInt64. `remaining := maxBytes - written + 1` wraps to
-// MinInt64, the negative clamp sets it to 0, every io.Copy reads zero
-// bytes, and `written > maxBytes` never fires: the ENTIRE repository
-// extracts as zero-byte files with NO error — the budget that exists to
-// make over-budget writes refuse instead silently truncates everything
-// and reports success. Unreachable through today's callers (the budget
+// J7 — the HI-2 byte-budget arithmetic overflowed at maxBytes ==
+// math.MaxInt64. Pre-fix, `remaining := maxBytes - written + 1` wrapped
+// to MinInt64, the negative clamp set it to 0, every io.Copy read zero
+// bytes, and `written > maxBytes` never fired: the ENTIRE repository
+// extracted as zero-byte files with NO error — the budget that exists to
+// make over-budget writes refuse instead silently truncated everything
+// and reported success. Unreachable through today's callers (the budget
 // is the verified actual byte sum, so MaxInt64 needs 8 EiB of entries
 // in a verified container), but it is a real hole in the enforcement
-// itself: the clamp converts an overflow into "budget exhausted →
-// write nothing", which is indistinguishable from success.
+// itself. Post-fix contract: the allowance SATURATES — a MaxInt64
+// budget extracts the real bytes exactly like the MaxInt64-1 control,
+// and over-budget detection still fires below the true content size.
 func TestJ7_BudgetMaxInt64OverflowSilentlyExtractsZeroBytes(t *testing.T) {
 	dir := t.TempDir()
 	body := "hello"
@@ -135,38 +138,35 @@ func TestJ7_BudgetMaxInt64OverflowSilentlyExtractsZeroBytes(t *testing.T) {
 	}
 	path := writeRawCapsule(t, dir, entries)
 
-	// Control: MaxInt64-1 (no overflow) extracts the real bytes.
-	dst1 := filepath.Join(dir, "ok")
-	if err := extractRepository(path, dst1, math.MaxInt64-1); err != nil {
-		t.Fatalf("J7 control: extraction under MaxInt64-1 failed: %v", err)
-	}
-	for _, f := range []string{"data/a", "data/b"} {
-		b, err := os.ReadFile(filepath.Join(dst1, filepath.FromSlash(f)))
-		if err != nil || string(b) != body {
-			t.Fatalf("J7 control: %s = %q (%v)", f, b, err)
+	extractAll := func(budget int64) string {
+		dst := filepath.Join(dir, fmt.Sprintf("out-%d", budget))
+		if err := extractRepository(path, dst, budget); err != nil {
+			t.Fatalf("J7: extraction under budget %d failed: %v", budget, err)
 		}
+		for _, f := range []string{"data/a", "data/b"} {
+			b, err := os.ReadFile(filepath.Join(dst, filepath.FromSlash(f)))
+			if err != nil || string(b) != body {
+				t.Fatalf("J7: budget %d: %s = %q (%v) — real bytes must extract", budget, f, b, err)
+			}
+		}
+		return dst
 	}
 
-	// The defect: MaxInt64 extracts everything as ZERO bytes, no error.
-	dst2 := filepath.Join(dir, "overflow")
-	if err := extractRepository(path, dst2, math.MaxInt64); err != nil {
-		t.Fatalf("J7: expected silent success under MaxInt64, got error %v (defect shape changed)", err)
+	// Control: MaxInt64-1 (no overflow) extracts the real bytes.
+	extractAll(math.MaxInt64 - 1)
+	// The fixed defect: MaxInt64 must behave identically — the saturating
+	// allowance extracts the real bytes instead of silently truncating
+	// every entry to zero bytes shaped like success.
+	extractAll(math.MaxInt64)
+	t.Log("J7: MaxInt64 and MaxInt64-1 budgets both extract the real bytes — the allowance saturates")
+
+	// The over-budget detection the HI-2 budget exists for still fires:
+	// a budget below the true content (10 bytes) must refuse with the
+	// named budget error, not silently under-extract.
+	dst := filepath.Join(dir, "over")
+	err := extractRepository(path, dst, int64(len(body)))
+	if err == nil || !strings.Contains(err.Error(), "exceeded the verified byte budget") {
+		t.Fatalf("J7: over-budget extraction must refuse with the named budget error, got: %v", err)
 	}
-	zeroed := 0
-	for _, f := range []string{"data/a", "data/b"} {
-		fi, err := os.Stat(filepath.Join(dst2, filepath.FromSlash(f)))
-		if err != nil {
-			t.Fatalf("J7: %s missing: %v", f, err)
-		}
-		if fi.Size() == 0 {
-			zeroed++
-		}
-	}
-	if zeroed != 2 {
-		t.Fatalf("J7: expected both entries zero-byte under MaxInt64, got %d/2 (arithmetic changed)", zeroed)
-	}
-	t.Error("J7 CONFIRMED: extractRepository with a MaxInt64 budget silently extracted every entry as a " +
-		"ZERO-BYTE file and returned nil — the `maxBytes - written + 1` overflow wraps to MinInt64, the " +
-		"negative clamp zeroes the LimitReader, and the `written > maxBytes` check never fires; the byte " +
-		"budget's enforcement converts an overflow into silent full truncation shaped like success")
+	t.Logf("J7: over-budget write refused: %v", err)
 }
