@@ -120,6 +120,26 @@ func (e *ErrJournalMismatch) Error() string {
 	return "lifecycle: durable evidence inconsistent: " + e.Detail
 }
 
+// ErrCancelRefused reports that --cancel was refused because the
+// operation sits in the §12.2 step-7 quarantine-rename crash window (or
+// its aftermath): the deterministic quarantine sibling exists, so the
+// workspace tree may be mid-rename at that path and canceling would
+// strand it with no durable pointer (Wave G review finding G4). The
+// sibling is probed EXISTENCE-ONLY and never touched regardless of
+// identity; `ebb recover <op>` is the reconciliation path — it
+// adopts-or-reports by native identity (F5/D020) and never deletes
+// anything unrecognized. The operation's phase is unchanged.
+type ErrCancelRefused struct {
+	OperationID domain.OperationID
+	Quarantine  string
+}
+
+func (e *ErrCancelRefused) Error() string {
+	return fmt.Sprintf(
+		"lifecycle: cancel of operation %s refused: the quarantine sibling %s EXISTS — the workspace may be mid-rename at the quarantine path (crash window between the \u00a712.2 step-7 rename and its journal commit); canceling now would strand the tree there with no durable pointer and this error never claims otherwise. Run `ebb recover %s` instead: it adopts-or-reports the sibling by identity (F5/D020)",
+		e.OperationID, e.Quarantine, e.OperationID)
+}
+
 // errPayloadIncomplete is the internal marker wrapped into returned
 // errors when a payload snapshot exists but failed verification, so the
 // caller-facing text can state the §11.3 retention rule.

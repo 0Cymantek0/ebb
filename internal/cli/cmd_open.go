@@ -356,19 +356,38 @@ func openApprovalResolver(deps Deps, streams Streams, yes bool, store *approvals
 }
 
 // approvalPromptText renders the grouped approval listing (§7.3: the
-// exact command, executable identity, inputs, outputs and network the
-// approval would pin; shell actions carry the stronger warning
-// verbatim; stale approvals show their drift lines).
+// exact command, executable identity, working root, inputs, outputs,
+// env allowlist and network the approval would pin; shell actions carry
+// the stronger warning verbatim; stale approvals show their drift
+// lines). Secret-bearing env keys (Ebb's own denylist, Foundation
+// §13.1) are never displayed by name — an action asking for one is
+// definitionally unapprovable (actions.ErrEnvDenylisted refuses the
+// definition before a prompt can exist), so the prompt says that
+// instead of spelling the key or offering a yes/no choice.
 func approvalPromptText(pending []restore.PendingApproval) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "The following reconstruction actions will run at the destination:\n")
 	for _, p := range pending {
 		fmt.Fprintf(&b, "  - %s: %s\n", p.Def.ID, strings.Join(p.Def.Argv, " "))
 		fmt.Fprintf(&b, "      tool: %s (sha256 %s…)\n", p.Tool.ResolvedPath, shaPrefix(p.Tool.SHA256))
+		if p.Def.WorkingRoot != "" {
+			fmt.Fprintf(&b, "      working root: %s\n", p.Def.WorkingRoot)
+		}
 		if len(p.Def.Inputs) > 0 {
 			fmt.Fprintf(&b, "      inputs: %s\n", strings.Join(p.Def.Inputs, ", "))
 		}
 		fmt.Fprintf(&b, "      outputs: %s\n", strings.Join(p.Def.Outputs, ", "))
+		if len(p.Def.EnvAllow) > 0 {
+			keys := make([]string, 0, len(p.Def.EnvAllow))
+			for _, k := range actions.CanonicalEnvAllow(p.Def.EnvAllow) {
+				if actions.EnvKeyDenylisted(k) {
+					keys = append(keys, "<secret-bearing env key suppressed; an action asking for it is unapprovable>")
+					continue
+				}
+				keys = append(keys, k)
+			}
+			fmt.Fprintf(&b, "      env allow: %s\n", strings.Join(keys, ", "))
+		}
 		fmt.Fprintf(&b, "      network: %s\n", p.Def.Network)
 		if w := p.Def.ShellWarning(); w != "" {
 			fmt.Fprintf(&b, "      %s\n", w)

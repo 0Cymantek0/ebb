@@ -195,8 +195,12 @@ func validatePathList(defID, what string, paths []string, allowDot bool) error {
 
 // validateEnvAllow checks that every allowlisted key is a usable
 // environment key: non-empty, no '=' or NUL, no duplicates (compared the
-// way the platform compares env names), and not one of the substrate
-// keys that every action already receives.
+// way the platform compares env names), not one of the substrate keys
+// that every action already receives, and not one of Ebb's own
+// secret-bearing environment names (an action asking for the vault
+// unlock secret is definitionally unapprovable — Foundation §13.1, Wave
+// G review finding G1c: the refusal happens here, before any prompt or
+// approval record can exist).
 func validateEnvAllow(d Definition) error {
 	for i, k := range d.EnvAllow {
 		if k == "" {
@@ -210,6 +214,9 @@ func validateEnvAllow(d Definition) error {
 				return fmt.Errorf("actions: definition %q: env allowlist key %q is part of the OS substrate and cannot be re-allowed", d.ID, k)
 			}
 		}
+		if EnvKeyDenylisted(k) {
+			return &ErrEnvDenylisted{ActionID: d.ID, Key: k}
+		}
 		for j := 0; j < i; j++ {
 			if envKeyMatches(d.EnvAllow[j], k) {
 				return fmt.Errorf("actions: definition %q: duplicate env allowlist key %q", d.ID, k)
@@ -221,8 +228,13 @@ func validateEnvAllow(d Definition) error {
 
 // ValidateGraph validates every definition and enforces that the
 // DependsOn edges over the given set form a DAG: duplicate IDs and
-// dependencies on actions outside the set are rejected, and cycles are
-// rejected by depth-first search with a deterministic error message.
+// dependencies on actions outside the set are rejected, cycles are
+// rejected by depth-first search with a deterministic error message, and
+// two definitions whose declared Outputs overlap (same path or
+// containment) are rejected — they would race for the same tree, and
+// each would silently widen the other's F36 exclusion (the reader-side
+// twin of policy's capture-time output-conflict rule; Wave G review
+// finding G1).
 func ValidateGraph(defs []Definition) error {
 	byID := make(map[string]Definition, len(defs))
 	for i := range defs {
@@ -238,6 +250,24 @@ func ValidateGraph(defs []Definition) error {
 		for _, dep := range defs[i].DependsOn {
 			if _, ok := byID[dep]; !ok {
 				return fmt.Errorf("actions: action %q depends on unknown action %q", defs[i].ID, dep)
+			}
+		}
+	}
+
+	// Cross-definition output overlap: deterministic over the sorted id
+	// pair sequence so the error never depends on input order.
+	ids := slices.Sorted(maps.Keys(byID))
+	for i := 0; i < len(ids); i++ {
+		for j := i + 1; j < len(ids); j++ {
+			a, b := byID[ids[i]], byID[ids[j]]
+			for _, oa := range a.Outputs {
+				for _, ob := range b.Outputs {
+					if pathsOverlap(oa, ob) {
+						return fmt.Errorf(
+							"actions: definitions %q and %q declare overlapping outputs (%q and %q); two actions racing for the same tree each silently widen the other's protected-content exclusion",
+							a.ID, b.ID, oa, ob)
+					}
+				}
 			}
 		}
 	}
@@ -288,6 +318,14 @@ func ValidateGraph(defs []Definition) error {
 // for the env allowlist.
 func CanonicalEnvAllow(keys []string) []string {
 	out := append([]string(nil), keys...)
+	slices.Sort(out)
+	return out
+}
+
+// CanonicalOutputs returns the sorted copy of output roots that
+// approvals store for the output ownership (Foundation §7.3).
+func CanonicalOutputs(paths []string) []string {
+	out := append([]string(nil), paths...)
 	slices.Sort(out)
 	return out
 }

@@ -18,8 +18,10 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"ebb/internal/actions"
 	"ebb/internal/restore"
@@ -43,10 +45,25 @@ func TestPoCApprovalPromptOmitsEnvAllowlistAndWorkingRoot(t *testing.T) {
 	}}
 	_ = context.Background()
 	text := approvalPromptText(pending)
-	if !strings.Contains(text, "EBB_VAULT_PASSWORD") || !strings.Contains(text, "attacker-shipped-subdir") {
-		t.Fatalf("G1c CONFIRMED: the approval prompt never shows the env allowlist (here carrying the "+
-			"secret-bearing process key EBB_VAULT_PASSWORD) or the working root (%q) — the user approves "+
-			"blind on exactly the two fields whose drift the approval identity also fails to pin (G1/G1b). "+
-			"Prompt text was:\n%s", "attacker-shipped-subdir", text)
+	// Fixed build (fix holds): the prompt shows the working root and the
+	// env allowlist — but a secret-bearing env key (Ebb's own denylist,
+	// Foundation §13.1) is NEVER spelled by name; the placeholder says it
+	// is unapprovable instead. And such a definition cannot even reach a
+	// prompt: validation refuses it outright (ErrEnvDenylisted), so no
+	// approval record can ever exist for it.
+	if strings.Contains(text, "EBB_VAULT_PASSWORD") {
+		t.Fatalf("G1c REGRESSION: the approval prompt spells the secret-bearing env key by name:\n%s", text)
+	}
+	if !strings.Contains(text, "attacker-shipped-subdir") {
+		t.Fatalf("G1c REGRESSION: the approval prompt still hides the working root:\n%s", text)
+	}
+	if !strings.Contains(text, "secret-bearing env key suppressed") {
+		t.Fatalf("G1c REGRESSION: the prompt lists env keys without the suppression marker for denylisted ones:\n%s", text)
+	}
+	validDef := pending[0].Def
+	validDef.Timeout = time.Minute // isolate the denylist from the timeout rule
+	var denied *actions.ErrEnvDenylisted
+	if err := validDef.Validate(); !errors.As(err, &denied) {
+		t.Fatalf("G1c REGRESSION: a definition asking for EBB_VAULT_PASSWORD must fail Validate with ErrEnvDenylisted (never promptable, never approvable), got %v", err)
 	}
 }

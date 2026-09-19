@@ -190,7 +190,8 @@ func (s stubApprover) Matches(actions.Definition, actions.ToolIdentity, map[stri
 }
 
 // buildApproval records what an honest approval flow would pin for def:
-// the resolved tool identity and the digests of the current inputs.
+// the resolved tool identity, the digests of the current inputs, and the
+// §7.3 working root and output ownership.
 func buildApproval(t *testing.T, def actions.Definition, wsRoot string) *actions.Approval {
 	t.Helper()
 	tool, err := actions.ResolveTool(def.Argv[0])
@@ -209,6 +210,8 @@ func buildApproval(t *testing.T, def actions.Definition, wsRoot string) *actions
 		ActionID:     def.ID,
 		ArgvDigest:   actions.ArgvDigest(def.Argv),
 		Tool:         tool,
+		WorkingRoot:  def.WorkingRoot,
+		Outputs:      actions.CanonicalOutputs(def.Outputs),
 		InputDigests: digests,
 		EnvAllow:     actions.CanonicalEnvAllow(def.EnvAllow),
 		Network:      def.Network,

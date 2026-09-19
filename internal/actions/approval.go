@@ -16,10 +16,11 @@ import (
 )
 
 // Approval records one local authorization (Foundation §7.3): the exact
-// command, executable identity, input digests, environment allowlist and
-// network declaration a specific user approved at a specific time. A
-// local approval never transfers: imported policy or capsules start
-// untrusted regardless of what they contain.
+// command, executable identity, working root, input digests, output
+// ownership, environment allowlist and network declaration a specific
+// user approved at a specific time. A local approval never transfers:
+// imported policy or capsules start untrusted regardless of what they
+// contain.
 type Approval struct {
 	// ID identifies this approval record.
 	ID domain.ID `json:"id"`
@@ -29,6 +30,15 @@ type Approval struct {
 	ArgvDigest string `json:"argv_digest"`
 	// Tool pins the resolved executable path and its SHA-256.
 	Tool ToolIdentity `json:"tool"`
+	// WorkingRoot is the approved root-relative working directory (""
+	// means the workspace root; Foundation §7.3 pins the working root as
+	// approval-authorized state — Wave G review finding G1).
+	WorkingRoot string `json:"working_root"`
+	// Outputs is the canonical (sorted) declared output ownership
+	// (Foundation §7.3 "output ownership"). Whatever the outputs cover is
+	// exempt from the F36 protected-content gate, so drift here widens
+	// what an approved action may silently change — it must re-prompt.
+	Outputs []string `json:"outputs"`
 	// InputDigests maps root-relative input path to content SHA-256.
 	InputDigests map[string]string `json:"input_digests"`
 	// EnvAllow is the canonical (sorted) env key allowlist.
@@ -99,10 +109,18 @@ func ResolveTool(name string) (ToolIdentity, error) {
 
 // ApprovalMatches reports whether approval exactly covers the resolved
 // definition. It returns nil on an exact match over ALL of action id +
-// argv digest + tool identity (path AND sha256) + every input digest +
-// env allowlist + network; otherwise it returns an *ErrApprovalStale
-// whose Diff names each drifted field. The pure comparison lives here so
-// every Approver implementation shares one drift definition.
+// argv digest + tool identity (path AND sha256) + working root + output
+// ownership + every input digest + env allowlist + network; otherwise it
+// returns an *ErrApprovalStale whose Diff names each drifted field. The
+// pure comparison lives here so every Approver implementation shares one
+// drift definition.
+//
+// Migration (Wave G review finding G1): records persisted before the
+// working-root/output fields existed carry no output ownership. They are
+// STALE — never silently honored — with a drift line saying the recorded
+// approval does not cover the working root/outputs; one re-approval
+// records them. The store is a rebuildable cache of trust decisions, so
+// a single honest re-prompt is the whole migration cost.
 func ApprovalMatches(approval *Approval, def Definition, tool ToolIdentity, inputDigests map[string]string) *ErrApprovalStale {
 	if approval == nil {
 		return &ErrApprovalStale{Diff: []string{"approval missing"}}
@@ -119,6 +137,20 @@ func ApprovalMatches(approval *Approval, def Definition, tool ToolIdentity, inpu
 	}
 	if approval.Tool.SHA256 != tool.SHA256 {
 		diff = append(diff, fmt.Sprintf("tool sha256: approved %s, current %s (executable bytes changed)", approval.Tool.SHA256, tool.SHA256))
+	}
+
+	if len(approval.Outputs) == 0 {
+		// A valid definition always declares at least one output root,
+		// so empty recorded outputs mean the record predates output
+		// pinning: stale, never silently honored (see the migration note).
+		diff = append(diff, "working root/outputs not covered by the recorded approval (recorded before these fields were pinned); one re-approval records them")
+	} else {
+		if approval.WorkingRoot != def.WorkingRoot {
+			diff = append(diff, fmt.Sprintf("working root: approved %q, current %q", approval.WorkingRoot, def.WorkingRoot))
+		}
+		if want := CanonicalOutputs(def.Outputs); !slices.Equal(approval.Outputs, want) {
+			diff = append(diff, fmt.Sprintf("outputs: approved %v, current %v (the approved output ownership changed)", approval.Outputs, want))
+		}
 	}
 
 	declared := make(map[string]bool, len(def.Inputs))

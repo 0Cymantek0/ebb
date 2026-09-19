@@ -329,10 +329,16 @@ func TestRebuildF36ProtectedChangeDetectedFilesKept(t *testing.T) {
 func TestResumeRebuildRunsOnlyUnsucceededActions(t *testing.T) {
 	f := rebuildFixture(t, "go", "version")
 	dest := rebuildDest(f)
-	// Phase 1: the action succeeds (journaled) but F36 fails the rebuild
-	// because a protected file changed.
+	// Phase 1: the action succeeds (journaled, outputs materialized as
+	// any successful action must) but F36 fails the rebuild because a
+	// protected file changed.
 	runner := &fakeRunner{fn: func(def actions.Definition) (actions.Result, error) {
 		_ = os.WriteFile(filepath.Join(dest, "a.txt"), []byte("trampled\n"), 0o644)
+		for _, out := range def.Outputs {
+			if err := os.MkdirAll(filepath.Join(dest, filepath.FromSlash(out)), 0o755); err != nil {
+				return actions.Result{ExitCode: -1}, err
+			}
+		}
 		return actions.Result{ExitCode: 0}, nil
 	}}
 	o, _ := newRebuildOpener(f, runner, false)

@@ -36,10 +36,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -47,6 +45,7 @@ import (
 	"ebb/internal/actions"
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
+	"ebb/internal/pathcanon"
 	"ebb/internal/policy"
 )
 
@@ -270,23 +269,25 @@ func resolvedRoutesDigest(entries []domain.Entry, groupIDs []string) string {
 // spellings — capturing the repo into itself, parking a tree that lives
 // inside the live restic repository, or deleting the passfile with the
 // workspace are all unacceptable. Comparisons run on canonicalized
-// paths (canonicalPath resolves symlinks and junctions).
+// paths (pathcanon.CanonicalPath resolves symlinks and junctions; the
+// canonicalizer is shared with restore's destination-side I06 twin so
+// the two sides can never drift apart).
 func preflight(rootAbs string, vault VaultRef) error {
-	rootCanon := canonicalPath(rootAbs)
-	repoCanon := canonicalPath(mustAbs(vault.RepoDir))
+	rootCanon := pathcanon.CanonicalPath(rootAbs)
+	repoCanon := pathcanon.CanonicalPath(vault.RepoDir)
 	if repoCanon == rootCanon {
 		return &ErrDestructiveBlocked{Reasons: []string{
 			fmt.Sprintf("vault repository %s IS the captured root %s; capture would destroy its own backend", vault.RepoDir, rootAbs)}}
 	}
-	if underPath(repoCanon, rootCanon) {
+	if pathcanon.UnderPath(repoCanon, rootCanon) {
 		return &ErrDestructiveBlocked{Reasons: []string{
 			fmt.Sprintf("captured root %s is inside the vault repository %s; parking would quarantine and delete a tree inside the live backend (I06)", rootAbs, vault.RepoDir)}}
 	}
-	if underPath(rootCanon, repoCanon) {
+	if pathcanon.UnderPath(rootCanon, repoCanon) {
 		return &ErrDestructiveBlocked{Reasons: []string{
 			fmt.Sprintf("vault repository %s is inside the captured root %s; capture would destroy its own backend", vault.RepoDir, rootAbs)}}
 	}
-	if underPath(rootCanon, canonicalPath(mustAbs(vault.Passfile))) {
+	if pathcanon.UnderPath(rootCanon, pathcanon.CanonicalPath(vault.Passfile)) {
 		return &ErrDestructiveBlocked{Reasons: []string{
 			fmt.Sprintf("vault passfile %s is inside the captured root %s; parking would delete the unlock secret", vault.Passfile, rootAbs)}}
 	}
@@ -301,92 +302,11 @@ func mustAbs(p string) string {
 	return abs
 }
 
-// canonicalLinkBudget bounds alias resolution (chains of links pointing
-// at links); beyond it the lexical spelling stands.
-const canonicalLinkBudget = 32
-
-// canonicalPath resolves alias spellings — symlinks AND Windows
-// junctions/mount points — to a final absolute path, stdlib only (this
-// package must not import internal/platform, Foundation §16.7).
-//
-// filepath.EvalSymlinks alone is NOT sufficient on Windows: Go reports
-// junctions as ModeIrregular (not ModeSymlink), so EvalSymlinks neither
-// resolves them nor paths traversing them (probe-verified) — exactly the
-// alias class of Wave F review finding F6. canonicalPath therefore walks
-// the path components itself: a component observed as a link
-// (ModeSymlink or ModeIrregular) is resolved through os.Readlink (which
-// DOES read junction text on Windows) and resolution restarts on the
-// target (nested aliases collapse); a regular existing component is
-// normalized through EvalSymlinks, which also expands 8.3-short and
-// true-case spellings (the GIT-WT-1 lesson).
-//
-// Residual, documented honestly: a component that cannot be resolved —
-// it does not exist yet (a not-yet-initialized vault repo), cannot be
-// read, is a subst/ mapped drive with no link object to read, or the
-// link budget is exhausted — falls back to its lexical spelling, and an
-// alias expressed only through such a spelling can still go unnoticed
-// by this comparison. Removal-side identity revalidation (I13) remains
-// the backstop for anything that slips past preflight.
-func canonicalPath(p string) string {
-	return canonicalFrom(filepath.Clean(mustAbs(p)), canonicalLinkBudget)
-}
-
-func canonicalFrom(p string, budget int) string {
-	if budget <= 0 {
-		return p
-	}
-	vol := filepath.VolumeName(p)
-	rest := strings.TrimPrefix(p, vol)
-	rest = strings.TrimPrefix(rest, string(filepath.Separator))
-	cur := string(filepath.Separator)
-	if vol != "" {
-		cur = vol + string(filepath.Separator)
-	}
-	for _, comp := range strings.Split(rest, string(filepath.Separator)) {
-		if comp == "" {
-			continue
-		}
-		child := filepath.Join(cur, comp)
-		fi, err := os.Lstat(child)
-		if err == nil && fi.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
-			// An alias component: resolve its target and continue from
-			// the RESOLVED path (handles nested aliases).
-			tgt, rerr := os.Readlink(child)
-			if rerr != nil || tgt == "" {
-				cur = child
-				continue
-			}
-			tgt = strings.TrimPrefix(tgt, `\??\`) // junction substitute-name prefix
-			if !filepath.IsAbs(tgt) {
-				tgt = filepath.Join(cur, tgt)
-			}
-			cur = canonicalFrom(filepath.Clean(tgt), budget-1)
-			continue
-		}
-		// A regular (or missing) component: EvalSymlinks resolves any
-		// symlink spelling of the prefix AND normalizes short/case
-		// forms; on failure keep the lexical spelling (residual above).
-		if resolved, ferr := filepath.EvalSymlinks(child); ferr == nil {
-			cur = resolved
-		} else {
-			cur = child
-		}
-	}
-	return cur
-}
-
-// underPath reports whether child equals or lies below parent (native
-// separators; both must already be cleaned/absolute).
-func underPath(parent, child string) bool {
-	if parent == child {
-		return true
-	}
-	rel, err := filepath.Rel(parent, child)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
+// The junction-aware path canonicalizer this package's preflight uses
+// lives in internal/pathcanon (shared with restore's destination-side
+// I06 twin — Wave G review finding G3; one canonicalizer, no drifting
+// copies). Its documented residual (subst drives and other unresolvable
+// spellings stay lexical) is recorded there.
 
 // beginOperation resolves/creates the workspace and opens the journaled
 // operation with the F37 single-active-operation check.

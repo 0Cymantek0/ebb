@@ -76,3 +76,42 @@ type ErrTimeout struct {
 func (e *ErrTimeout) Error() string {
 	return fmt.Sprintf("actions: action %q exceeded its %s timeout and was killed", e.ActionID, e.Timeout)
 }
+
+// secretEnvKeys is the documented denylist of Ebb's own secret-bearing
+// environment names (Foundation §13.1: secrets never reach command
+// arguments, logs, or child process environments). An action whose env
+// allowlist asks for any of these keys is definitionally unapprovable:
+// no approval may ever be recorded for it, it is never displayed as a
+// pending yes/no choice, and Definition.Validate refuses it outright —
+// the value would flow from the vault-unlock mechanism straight into an
+// approved arbitrary command's environment (Wave G review finding G1c).
+var secretEnvKeys = []string{
+	"EBB_VAULT_PASSWORD", // the vault unlock secret (vault passfile mechanism)
+}
+
+// EnvKeyDenylisted reports whether key matches one of Ebb's own
+// secret-bearing environment names (platform env-name matching rules:
+// case-insensitive on Windows).
+func EnvKeyDenylisted(key string) bool {
+	for _, secret := range secretEnvKeys {
+		if envKeyMatches(key, secret) {
+			return true
+		}
+	}
+	return false
+}
+
+// ErrEnvDenylisted reports that an action's env allowlist asks for one
+// of Ebb's own secret-bearing environment keys. Such an action is
+// definitionally unapprovable: the refusal happens at validation, before
+// any prompt, approval record, or execution (never a yes/no question).
+type ErrEnvDenylisted struct {
+	ActionID string
+	Key      string
+}
+
+func (e *ErrEnvDenylisted) Error() string {
+	return fmt.Sprintf(
+		"actions: action %q asks for the secret-bearing environment key %q in its env allowlist; an action requesting Ebb's own secrets is definitionally unapprovable — fix the action definition",
+		e.ActionID, e.Key)
+}

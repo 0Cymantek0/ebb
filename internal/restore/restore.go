@@ -286,7 +286,7 @@ func (o *Opener) Open(ctx context.Context, vault VaultRef, snapID domain.Snapsho
 	}
 
 	// ---- §12.5 step 4: destination preflight -------------------------
-	dest, err := o.preflight(ctx, snap.WorkspaceID, opts.Destination, docs)
+	dest, err := o.preflight(ctx, snap.WorkspaceID, vault, opts.Destination, docs)
 	if err != nil {
 		return res, err
 	}

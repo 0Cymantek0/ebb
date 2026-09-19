@@ -25,6 +25,7 @@ const (
 	CodeLinksBlocked      = "EBB_E_LINK_BLOCKED"
 	CodeRebuildFailed     = "EBB_E_REBUILD_FAILED"
 	CodeProtectedChanged  = "EBB_E_PROTECTED_CHANGED"
+	CodeVaultOverlap      = "EBB_E_VAULT_OVERLAP"
 )
 
 // ErrNotOpenable reports that the selected snapshot cannot be opened at
@@ -230,3 +231,25 @@ func (e *ErrProtectedChanged) Error() string {
 }
 
 func (e *ErrProtectedChanged) Code() string { return CodeProtectedChanged }
+
+// ErrVaultOverlap is the open-side I06 twin (Wave G review finding G3):
+// the requested destination — and with it the .ebb-stage-<opID> staging
+// sibling restore materializes next to it — overlaps the vault
+// repository (either direction) or the vault passfile through a direct
+// OR ALIAS spelling (pathcanon resolves symlinks and junctions, the
+// same canonicalizer lifecycle's capture preflight uses). Refused
+// before any staging side effect: restoring workspace files into the
+// live backend (or over the unlock secret's tree) interleaves restore
+// and vault state unnoticed — Foundation §6.4 I06.
+type ErrVaultOverlap struct {
+	Destination string
+	VaultPath   string // the repo dir or passfile the destination overlaps
+	Detail      string
+}
+
+func (e *ErrVaultOverlap) Error() string {
+	return fmt.Sprintf("restore: destination %s overlaps vault path %s: %s (Foundation I06: root/vault/operation paths cannot overlap through aliases unnoticed; canonicalized through symlinks and junctions)",
+		e.Destination, e.VaultPath, e.Detail)
+}
+
+func (e *ErrVaultOverlap) Code() string { return CodeVaultOverlap }
