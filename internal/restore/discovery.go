@@ -80,6 +80,7 @@ package restore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -288,7 +289,11 @@ func DiscoverVault(ctx context.Context, store domain.SnapshotStore, vault VaultR
 	return d, nil
 }
 
-// discoverSeal verifies one seal candidate end to end. Exactly one of
+// discoverSeal verifies one seal candidate end to end: the receipt is
+// shape-gated (.ebb-seal-<32hex>/receipt.json), strict-parsed and
+// cross-checked, then the payload verification is re-derived from P's
+// own bytes through loadPayloadEvidence (the shared trust core also
+// used by the capsule-import evidence loader). Exactly one of
 // pair/finding is non-nil; (nil, nil) cannot happen (a seal that yields
 // nothing is itself a finding).
 func discoverSeal(ctx context.Context, store domain.SnapshotStore, vault VaultRef, seal domain.SnapshotRef, present map[string]domain.SnapshotRef, repoID string) (*DiscoveredPair, *SuspiciousFinding) {
@@ -349,98 +354,33 @@ func discoverSeal(ctx context.Context, store domain.SnapshotStore, vault VaultRe
 			receipt.PayloadBackendID))
 	}
 
-	// Trust core: re-derive the payload verification from P's own bytes.
-	// The receipt's digests bind the manifest and the accounting document;
-	// we hash what the backend actually stores and compare (I12).
-	opDir := opDirName(receipt.OperationID)
-	manifestRaw, err := store.DumpFile(ctx, vault.RepoDir, vault.Passfile, payload.BackendID, "/"+opDir+"/"+manifestName)
+	// Trust core: re-derive the payload verification from P's own bytes
+	// through the shared payload-evidence loader (below). The receipt's
+	// digests bind the manifest and the accounting document; the loader
+	// hashes what the backend actually stores and compares (I12), and
+	// additionally requires that the op dir named by the receipt's
+	// operation id is the one the payload tree actually carries.
+	ev, err := loadPayloadEvidence(ctx, store, vault, payload.BackendID, payloadClaims{
+		manifestDigest:  receipt.ManifestDigest,
+		inventoryDigest: receipt.InventoryDigest,
+		snapshotID:      receipt.SnapshotID,
+		workspaceID:     receipt.WorkspaceID,
+		requireOpDir:    opDirName(receipt.OperationID),
+		claimant:        "receipt",
+	})
 	if err != nil {
-		return refuse(fmt.Sprintf("reading %s from payload %s: %v", "/"+opDir+"/"+manifestName, payload.BackendID, err))
-	}
-	if got := digestBytes(manifestRaw); got != receipt.ManifestDigest {
-		return refuse(fmt.Sprintf("%s: digest %s, receipt declares %s — the payload does not match its seal",
-			manifestName, got, receipt.ManifestDigest))
-	}
-	var manifest manifestDoc
-	if err := decodeStrict(manifestRaw, &manifest); err != nil {
-		return refuse(fmt.Sprintf("%s failed strict parsing: %v", manifestName, err))
-	}
-	if manifest.SchemaVersion != schemaVersionCurrent {
-		return refuse(fmt.Sprintf("manifest schema_version %d, reader supports %d", manifest.SchemaVersion, schemaVersionCurrent))
-	}
-	if len(manifest.RequiredFeatures) > 0 {
-		return refuse(fmt.Sprintf("manifest declares unsupported required features %v", manifest.RequiredFeatures))
-	}
-	if manifest.SnapshotID != receipt.SnapshotID {
-		return refuse(fmt.Sprintf("manifest snapshot_id %q disagrees with the receipt's %q", manifest.SnapshotID, receipt.SnapshotID))
-	}
-	if manifest.WorkspaceID != receipt.WorkspaceID {
-		return refuse(fmt.Sprintf("manifest workspace_id %q disagrees with the receipt's %q", manifest.WorkspaceID, receipt.WorkspaceID))
-	}
-	if manifest.Inventory.Path == "" {
-		return refuse("manifest names no accounting document (inventory.path empty)")
-	}
-	invRaw, err := store.DumpFile(ctx, vault.RepoDir, vault.Passfile, payload.BackendID, "/"+opDir+"/"+manifest.Inventory.Path)
-	if err != nil {
-		return refuse(fmt.Sprintf("reading %s from payload %s: %v", manifest.Inventory.Path, payload.BackendID, err))
-	}
-	if got := digestBytes(invRaw); got != receipt.InventoryDigest {
-		return refuse(fmt.Sprintf("%s: digest %s, receipt declares %s — the payload does not match its seal",
-			manifest.Inventory.Path, got, receipt.InventoryDigest))
-	}
-
-	// Workspace name + kind come from the frozen manifest (D003 prefix
-	// bijection; §16.2 contract vocabulary).
-	var main *manifestRoot
-	for i := range manifest.Roots {
-		if manifest.Roots[i].ID == string(domain.RootMain) {
-			main = &manifest.Roots[i]
-			break
-		}
-	}
-	if main == nil {
-		return refuse(fmt.Sprintf("manifest has no root with id %q; the workspace tree prefix is unknown", domain.RootMain))
-	}
-	if err := validBackendPrefix(main.BackendPrefix); err != nil {
-		return refuse(fmt.Sprintf("main root backend_prefix: %v", err))
-	}
-
-	// Parse the accounting stream too: canonical order, validated entries
-	// (the same strictness loadDocuments applies — a well-formed digest
-	// over garbage bytes is not adoption evidence). Trim payloads carry
-	// removal-manifest.json instead of inventory.jsonl, so only the
-	// inventory.jsonl shape is parsed here; the digest gate above already
-	// bound whichever document the manifest names.
-	var preservedEntries, preservedBytes int64
-	if manifest.Inventory.Path == inventoryName {
-		entries, perr := parseInventory(invRaw)
-		if perr != nil {
-			return refuse(fmt.Sprintf("retained accounting document: %v", perr))
-		}
-		if manifest.Inventory.Count != int64(len(entries)) {
-			return refuse(fmt.Sprintf("manifest inventory count %d, payload carries %d records",
-				manifest.Inventory.Count, len(entries)))
-		}
-		for _, e := range entries {
-			if e.Route != domain.RoutePreserve {
-				continue
-			}
-			preservedEntries++
-			if e.Kind == domain.KindFile {
-				preservedBytes += e.LogicalSize
-			}
-		}
+		return nil, &SuspiciousFinding{BackendID: seal.BackendID, Reasons: evidenceDetails(err)}
 	}
 
 	return &DiscoveredPair{
 		SnapshotID:       domain.SnapshotID(receipt.SnapshotID),
 		WorkspaceID:      domain.WorkspaceID(receipt.WorkspaceID),
-		WorkspaceName:    main.BackendPrefix,
+		WorkspaceName:    ev.wsPrefix,
 		PayloadBackendID: payload.BackendID,
 		SealBackendID:    seal.BackendID,
-		ManifestDigest:   receipt.ManifestDigest,
-		InventoryDigest:  receipt.InventoryDigest,
-		Kind:             kindFromContract(manifest.Contract.Scope, manifest.Contract.Consistency),
+		ManifestDigest:   ev.manifestDigest,
+		InventoryDigest:  ev.inventoryDigest,
+		Kind:             ev.kind,
 		CreatedAt:        firstNonEmpty(payload.Time, domain.FormatTime(time.Now().UTC())),
 		Receipt: ReceiptFacts{
 			OperationID:  receipt.OperationID,
@@ -449,8 +389,8 @@ func discoverSeal(ctx context.Context, store domain.SnapshotStore, vault VaultRe
 			Time:         receipt.Verification.Time,
 			ToolVersions: receipt.Verification.ToolVersions,
 		},
-		PreservedEntries: preservedEntries,
-		PreservedBytes:   preservedBytes,
+		PreservedEntries: ev.preservedEntries,
+		PreservedBytes:   ev.preservedBytes,
 	}, nil
 }
 
@@ -463,34 +403,11 @@ func discoverUnsealed(ctx context.Context, store domain.SnapshotStore, vault Vau
 	}
 
 	// The op dir is located by tree shape (.ebb-op-<32hex>/manifest.json),
-	// not by the ws/ebb-op tags (tags are hints).
-	ls, err := store.Ls(ctx, vault.RepoDir, vault.Passfile, p.BackendID)
+	// not by the ws/ebb-op tags (tags are hints) — the same shape gate the
+	// shared payload-evidence core applies.
+	manifestPath, dirOpID, err := findOpManifestNode(ctx, store, vault, p.BackendID)
 	if err != nil {
-		return refuse(fmt.Sprintf("listing payload: %v", err))
-	}
-	var manifestPath, dirOpID string
-	matches := 0
-	for _, e := range ls {
-		if e.Kind != domain.KindFile {
-			continue
-		}
-		dir, base := splitTreePath(e.Path)
-		if base != manifestName {
-			continue
-		}
-		id, ok := opDirID(strings.TrimSuffix(dir, "/"))
-		if !ok {
-			continue
-		}
-		matches++
-		manifestPath, dirOpID = e.Path, id
-	}
-	switch {
-	case matches == 0:
-		return refuse(fmt.Sprintf("no %s<32hex>/%s node found (not an Ebb payload shape; retained as-is)",
-			opPrefix, manifestName))
-	case matches > 1:
-		return refuse(fmt.Sprintf("%d candidate manifest nodes; the payload is ambiguous", matches))
+		return refuse(err.Error())
 	}
 
 	raw, err := store.DumpFile(ctx, vault.RepoDir, vault.Passfile, p.BackendID, manifestPath)
@@ -546,6 +463,274 @@ func discoverUnsealed(ctx context.Context, store domain.SnapshotStore, vault Vau
 		Kind:             kindFromContract(manifest.Contract.Scope, manifest.Contract.Consistency),
 		CreatedAt:        firstNonEmpty(p.Time, domain.FormatTime(time.Now().UTC())),
 	}, nil
+}
+
+// ---- the shared payload-evidence trust core ----------------------------
+//
+// Both seal-backed paths that must re-derive a payload's retained
+// evidence from the payload's OWN bytes funnel through ONE loader:
+//
+//   - discoverSeal holds a verified lifecycle receipt (§16.4) and feeds
+//     its digests/identities/op-dir as claims;
+//   - LoadCapsuleEvidence (evidence.go) holds only the two digests a
+//     capsule's embedded destination seal declares (§15.3/§16.4
+//     replication block — a different document shape, parsed by
+//     internal/capsule) and takes every identity FROM the manifest.
+//
+// Neither caller trusts a listing or a claimed digest: the op dir is
+// located by tree shape, both documents are dumped through the backend,
+// digests are re-computed over the served bytes, and parsing is strict
+// (I12). A capsule-side reader must NEVER shortcut this by trusting the
+// seal's own fields beyond the two digests it passes in.
+
+// payloadClaims names the values a caller already holds from a verified
+// seal document for the payload's retained documents. All digest/identity
+// fields are EXPECTATIONS the loader re-derives and compares — never
+// values the loader adopts. The zero expectation ("" for the identity
+// fields) means "take it from the manifest" (the capsule path, where the
+// destination seal's operation id belongs to the EXPORT, not to the
+// payload's frozen op dir).
+type payloadClaims struct {
+	manifestDigest  string // digest the seal declares for manifest.json
+	inventoryDigest string // digest the seal declares for the accounting doc
+	// snapshotID / workspaceID, when non-empty, are the logical identities
+	// the seal recorded; the manifest must agree with them.
+	snapshotID  string
+	workspaceID string
+	// requireOpDir, when non-empty, is the op dir derived from the seal's
+	// operation id; the payload tree must carry exactly that dir.
+	requireOpDir string
+	// claimant is the wording label for refusal messages ("receipt" on the
+	// discovery path, "destination seal" on the capsule path).
+	claimant string
+}
+
+// payloadEvidence is everything the shared core re-derived from one
+// payload's own bytes: the frozen manifest, the parsed accounting
+// records, the retained (preserve-route) set and the tree prefixes a
+// caller needs to reason about the payload (or re-derive coverage)
+// without re-reading it.
+type payloadEvidence struct {
+	snapshotID      domain.SnapshotID
+	workspaceID     domain.WorkspaceID
+	opDir           string // located ".ebb-op-<32hex>" dir name
+	manifest        manifestDoc
+	manifestDigest  string // re-computed over the dumped bytes
+	inventoryDigest string // re-computed over the dumped bytes
+	manifestLen     int64  // exact byte length of the dumped manifest.json
+	// retained is the preserve-route subset of the parsed accounting
+	// records (only the inventory.jsonl shape is parsed — see below).
+	retained         []domain.Entry
+	preservedEntries int64
+	preservedBytes   int64
+	wsPrefix         string // main-root backend_prefix (D003 bijection)
+	kind             string // kindFromContract over the frozen contract
+}
+
+// payloadEvidenceError is the shared core's refusal: concrete detail
+// lines (one per failed gate, in gate order), mirroring the discovery
+// path's refusal style. Callers surface them verbatim — discovery as
+// SuspiciousFinding.Reasons, the capsule loader as ErrVerification
+// details.
+type payloadEvidenceError struct {
+	details []string
+}
+
+func (e *payloadEvidenceError) Error() string { return strings.Join(e.details, "; ") }
+
+// evidenceDetails extracts the core's detail lines from an error
+// (non-core errors keep their single message as the only line).
+func evidenceDetails(err error) []string {
+	var pe *payloadEvidenceError
+	if errors.As(err, &pe) {
+		return pe.details
+	}
+	return []string{err.Error()}
+}
+
+// loadPayloadEvidence re-derives one payload's retained evidence from
+// the payload's own bytes and refuses on any mismatch with the claims a
+// caller holds from a verified seal (I12: never trust a claimed digest —
+// hash what the backend actually stores and compare). Steps, in order:
+//
+//	(a) locate the payload's op dir by TREE SHAPE — exactly one file node
+//	    at .ebb-op-<32hex>/manifest.json (tags are hints; the seal's
+//	    operation id only adds a must-match expectation); ambiguity and
+//	    absence both refuse;
+//	(b) dump manifest.json, digest-gate it against the declared digest,
+//	    strict-parse it (schema version, required features, well-formed
+//	    and — when the caller named them — mutually agreeing snapshot/
+//	    workspace ids), and bind the manifest's own meta-root claim to
+//	    the located op dir;
+//	(c) dump the accounting document the manifest names
+//	    (Inventory.Path), digest-gate it, and — for the inventory.jsonl
+//	    shape — strictly parse the records and check the manifest's
+//	    declared count (a well-formed digest over garbage bytes is not
+//	    evidence; trim payloads name removal-manifest.json instead, which
+//	    the digest gate binds but whose shape this reader does not parse);
+//	(d) derive the retained set, preserved counts, WsPrefix (main-root
+//	    backend prefix) and OpDirName.
+//
+// The claimed digest cross-check is byte-level only, exactly like the
+// discovery path always was: the manifest's own inventory.digest field is
+// covered by the manifest digest (it is inside those bytes) and is not
+// separately compared against the seal's claim here.
+func loadPayloadEvidence(ctx context.Context, store domain.SnapshotStore, vault VaultRef, payloadBackendID string, claims payloadClaims) (payloadEvidence, error) {
+	refuse := func(format string, args ...any) (payloadEvidence, error) {
+		return payloadEvidence{}, &payloadEvidenceError{details: []string{fmt.Sprintf(format, args...)}}
+	}
+
+	if claims.manifestDigest == "" || claims.inventoryDigest == "" {
+		return refuse("%s carries an empty manifest/inventory digest; the payload cannot be verified", claims.claimant)
+	}
+
+	// (a) tree shape first: the op dir is where the payload's tree says it
+	// is, not where a seal's operation id would predict it.
+	manifestPath, dirOpID, err := findOpManifestNode(ctx, store, vault, payloadBackendID)
+	if err != nil {
+		return payloadEvidence{}, &payloadEvidenceError{details: []string{err.Error()}}
+	}
+	opDir := opDirName(dirOpID)
+	if claims.requireOpDir != "" && claims.requireOpDir != opDir {
+		return refuse("the payload's op dir is %q, but the %s names %q", opDir, claims.claimant, claims.requireOpDir)
+	}
+
+	// (b) manifest bytes: dump, digest-gate, strict-parse.
+	manifestRaw, err := store.DumpFile(ctx, vault.RepoDir, vault.Passfile, payloadBackendID, manifestPath)
+	if err != nil {
+		return refuse("reading %s from payload %s: %v", manifestPath, payloadBackendID, err)
+	}
+	if got := digestBytes(manifestRaw); got != claims.manifestDigest {
+		return refuse("%s: digest %s, %s declares %s — the payload does not match its seal",
+			manifestName, got, claims.claimant, claims.manifestDigest)
+	}
+	var manifest manifestDoc
+	if err := decodeStrict(manifestRaw, &manifest); err != nil {
+		return refuse("%s failed strict parsing: %v", manifestName, err)
+	}
+	if manifest.SchemaVersion != schemaVersionCurrent {
+		return refuse("manifest schema_version %d, reader supports %d", manifest.SchemaVersion, schemaVersionCurrent)
+	}
+	if len(manifest.RequiredFeatures) > 0 {
+		return refuse("manifest declares unsupported required features %v", manifest.RequiredFeatures)
+	}
+	if _, perr := domain.ParseID(manifest.SnapshotID); perr != nil {
+		return refuse("manifest snapshot_id %q: %v", manifest.SnapshotID, perr)
+	}
+	if _, perr := domain.ParseID(manifest.WorkspaceID); perr != nil {
+		return refuse("manifest workspace_id %q: %v", manifest.WorkspaceID, perr)
+	}
+	if claims.snapshotID != "" && manifest.SnapshotID != claims.snapshotID {
+		return refuse("manifest snapshot_id %q disagrees with the %s %q",
+			manifest.SnapshotID, claims.claimant+"'s", claims.snapshotID)
+	}
+	if claims.workspaceID != "" && manifest.WorkspaceID != claims.workspaceID {
+		return refuse("manifest workspace_id %q disagrees with the %s %q",
+			manifest.WorkspaceID, claims.claimant+"'s", claims.workspaceID)
+	}
+
+	// (c) the accounting document the manifest itself names.
+	if manifest.Inventory.Path == "" {
+		return refuse("manifest names no accounting document (inventory.path empty)")
+	}
+	invRaw, err := store.DumpFile(ctx, vault.RepoDir, vault.Passfile, payloadBackendID, "/"+opDir+"/"+manifest.Inventory.Path)
+	if err != nil {
+		return refuse("reading %s from payload %s: %v", manifest.Inventory.Path, payloadBackendID, err)
+	}
+	if got := digestBytes(invRaw); got != claims.inventoryDigest {
+		return refuse("%s: digest %s, %s declares %s — the payload does not match its seal",
+			manifest.Inventory.Path, got, claims.claimant, claims.inventoryDigest)
+	}
+
+	// (d) workspace prefix + op-dir binding + retained set. Workspace
+	// name and kind come from the frozen manifest (D003 prefix bijection;
+	// §16.2 contract vocabulary); the meta root must name the op dir the
+	// tree actually carries.
+	var main *manifestRoot
+	for i := range manifest.Roots {
+		if manifest.Roots[i].ID == string(domain.RootMain) {
+			main = &manifest.Roots[i]
+			break
+		}
+	}
+	if main == nil {
+		return refuse("manifest has no root with id %q; the workspace tree prefix is unknown", domain.RootMain)
+	}
+	if err := validBackendPrefix(main.BackendPrefix); err != nil {
+		return refuse("main root backend_prefix: %v", err)
+	}
+	if meta := manifestMetaOpDir(manifest); meta != opDir {
+		return refuse("manifest meta-root backend_prefix %q does not match the tree's embedded op dir %q", meta, opDir)
+	}
+
+	ev := payloadEvidence{
+		snapshotID:      domain.SnapshotID(manifest.SnapshotID),
+		workspaceID:     domain.WorkspaceID(manifest.WorkspaceID),
+		opDir:           opDir,
+		manifest:        manifest,
+		manifestDigest:  digestBytes(manifestRaw), // == claims.manifestDigest here
+		inventoryDigest: digestBytes(invRaw),      // == claims.inventoryDigest here
+		manifestLen:     int64(len(manifestRaw)),
+		wsPrefix:        main.BackendPrefix,
+		kind:            kindFromContract(manifest.Contract.Scope, manifest.Contract.Consistency),
+	}
+	if manifest.Inventory.Path == inventoryName {
+		entries, perr := parseInventory(invRaw)
+		if perr != nil {
+			return refuse("retained accounting document: %v", perr)
+		}
+		if manifest.Inventory.Count != int64(len(entries)) {
+			return refuse("manifest inventory count %d, payload carries %d records",
+				manifest.Inventory.Count, len(entries))
+		}
+		for _, e := range entries {
+			if e.Route != domain.RoutePreserve {
+				continue
+			}
+			ev.retained = append(ev.retained, e)
+			ev.preservedEntries++
+			if e.Kind == domain.KindFile {
+				ev.preservedBytes += e.LogicalSize
+			}
+		}
+	}
+	return ev, nil
+}
+
+// findOpManifestNode locates the single manifest node in a payload
+// snapshot: a file at .ebb-op-<32hex>/manifest.json (shape gate; never
+// content search, and tags are hints only). The second return is the
+// operation id embedded in the dir name. The payload twin of
+// findReceiptNode.
+func findOpManifestNode(ctx context.Context, store domain.SnapshotStore, vault VaultRef, payloadID string) (path, opID string, err error) {
+	ls, lerr := store.Ls(ctx, vault.RepoDir, vault.Passfile, payloadID)
+	if lerr != nil {
+		return "", "", fmt.Errorf("listing payload %s: %v", payloadID, lerr)
+	}
+	matches := 0
+	for _, e := range ls {
+		if e.Kind != domain.KindFile {
+			continue
+		}
+		dir, base := splitTreePath(e.Path)
+		if base != manifestName {
+			continue
+		}
+		id, ok := opDirID(strings.TrimSuffix(dir, "/"))
+		if !ok {
+			continue
+		}
+		matches++
+		path, opID = e.Path, id
+	}
+	switch {
+	case matches == 0:
+		return "", "", fmt.Errorf("no %s<32hex>/%s node found (not an Ebb payload shape; retained as-is)",
+			opPrefix, manifestName)
+	case matches > 1:
+		return "", "", fmt.Errorf("%d candidate manifest nodes; the payload is ambiguous", matches)
+	}
+	return path, opID, nil
 }
 
 // findReceiptNode locates the single receipt node in a seal snapshot:

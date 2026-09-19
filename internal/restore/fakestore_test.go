@@ -51,6 +51,9 @@ type fakeSnap struct {
 	files map[string][]byte
 	dirs  map[string]bool
 	links map[string]fakeLink
+	// tags mirrors the real backend's List, which reports the tags a
+	// snapshot was created with (discovery pairs by the ebb-kind tag).
+	tags map[string]string
 }
 
 type fakeStore struct {
@@ -106,6 +109,7 @@ func (s *fakeStore) Snapshot(ctx context.Context, repoDir, baseDir string, relPa
 		files: map[string][]byte{},
 		dirs:  map[string]bool{},
 		links: map[string]fakeLink{},
+		tags:  tags,
 	}
 	for _, rel := range relPaths {
 		if err := s.walkInto(snap, baseDir, filepath.ToSlash(rel)); err != nil {
@@ -165,7 +169,10 @@ func (s *fakeStore) List(ctx context.Context, repoDir, passfile string) ([]domai
 	defer s.mu.Unlock()
 	var refs []domain.SnapshotRef
 	for _, id := range s.sortedIDs() {
-		refs = append(refs, domain.SnapshotRef{BackendID: id, ShortID: id[:8], Time: "2026-09-18T00:00:00Z"})
+		refs = append(refs, domain.SnapshotRef{
+			BackendID: id, ShortID: id[:8], Time: "2026-09-18T00:00:00Z",
+			Tags: s.snaps[id].tags,
+		})
 	}
 	return refs, nil
 }
