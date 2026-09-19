@@ -14,6 +14,7 @@ ebb reclaim . --target 15GiB           # trim first; escalate to park only if ne
 ebb forget <snapshot-id>               # deliberately release a recovery copy
 ebb gc <vault>                          # physically reclaim unreferenced vault storage (after forget)
 ebb export <snapshot-id> --output f     # independent encrypted capsule for transfer/archival
+ebb import <file.ebb>                   # verified recovery of a capsule into a vault
 ebb init --rebuild-catalog              # recover the catalog from a surviving vault (F39)
 ebb verify <snapshot-id>               # re-check seal/documents/coverage (--content for full readback)
 ebb status        # what Ebb knows
@@ -64,7 +65,7 @@ State lives in `os.UserConfigDir()/ebb` (Windows: `%AppData%\ebb`): `catalog.db`
 ## Known limitations (explicit, not hidden)
 
 - Opening a workspace whose preserved set contains **true symlinks** requires the Windows symlink privilege (Developer Mode / elevation) — junctions (the common case, e.g. pnpm-style `node_modules`) recreate unprivileged. A privilege-blocked open fails BEFORE publishing anything, with a precise typed error naming the blocked entries.
-- `ebb import` (opening a capsule into a vault) is not yet implemented — capsules can be produced and independently verified, but recovery from one currently requires following the capsule's embedded repo manually.
+- `ebb import <file.ebb>` is implemented (extract → verify → copy → readback → reseal; `ebb inspect <file.ebb>` shows public metadata, and with EBB_CAPSULE_PASSWORD set runs full verification without registering), but it needs ~2x the capsule payload free on the destination volume; `ebb open <file.ebb> --to <path>` is NOT implemented — open from a capsule is two steps: `import`, then `open <workspace-name>`; imported snapshots stay pinned and their rebuild approvals start EMPTY by design (the first `open` of an imported snapshot re-prompts).
 - Rebuild executes approved actions with your privileges — there is no sandbox (Foundation §9.5); the approval prompt shows the exact command, tool hash, inputs and outputs before anything runs.
 - Rebuild approvals pin the full authorization surface (exact command, tool hash, inputs, working root, output ownership, env allowlist, network): any drift — including an Ebbfile edit that widens an action's outputs — re-prompts, and an action asking for Ebb's own vault password is refused outright, never prompted. Recovery paths consult the filesystem rather than trusting journal rows (Wave G audit findings G1–G4 all fixed; see lab/security-review/wave-G/FINDINGS.md).
 - Hardlink relationships, NTFS alternate data streams, sparse flags and ACLs are captured as inventory facts but not restored (documented per-snapshot in the manifest's `not_promised` capabilities).
