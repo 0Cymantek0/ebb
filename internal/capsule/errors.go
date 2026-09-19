@@ -12,6 +12,11 @@ import (
 //	ErrInvalidParams / ErrOutputOccupied / ErrPartialExists → 2/3
 //	ErrVerification (any check)                            → 4
 //	underlying domain.StoreError keeps its own class        → 4/7/2
+//
+// Import (§15.3) adds: ErrCapsuleUnlock (auth — wrong capsule
+// passphrase), ErrNotACapsule / ErrCopyIntegrity (integrity —
+// structural failure or an unprovable copy), ErrImportSpace /
+// ErrTrimCapsule (blocked — headroom or trim-kind, nothing mutated).
 type errInvalidParams struct{ Detail string }
 
 func (e *errInvalidParams) Error() string {
@@ -35,6 +40,17 @@ const (
 	CodeOutputOccupied = "EBB_E_OUTPUT_OCCUPIED"
 	CodePartialStale   = "EBB_E_EXPORT_PARTIAL_STALE"
 	CodeExportVerify   = "EBB_E_EXPORT_VERIFY"
+)
+
+// Import-side blocker codes (§15.3; the same single-classification
+// authority contract — internal/cli/errors.go maps them, this package
+// only names them).
+const (
+	CodeCapsuleUnlock   = "EBB_E_IMPORT_UNLOCK"    // wrong capsule passphrase (auth)
+	CodeNotACapsule     = "EBB_E_NOT_A_CAPSULE"    // container/repository structural failure
+	CodeImportSpace     = "EBB_E_IMPORT_SPACE"     // destination headroom block (blocked, nothing extracted)
+	CodeTrimCapsule     = "EBB_E_TRIM_CAPSULE"     // trim capsules carry no importable payload (blocked)
+	CodeImportIntegrity = "EBB_E_IMPORT_INTEGRITY" // silent copy skip / ambiguous destination discovery
 )
 
 // ErrOutputOccupied reports that the final output path already exists;
@@ -102,3 +118,104 @@ func IsVerification(err error) bool {
 	var e *ErrVerification
 	return errors.As(err, &e)
 }
+
+// ---- import-side typed failures (§15.3) --------------------------------
+
+// ErrCapsuleUnlock reports that the supplied recovery secret did not
+// unlock the repository inside the capsule (the store's auth failure
+// re-typed to name the capsule file; the underlying store error is
+// preserved for the CLI's exit classification). Nothing was extracted
+// into the destination vault. Exit class: auth.
+type ErrCapsuleUnlock struct {
+	Path string
+	Err  error
+}
+
+func (e *ErrCapsuleUnlock) Error() string {
+	return fmt.Sprintf("%s: capsule: the passphrase did not unlock the repository inside %s (%v); nothing was imported",
+		CodeCapsuleUnlock, e.Path, e.Err)
+}
+
+// Unwrap preserves the store's auth error (a *domain.StoreError with
+// Class StoreErrAuth).
+func (e *ErrCapsuleUnlock) Unwrap() error { return e.Err }
+
+// Code returns the stable §5.5 blocker code.
+func (e *ErrCapsuleUnlock) Code() string { return CodeCapsuleUnlock }
+
+// ErrNotACapsule reports that the file is not a structurally valid
+// capsule: the container failed the §15.1/§15.3 hostile-input
+// discipline, or the repository extracted from it did not open/list as
+// a fresh capsule repository (exactly one payload + one seal). The
+// capsule file itself was never modified; nothing was imported. Exit
+// class: integrity.
+type ErrNotACapsule struct {
+	Path    string
+	Details []string
+}
+
+func (e *ErrNotACapsule) Error() string {
+	return fmt.Sprintf("%s: capsule: %s is not a usable capsule: %s",
+		CodeNotACapsule, e.Path, joinDetails(e.Details))
+}
+
+// Code returns the stable §5.5 blocker code.
+func (e *ErrNotACapsule) Code() string { return CodeNotACapsule }
+
+// ErrImportSpace reports the §15.3 headroom block: free space on the
+// destination volume is below what extraction plus the copy into the
+// vault can be expected to need. Refused BEFORE extraction with BOTH
+// numbers named; import to another configured volume or free space.
+// Exit class: blocked.
+type ErrImportSpace struct {
+	Volume    string // the path the probe measured (the destination repo dir)
+	FreeBytes int64
+	NeedBytes int64 // 2 × the capsule's declared repository bytes
+	RepoBytes int64
+}
+
+func (e *ErrImportSpace) Error() string {
+	return fmt.Sprintf(
+		"%s: capsule: insufficient space on the destination volume of %s: %d bytes free, approximately %d needed (the capsule holds %d bytes of repository; v1 budget space for the extraction plus the copy into the vault). Import to another configured volume or free space first; nothing was extracted",
+		CodeImportSpace, e.Volume, e.FreeBytes, e.NeedBytes, e.RepoBytes)
+}
+
+// Code returns the stable §5.5 blocker code.
+func (e *ErrImportSpace) Code() string { return CodeImportSpace }
+
+// ErrTrimCapsule reports the blocked-by-kind refusal: the capsule's
+// payload is a trim capture, whose only authoritative material is a
+// removal plan — there is no workspace payload to import (Foundation
+// §15.3, §11.4 trim scope). Nothing was imported. Exit class: blocked.
+type ErrTrimCapsule struct {
+	Path        string
+	SnapshotID  string
+	WorkspaceID string
+}
+
+func (e *ErrTrimCapsule) Error() string {
+	return fmt.Sprintf(
+		"%s: capsule: %s holds a trim capture (snapshot %s of workspace %s): a trim capsule's authoritative material is a removal plan; there is no workspace payload to import. Nothing was imported",
+		CodeTrimCapsule, e.Path, e.SnapshotID, e.WorkspaceID)
+}
+
+// Code returns the stable §5.5 blocker code.
+func (e *ErrTrimCapsule) Code() string { return CodeTrimCapsule }
+
+// ErrCopyIntegrity reports that the payload copy into the destination
+// vault could not be proven: restic copy can skip silently (probe C10 —
+// copying a missing id exits 0), and a discovery that finds zero or
+// more-than-one new snapshot is ambiguous. The destination may hold an
+// unattributable snapshot; the detail lines name the ids honestly.
+// Exit class: integrity.
+type ErrCopyIntegrity struct {
+	Details []string
+}
+
+func (e *ErrCopyIntegrity) Error() string {
+	return fmt.Sprintf("%s: capsule: the payload copy into the destination vault could not be proven: %s",
+		CodeImportIntegrity, joinDetails(e.Details))
+}
+
+// Code returns the stable §5.5 blocker code.
+func (e *ErrCopyIntegrity) Code() string { return CodeImportIntegrity }
