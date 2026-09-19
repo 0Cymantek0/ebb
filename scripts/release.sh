@@ -3,8 +3,9 @@
 #
 # Usage: scripts/release.sh <version>      (e.g. scripts/release.sh v0.1.0)
 #
-# Builds cmd/ebb for windows/amd64, linux/amd64, darwin/amd64 and
-# darwin/arm64 (CGO_ENABLED=0, -trimpath, stripped, version-stamped),
+# Builds cmd/ebb for the target matrix below (default windows/amd64
+# and linux/amd64 — the platforms Ebb builds for today), with
+# CGO_ENABLED=0, -trimpath, stripped, version-stamped binaries;
 # archives each (zip for Windows, tar.gz otherwise, binary at the
 # archive root) and writes SHA256SUMS.txt over the ARCHIVES.
 #
@@ -78,31 +79,41 @@ tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
 # zip via git archive: Git Bash has no `zip` and GNU tar cannot emit zip,
-# but git always can. A temporary index holds exactly the binary; the
-# subtree becomes the archive root, and a fixed-date commit object makes
-# the embedded entry timestamps (and thus the zip bytes) reproducible.
-make_zip() { # make_zip <file-to-embed> <output.zip>
-	local embed=$1 out=$2 idx="$tmpdir/index" tree commit
+# but git always can. A temporary index stages exactly the binary at the
+# tree root, a fixed-date commit object sets the entry timestamps, and
+# the resulting archive bytes are reproducible for identical inputs.
+# (1980-01-01 is the oldest timestamp the zip DOS date field encodes.)
+make_zip() { # make_zip <file-to-embed> <basename-in-archive> <output.zip>
+	local embed=$1 base=$2 out=$3 idx="$tmpdir/index" blob tree commit
 	rm -f "$idx"
-	GIT_INDEX_FILE="$idx" git read-tree --empty
-	GIT_INDEX_FILE="$idx" git add -f "$embed"
-	tree=$(GIT_INDEX_FILE="$idx" git write-tree)
+	blob=$(git hash-object -w "$embed") || die "hash-object failed for $embed"
+	tree=$(
+		GIT_INDEX_FILE="$idx" git read-tree --empty &&
+		GIT_INDEX_FILE="$idx" git update-index --add --cacheinfo "100755,$blob,$base" &&
+		GIT_INDEX_FILE="$idx" git write-tree
+	) || die "building archive tree failed for $embed"
+	[ -n "$tree" ] || die "write-tree returned no tree for $embed"
 	commit=$(
 		GIT_AUTHOR_NAME=ebb-release GIT_AUTHOR_EMAIL=release@ebb.invalid \
 		GIT_COMMITTER_NAME=ebb-release GIT_COMMITTER_EMAIL=release@ebb.invalid \
-		GIT_AUTHOR_DATE='0 +0000' GIT_COMMITTER_DATE='0 +0000' \
+		GIT_AUTHOR_DATE='1980-01-01T00:00:00+00:00' \
+		GIT_COMMITTER_DATE='1980-01-01T00:00:00+00:00' \
 		git commit-tree "$tree" -m "release archive"
-	)
-	git archive --format=zip --output="$out" "$commit:$(dirname "$embed")"
+	) || die "commit-tree failed while archiving $embed"
+	[ -n "$commit" ] || die "commit-tree returned no commit for $embed"
+	git archive --format=zip --output="$out" "$commit"
 }
 
 # tar.gz via GNU tar with fixed metadata (sorted names, epoch mtime,
-# root ownership). Falls back to plain tar for non-GNU tars (macOS).
+# root ownership, explicit 755 so the umask never strips the executable
+# bit from the stored mode). Falls back to plain tar for non-GNU tars
+# (macOS).
 make_tgz() { # make_tgz <dir> <file-to-embed> <output.tar.gz>
 	local dir=$1 embed=$2 out=$3
 	if tar --version 2>/dev/null | head -1 | grep -q 'GNU tar'; then
 		tar --format=gnu --sort=name --mtime='1970-01-01 00:00:00Z' \
-			--owner=0 --group=0 --numeric-owner -czf "$out" -C "$dir" "$embed"
+			--owner=0 --group=0 --numeric-owner --mode=755 \
+			-czf "$out" -C "$dir" "$embed"
 	else
 		tar -czf "$out" -C "$dir" "$embed"
 	fi
@@ -110,7 +121,13 @@ make_tgz() { # make_tgz <dir> <file-to-embed> <output.tar.gz>
 
 # ---- build -----------------------------------------------------------------
 
-targets="windows/amd64 linux/amd64 darwin/amd64 darwin/arm64"
+# Default target matrix: the platforms Ebb actually builds for today.
+# darwin/* is deliberately absent: internal/platform has windows and
+# linux adapters only (README: "macOS is unsupported") and a darwin
+# build does not compile. Override with EBB_RELEASE_TARGETS (space-
+# separated GOOS/GOARCH pairs) once a darwin platform layer lands; a
+# configured target that fails to build fails the release.
+targets=${EBB_RELEASE_TARGETS:-windows/amd64 linux/amd64}
 outroot="dist/$version"
 ldflags="-s -w -X main.Version=$version -X ebb/cmd/ebb.Version=$version"
 
@@ -140,7 +157,7 @@ for target in $targets; do
 	echo "==> archive $goos/$goarch"
 	archive="$outroot/ebb-$version-$goos-$goarch"
 	if [ "$goos" = "windows" ]; then
-		make_zip "$outroot/$bin" "$archive.zip" || die "zip failed for $goos/$goarch"
+		make_zip "$outroot/$bin" "$bin" "$archive.zip" || die "zip failed for $goos/$goarch"
 	else
 		make_tgz "$outroot" "$bin" "$archive.tar.gz" || die "tar failed for $goos/$goarch"
 	fi

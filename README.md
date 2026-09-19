@@ -54,7 +54,7 @@ go test ./...          # full suite (~4-5 min; the restic acceptance suite auto-
 bash scripts/verify.sh
 ```
 
-Release builds (`scripts/release.sh <version>`) cross-compile CGO-free, stripped, version-stamped binaries for windows/amd64, linux/amd64, darwin/amd64 and darwin/arm64 into `dist/<version>/`, with checksummed zip/tar.gz archives and a `SHA256SUMS.txt`. The script refuses a dirty working tree unless `EBB_RELEASE_DIRTY=1` is set:
+Release builds (`scripts/release.sh <version>`) cross-compile CGO-free, stripped, version-stamped binaries for windows/amd64 and linux/amd64 (the platforms Ebb builds for today; macOS is unsupported — override the matrix with `EBB_RELEASE_TARGETS` once that changes) into `dist/<version>/`, with checksummed zip/tar.gz archives and a `SHA256SUMS.txt`. The script refuses a dirty working tree unless `EBB_RELEASE_DIRTY=1` is set:
 
 ```sh
 scripts/release.sh v0.1.0
