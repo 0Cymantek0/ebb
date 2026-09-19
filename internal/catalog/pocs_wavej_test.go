@@ -6,25 +6,23 @@ package catalog
 // -tags security_poc; the default suite stays green.
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"ebb/internal/domain"
 )
 
-// J4 — ImportDiscoveredSnapshot's ON CONFLICT DO UPDATE silently
-// OVERWRITES the witness-bearing fields (payload/seal backend ids,
-// manifest/inventory digests, kind) of an EXISTING snapshot row with
-// values re-derived from the vault. Those digests are exactly the
-// D017/D020 tamper witness (loadSeal binds a retained receipt to the
-// catalog row's seal-time digests). On the `ebb init --rebuild-catalog
-// --force-rebuild` merge path (rebuild_catalog.go calls this method for
-// EVERY discovered pair, counting duplicates but never comparing), a
-// vault-password attacker who minted a diverging pair for a known
-// logical snapshot id gets the intact catalog's witness swapped for the
-// minted pair's values — after which open/verify/forget validate
-// against the attacker's digests. No mismatch is reported and nothing
-// is marked suspicious; only the duplicates counter moves.
+// J4 — post-fix contract (wave C/F/G convention: the PoC flips to assert
+// the fixed behavior and stays as the regression guard).
+// ImportDiscoveredSnapshot's conflict handling COMPARES the
+// witness-bearing fields (payload/seal backend ids, vault binding,
+// manifest/inventory digests, kind) instead of overwriting them. An
+// exact match is a benign duplicate; a divergent candidate returns
+// *ErrWitnessDivergence with the existing row — the D017/D020 tamper
+// witness — completely untouched, for the caller to surface as a
+// suspicious finding. Rebuild-from-catalog-LOSS is unaffected (no row
+// exists to conflict).
 func TestJ4_ForcedMergeReplacesWitnessDigestsOfExistingRow(t *testing.T) {
 	c := open(t)
 	ws := domain.WorkspaceID(domain.NewID())
@@ -56,30 +54,54 @@ func TestJ4_ForcedMergeReplacesWitnessDigestsOfExistingRow(t *testing.T) {
 		InventoryDigest:  strings.Repeat("d", 64),
 		Kind:             SnapshotKindSnapshot,
 	}
-	if err := c.ImportDiscoveredSnapshot(ws, "victim", minted); err != nil {
-		t.Fatalf("J4 harness: ImportDiscoveredSnapshot refused: %v", err)
+	err := c.ImportDiscoveredSnapshot(ws, "victim", minted)
+	if err == nil {
+		t.Fatal("J4: the divergent merge was ACCEPTED — the witness is re-anchorable; fix regressed")
+	}
+	var div *ErrWitnessDivergence
+	if !errors.As(err, &div) {
+		t.Fatalf("J4: divergent import error is not ErrWitnessDivergence: %v", err)
+	}
+	for _, want := range []string{"payload_backend_id", "seal_backend_id", "manifest_digest", "inventory_digest", "kind"} {
+		found := false
+		for _, f := range div.Fields {
+			if f == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("J4: divergence report omits field %q (fields: %v)", want, div.Fields)
+		}
 	}
 
 	got, err := c.GetSnapshot(snapID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// What the merge honestly preserves: pinned state and the pin audit.
+	// The intact witness survives bit-for-bit: pinned state, pin audit,
+	// backend ids, digests and kind all describe the GENUINE pair.
 	if !got.Pinned {
-		t.Error("J4: merge dropped the pinned flag (a REAL drop the comment promises never happens)")
+		t.Error("J4: merge dropped the pinned flag")
 	}
 	if len(got.PinReasons) == 0 || got.PinReasons[0] != PinReasonCreation {
 		t.Errorf("J4: pin audit = %v (creation reason lost)", got.PinReasons)
 	}
-	// The defect: the D017 witness was silently re-anchored.
-	if got.ManifestDigest == genuine.ManifestDigest && got.PayloadBackendID == genuine.PayloadBackendID {
-		t.Fatal("J4: merge did NOT overwrite the row — the ON CONFLICT shape changed; re-review")
+	if got.ManifestDigest != genuine.ManifestDigest || got.InventoryDigest != genuine.InventoryDigest {
+		t.Errorf("J4: seal-time digests overwritten: got %s/%s, want the genuine %s/%s",
+			got.ManifestDigest[:12]+"…", got.InventoryDigest[:12]+"…",
+			genuine.ManifestDigest[:12]+"…", genuine.InventoryDigest[:12]+"…")
 	}
-	t.Errorf("J4 CONFIRMED: the forced-merge import replaced the existing row's witness fields — "+
-		"payload %s -> %s, manifest digest %s -> %s, kind %s -> %s — with vault-derived values, "+
-		"with no mismatch reported and nothing marked suspicious; the catalog's seal-time digests "+
-		"(D017/D020's tamper witness for open/verify/forget) now describe the minted pair",
-		genuine.PayloadBackendID, got.PayloadBackendID,
-		genuine.ManifestDigest[:12]+"…", got.ManifestDigest[:12]+"…",
-		genuine.Kind, got.Kind)
+	if got.PayloadBackendID != genuine.PayloadBackendID || got.SealBackendID != genuine.SealBackendID {
+		t.Errorf("J4: backend ids overwritten: got %s/%s, want the genuine pair",
+			got.PayloadBackendID, got.SealBackendID)
+	}
+	if got.Kind != genuine.Kind {
+		t.Errorf("J4: kind overwritten: got %s, want %s", got.Kind, genuine.Kind)
+	}
+
+	// The benign twin (exact re-import) still passes as a duplicate.
+	if err := c.ImportDiscoveredSnapshot(ws, "victim", genuine); err != nil {
+		t.Errorf("J4: benign duplicate re-import refused: %v", err)
+	}
 }

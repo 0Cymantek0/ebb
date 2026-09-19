@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
@@ -104,6 +105,14 @@ func (c *Coordinator) Recover(ctx context.Context, vault VaultRef, opID domain.O
 	case catalog.PhaseTrimSealing:
 		return c.resumeTrimRemoval(ctx, vault, op, rep)
 
+	case catalog.PhaseExportPlanned, catalog.PhaseExportCopying, catalog.PhaseExportVerifying,
+		catalog.PhaseImportPlanned, catalog.PhaseImportCopying, catalog.PhaseImportVerifying:
+		// The capsule transports (Wave H/I export/import; Wave J review
+		// J1): plain Recover stays REPORT-ONLY — consistent with the
+		// non-removal semantics every other externally-owned kind gets —
+		// and names the verb that closes the operation.
+		return c.reportCapsuleTransport(op, rep)
+
 	default:
 		// Terminal (CANCELED/DONE/TRIM_DONE) or phases owned by other
 		// commands (RESTORING/FILES_READY/REBUILDING/READY/
@@ -161,6 +170,19 @@ func (c *Coordinator) ResumeRemoval(ctx context.Context, vault VaultRef, opID do
 // step-7 rename crash window, ANY identity — G4) is likewise refused:
 // only Recover may reconcile that state.
 //
+// The capsule transports (Wave H/I export/import; Wave J review J1) add
+// their own closable set: EVERY non-terminal EXPORT_*/IMPORT_* phase.
+// The transports own NO removal authority — nothing in the source
+// workspace or vault is ever removed by them — so cancel-after-crash is
+// always safe: the op closes idempotently to CANCELED, the export's
+// duration pins (pin:export:<opID>) are released audit-only (the
+// snapshot keeps every original pin; deliberate release stays forget's
+// job, I07), and any backend snapshots the interrupted transport had
+// already created are NAMED in the report from durable state, never
+// deleted (the export's copies live only inside the identifiable
+// .partial capsule file; an import's unregistered copies are not
+// journaled and are reported as unnameable rather than guessed).
+//
 // Cancel never releases recovery obligations (I07): a sealed P/S pair
 // stays pinned — deliberate release is `ebb forget`, never cancel.
 func (c *Coordinator) CancelOperation(ctx context.Context, vault VaultRef, opID domain.OperationID) (RecoveryReport, error) {
@@ -176,17 +198,188 @@ func (c *Coordinator) CancelOperation(ctx context.Context, vault VaultRef, opID 
 		Kind: op.Kind, PhaseBefore: op.Phase,
 	}
 	rep.PhaseAfter = op.Phase
-	switch op.Phase {
-	case catalog.PhasePlanned, catalog.PhaseCapturing, catalog.PhasePayloadCommitted, catalog.PhaseTrimPlanned:
+	switch {
+	case capsuleTransportPhase(op.Kind, op.Phase) || (capsuleTransportKind(op.Kind) && op.Phase == catalog.PhaseCanceled):
+		// The already-CANCELED arm keeps the close idempotent (rerunning
+		// --cancel after a crash mid-close must not refuse).
+		return c.cancelCapsuleTransport(op, rep)
+	case op.Phase == catalog.PhasePlanned || op.Phase == catalog.PhaseCapturing ||
+		op.Phase == catalog.PhasePayloadCommitted || op.Phase == catalog.PhaseTrimPlanned:
 		// Pre-seal territory: the existing cancel path (records any
 		// recorded payload as an unsealed, pinned snapshot per §11.3).
 		return c.recoverCancelCapture(ctx, vault, op, rep)
-	case catalog.PhaseSealed:
+	case op.Phase == catalog.PhaseSealed:
 		return c.cancelSealed(op, rep)
 	default:
 		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
-			"operation %s is %s; cancel applies to phases before removal starts (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED) — mid-removal phases require reconciliation (Recover/ResumeRemoval)", opID, op.Phase)}
+			"operation %s is %s; cancel applies to phases before removal starts (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED) or to the capsule transports' EXPORT_*/IMPORT_* phases — mid-removal phases require reconciliation (Recover/ResumeRemoval)", opID, op.Phase)}
 	}
+}
+
+// capsuleTransportPhase reports whether phase belongs to the given
+// capsule-transport kind's non-terminal phase set (EXPORT_* for export,
+// IMPORT_* for import).
+func capsuleTransportPhase(kind, phase string) bool {
+	switch kind {
+	case catalog.OpKindExport:
+		switch phase {
+		case catalog.PhaseExportPlanned, catalog.PhaseExportCopying, catalog.PhaseExportVerifying:
+			return true
+		}
+	case catalog.OpKindImport:
+		switch phase {
+		case catalog.PhaseImportPlanned, catalog.PhaseImportCopying, catalog.PhaseImportVerifying:
+			return true
+		}
+	}
+	return false
+}
+
+// capsuleTransportKind reports whether kind is one of the two capsule
+// transports (export/import).
+func capsuleTransportKind(kind string) bool {
+	return kind == catalog.OpKindExport || kind == catalog.OpKindImport
+}
+
+// exportPinReasons are the pin-audit reason spellings an export op takes
+// and releases (cmdExport's duration pin, Foundation §15.2).
+const (
+	exportPinPrefix  = "export:"
+	exportPinTaken   = "pin:" + exportPinPrefix
+	exportPinRelease = "unpin:" + exportPinPrefix
+)
+
+// reportCapsuleTransport is plain Recover's report-only outcome for a
+// crashed export/import operation: the state is described and --cancel
+// is named as the closing verb, but nothing is reconciled (the same
+// discipline Recover applies to every kind whose phases another command
+// owns).
+func (c *Coordinator) reportCapsuleTransport(op catalog.Operation, rep RecoveryReport) (RecoveryReport, error) {
+	if want := capsuleTransportKindForPhase(op.Phase); want != "" && op.Kind != want {
+		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+			"operation %s is kind %q but its phase %s belongs to the %s vocabulary; durable state diverged — inspect manually", op.ID, op.Kind, op.Phase, want)}
+	}
+	rep.Actions = append(rep.Actions, fmt.Sprintf(
+		"reported the interrupted %s operation in %s (report-only: the capsule transport owns no removal authority, so the workspace, the source vault and every snapshot are untouched)", op.Kind, op.Phase))
+	if op.LastError != "" {
+		rep.Remaining = append(rep.Remaining, "last recorded failure: "+op.LastError)
+	}
+	rep.Remaining = append(rep.Remaining, capsuleTransportLeftovers(op)...)
+	rep.NextAction = fmt.Sprintf(
+		"this operation blocks the workspace and gc until closed — close it with `ebb recover %s --cancel` (always safe for a capsule transport: cancel removes nothing), then rerun the command if the transfer is still wanted", op.ID)
+	return rep, nil
+}
+
+// capsuleTransportKindForPhase names the operation kind a capsule phase
+// belongs to ("" for non-capsule phases).
+func capsuleTransportKindForPhase(phase string) string {
+	switch phase {
+	case catalog.PhaseExportPlanned, catalog.PhaseExportCopying, catalog.PhaseExportVerifying:
+		return catalog.OpKindExport
+	case catalog.PhaseImportPlanned, catalog.PhaseImportCopying, catalog.PhaseImportVerifying:
+		return catalog.OpKindImport
+	}
+	return ""
+}
+
+// capsuleTransportLeftovers describes, from durable state only, what a
+// crashed transport may have left behind. It never guesses ids and it
+// never deletes anything.
+func capsuleTransportLeftovers(op catalog.Operation) []string {
+	if op.Kind == catalog.OpKindExport {
+		// The transport's backend snapshots live INSIDE the capsule's
+		// partial file — the source vault is never written by an export.
+		return []string{
+			"a partial capsule file (<output>.partial) may exist at the intended output path; it was not removed and a rerun of the export refuses until it is removed explicitly",
+			"the export duration pin (pin:export:" + string(op.ID) + ") may still be taken on the exported snapshot",
+		}
+	}
+	// Import: the CLI records the copied destination ids on the op row
+	// once the transport completes, so a crash between the copy and the
+	// registration can name them; without that record they are journaled
+	// nowhere and are reported as unnameable rather than guessed.
+	var created []string
+	if op.PayloadSnap != "" {
+		created = append(created, op.PayloadSnap)
+	}
+	if op.SealSnap != "" {
+		created = append(created, op.SealSnap)
+	}
+	if len(created) > 0 {
+		return []string{fmt.Sprintf(
+			"backend snapshot(s) %s were copied into the destination vault before the interruption (durable op-row record) and were NOT removed — no catalog row references them; inspect and resolve them explicitly (a completed rerun re-copies and a registration-failure rerun starts clean)",
+			strings.Join(created, ", "))}
+	}
+	return []string{
+		fmt.Sprintf("backend snapshots the interrupted copy created in the destination vault (if the crash struck mid-copy) are recorded NOWHERE in the catalog — they are not nameable from durable state and were not removed; a completed rerun copies fresh and any orphans need explicit external cleanup (capsule: %s)", op.SourceRoot),
+	}
+}
+
+// cancelCapsuleTransport closes a crashed export/import operation:
+// idempotently to CANCELED, releasing the export's duration pins
+// audit-only and reporting (never deleting) whatever the transport left
+// behind. It performs no backend calls and no removals.
+func (c *Coordinator) cancelCapsuleTransport(op catalog.Operation, rep RecoveryReport) (RecoveryReport, error) {
+	if op.Phase == catalog.PhaseCanceled {
+		// Idempotent rerun (a crash between the CAS commit and the
+		// report): nothing left to do.
+		rep.Actions = append(rep.Actions, "the operation is already CANCELED; nothing to close")
+		rep.NextAction = "the workspace accepts new operations"
+		return rep, nil
+	}
+	if want := capsuleTransportKindForPhase(op.Phase); want != "" && op.Kind != want {
+		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+			"operation %s is kind %q but its phase %s belongs to the %s vocabulary; durable state diverged — inspect manually", op.ID, op.Kind, op.Phase, want)}
+	}
+
+	// The export's duration pin, taken before the transport started, is
+	// the only obligation this operation added. Release it AUDIT-ONLY
+	// (RecordPinRelease): the pinned flag keeps whatever the snapshot's
+	// original reasons say — cancel errs toward retention (I07) and
+	// never becomes a forget. The durable record of WHICH snapshot was
+	// pinned is the pin audit itself.
+	if op.Kind == catalog.OpKindExport {
+		snaps, serr := c.cat.ListSnapshots(op.WorkspaceID)
+		if serr != nil {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+				"listing the workspace's snapshots to release the export pin: %v (the audit-only release could not run; `ebb status` shows the pin)", serr))
+		}
+		for _, s := range snaps {
+			taken, released := false, false
+			for _, r := range s.PinReasons {
+				if r == exportPinTaken+string(op.ID) {
+					taken = true
+				}
+				if r == exportPinRelease+string(op.ID) {
+					released = true
+				}
+			}
+			if !taken || released {
+				continue
+			}
+			if rerr := c.cat.RecordPinRelease(s.ID, exportPinPrefix+string(op.ID)); rerr != nil {
+				rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+					"releasing the export pin on snapshot %s failed: %v (the snapshot stays pinned — conservative; `ebb status` shows the pin)", s.ID, rerr))
+			} else {
+				rep.Actions = append(rep.Actions, fmt.Sprintf(
+					"released the export duration pin on snapshot %s (audit-only: the snapshot keeps its original pins; deliberate release remains `ebb forget`)", s.ID))
+			}
+		}
+	}
+
+	if err := c.cat.FailOperation(op.ID, op.Phase, "canceled by user request while "+op.Phase+" (capsule transport; no removal authority)"); err != nil {
+		// Best effort: the phase advance below is the authority.
+		_ = err
+	}
+	if aerr := c.cat.AdvanceOperation(op.ID, op.Phase, catalog.PhaseCanceled); aerr != nil {
+		return rep, fmt.Errorf("lifecycle: cancel %s: %w", op.ID, aerr)
+	}
+	rep.PhaseAfter = catalog.PhaseCanceled
+	rep.Actions = append(rep.Actions, fmt.Sprintf(
+		"canceled the interrupted %s operation in %s (the capsule transport owns no removal authority: nothing in the source workspace or any vault was removed)", op.Kind, op.Phase))
+	rep.Remaining = append(rep.Remaining, capsuleTransportLeftovers(op)...)
+	rep.NextAction = "operation canceled; the workspace accepts new operations (rerun the export/import if the capsule transfer is still wanted)"
+	return rep, nil
 }
 
 // cancelSealed abandons a SEALED operation with its live root intact:

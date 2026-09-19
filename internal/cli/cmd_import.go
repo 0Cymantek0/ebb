@@ -273,14 +273,15 @@ func runImport(ctx context.Context, sess *session, capStore capsule.Store,
 
 	var (
 		opID  domain.OperationID
-		phase = catalog.PhaseImportPlanned // failClose tracks from here (export's pattern)
+		phase = catalog.PhasePlanned // the journal's ACTUAL phase; failClose CASes from here (J1b class)
 	)
 	// beginJournal opens the operation and walks onto the import
 	// vocabulary. It runs at the copying boundary — after capsule
 	// verification and identity adoption, before the first
 	// destination-vault mutation. On a partial failure the caller's
 	// failClose closes whatever was opened (opID is set the moment
-	// BeginOperation succeeds).
+	// BeginOperation succeeds), with `phase` tracking the last committed
+	// transition so the CAS always matches.
 	beginJournal := func() error {
 		id, err := sess.cat.BeginOperation(wsAdopted, catalog.OpKindImport, capsulePath, "", "")
 		if err != nil {
@@ -288,6 +289,7 @@ func runImport(ctx context.Context, sess *session, capStore capsule.Store,
 		}
 		opID = id
 		details.OperationID = string(opID)
+		phase = catalog.PhasePlanned
 		steps := [][2]string{
 			{catalog.PhasePlanned, catalog.PhaseImportPlanned},
 			{catalog.PhaseImportPlanned, catalog.PhaseImportCopying},
@@ -296,8 +298,8 @@ func runImport(ctx context.Context, sess *session, capStore capsule.Store,
 			if err := sess.cat.AdvanceOperation(opID, s[0], s[1]); err != nil {
 				return fmt.Errorf("import: journal: %w", err)
 			}
+			phase = s[1]
 		}
-		phase = catalog.PhaseImportCopying
 		return nil
 	}
 	// failClose mirrors export's discipline: record the failure on the
@@ -408,12 +410,54 @@ func runImport(ctx context.Context, sess *session, capStore capsule.Store,
 	// ADOPTED workspace (ImportDiscoveredSnapshot re-runs the same
 	// never-modify workspace insert EnsureWorkspace used — a no-op
 	// now), the replica receipt, and DONE.
+	//
+	// Durable record for crash reconciliation (Wave J review J1): the
+	// destination backend ids are the only handle on what this import
+	// created in the vault; recording them on the op row lets
+	// `ebb recover <op> --cancel` NAME leaked snapshots instead of
+	// reporting them as unnameable. Best effort — a failed record must
+	// not fail the import.
+	if res.DestinationPayload != "" || res.DestinationSeal != "" {
+		_ = sess.cat.SetBackendRefs(opID, res.DestinationPayload, res.DestinationSeal)
+	}
+	//
+	// Rollback discipline (Wave J review J3): while the registration can
+	// still fail BEFORE the snapshot row exists, a failure rolls back
+	// the just-copied payload+seal pair through the transport's own
+	// List-verified forget (capsule.RollbackImport — the same deletion
+	// mechanism, never a second one), so a rerun starts clean instead of
+	// orphaning unregistered backend snapshots. Once the row EXISTS it
+	// references exactly these backend ids, so a later bookkeeping
+	// failure (replica receipt / DONE close) must NOT roll the pair
+	// back — the snapshot IS registered, and the idempotent rerun hits
+	// the Known duplicate gate (already-known) rather than copying a
+	// second time.
+	rollbackPair := func(cause error) error {
+		var created []string
+		if res.DestinationPayload != "" {
+			created = append(created, res.DestinationPayload)
+		}
+		if res.DestinationSeal != "" {
+			created = append(created, res.DestinationSeal)
+		}
+		if len(created) == 0 {
+			return cause
+		}
+		if rerr := capsule.RollbackImport(ctx, capStore, repoDir, passfile, created); rerr != nil {
+			return fmt.Errorf(
+				"%w — ROLLBACK FAILED: backend snapshot(s) %s may remain in the destination vault (%v); inspect and remove them explicitly before rerunning",
+				cause, strings.Join(created, ", "), rerr)
+		}
+		return fmt.Errorf(
+			"%w (the copied pair %s was rolled back in the destination vault and List-verified gone; a rerun copies fresh)",
+			cause, strings.Join(created, ", "))
+	}
 	vaultRowID := lifecycle.VaultIDFor(destRepoID, repoDir)
 	details.VaultRowID = string(vaultRowID)
 	if err := sess.cat.RegisterVault(catalog.Vault{
 		ID: vaultRowID, Path: repoDir, RepoID: destRepoID,
 	}); err != nil {
-		return failClose(fmt.Errorf("import: register vault row: %w", err))
+		return failClose(rollbackPair(fmt.Errorf("import: register vault row: %w", err)))
 	}
 	if err := sess.cat.ImportDiscoveredSnapshot(res.WorkspaceID, res.WorkspaceName, catalog.Snapshot{
 		ID:               res.LogicalSnapshotID,
@@ -427,18 +471,24 @@ func runImport(ctx context.Context, sess *session, capStore capsule.Store,
 		Kind:             res.Kind,
 		Pinned:           true, // recorded pinned by construction (I07)
 	}); err != nil {
-		return failClose(fmt.Errorf("import: register snapshot %s: %w", res.LogicalSnapshotID, err))
+		// A divergent row means another registration already claims this
+		// logical id with different content: our copied pair is redundant
+		// for it and is rolled back; the refusal names the divergence.
+		return failClose(rollbackPair(fmt.Errorf("import: register snapshot %s: %w", res.LogicalSnapshotID, err)))
 	}
+	// From here the row exists and references the copied pair: keep it.
 	if _, rerr := sess.cat.RecordReplica(catalog.Replica{
 		SnapshotID: res.LogicalSnapshotID,
 		VerifiedAt: domain.FormatTime(time.Now().UTC()),
 		Scope:      "capsule-import:" + strings.Join(res.Checks, "+") + "+local-seal-readback",
 		Path:       capsulePath,
 	}); rerr != nil {
-		return failClose(fmt.Errorf("import: record replica: %w", rerr))
+		return failClose(fmt.Errorf(
+			"import: record replica: %w (the snapshot %s IS registered and its pair retained — a rerun reports already-known and copies nothing)", rerr, res.LogicalSnapshotID))
 	}
 	if aerr := sess.cat.AdvanceOperation(opID, catalog.PhaseImportVerifying, catalog.PhaseDone); aerr != nil {
-		return failClose(fmt.Errorf("import: close operation DONE: %w", aerr))
+		return failClose(fmt.Errorf(
+			"import: close operation DONE: %w (the snapshot %s IS registered and its pair retained; if the operation stays active, close it with `ebb recover %s --cancel`)", aerr, res.LogicalSnapshotID, opID))
 	}
 	return nil
 }

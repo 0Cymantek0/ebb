@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"ebb/internal/domain"
@@ -183,13 +184,110 @@ func (c *Catalog) RecordPinRelease(id domain.SnapshotID, reason string) error {
 	})
 }
 
+// ErrWitnessDivergence reports that a discovered snapshot id collides
+// with an EXISTING row whose witness-bearing fields differ (Wave J
+// review J4): payload/seal backend ids, vault binding, manifest and
+// inventory digests, workspace binding or kind. Those fields are the
+// D017/D020 tamper witness (a retained receipt is validated against the
+// row's seal-time digests), so a merge that overwrote them from
+// vault-derived values would re-anchor trust to the tampered source.
+// The row is NEVER modified when this is returned; the caller surfaces
+// the pair as a suspicious finding instead.
+type ErrWitnessDivergence struct {
+	SnapshotID domain.SnapshotID
+	// Existing is the untouched catalog row (the intact witness).
+	Existing Snapshot
+	// Incoming is the discovered candidate that was refused.
+	Incoming Snapshot
+	// Fields names the diverging columns in a stable order.
+	Fields []string
+}
+
+func (e *ErrWitnessDivergence) Error() string {
+	return fmt.Sprintf(
+		"catalog: discovered snapshot %s diverges from the existing row's witness fields (%s); the row was left untouched",
+		e.SnapshotID, strings.Join(e.Fields, ", "))
+}
+
+// Reasons renders one line per diverging field with both values, for
+// suspicious-refusal reports.
+func (e *ErrWitnessDivergence) Reasons() []string {
+	field := func(name, existing, incoming string) string {
+		return fmt.Sprintf("%s: catalog row has %q, vault discovery claims %q", name, existing, incoming)
+	}
+	get := func(s Snapshot, name string) string {
+		switch name {
+		case "workspace_id":
+			return string(s.WorkspaceID)
+		case "payload_backend_id":
+			return s.PayloadBackendID
+		case "seal_backend_id":
+			return s.SealBackendID
+		case "vault_id":
+			return string(s.VaultID)
+		case "manifest_digest":
+			return s.ManifestDigest
+		case "inventory_digest":
+			return s.InventoryDigest
+		case "kind":
+			return s.Kind
+		default:
+			return name
+		}
+	}
+	out := make([]string, 0, len(e.Fields))
+	for _, f := range e.Fields {
+		out = append(out, field(f, get(e.Existing, f), get(e.Incoming, f)))
+	}
+	return out
+}
+
+// witnessFields is the ordered set of identity/witness-bearing columns
+// ImportDiscoveredSnapshot compares on a conflict. A field the existing
+// row does not carry (NULL/empty — legacy rows) is not a divergence;
+// every non-empty value must match exactly.
+var witnessFields = [...]string{
+	"workspace_id", "payload_backend_id", "seal_backend_id", "vault_id",
+	"manifest_digest", "inventory_digest", "kind",
+}
+
+// witnessDivergence returns the names of the witness fields on which the
+// existing row (authoritative, never overwritten) disagrees with the
+// incoming discovered candidate. Empty existing values never diverge.
+func witnessDivergence(existing, incoming Snapshot) []string {
+	type pair struct{ existing, incoming string }
+	carry := map[string]pair{
+		"workspace_id":       {string(existing.WorkspaceID), string(incoming.WorkspaceID)},
+		"payload_backend_id": {existing.PayloadBackendID, incoming.PayloadBackendID},
+		"seal_backend_id":    {existing.SealBackendID, incoming.SealBackendID},
+		"vault_id":           {string(existing.VaultID), string(incoming.VaultID)},
+		"manifest_digest":    {existing.ManifestDigest, incoming.ManifestDigest},
+		"inventory_digest":   {existing.InventoryDigest, incoming.InventoryDigest},
+		"kind":               {existing.Kind, incoming.Kind},
+	}
+	var fields []string
+	for _, f := range witnessFields {
+		p := carry[f]
+		if p.existing != "" && p.existing != p.incoming {
+			fields = append(fields, f)
+		}
+	}
+	return fields
+}
+
 // ImportDiscoveredSnapshot records one snapshot discovered by vault
 // recovery (Foundation §11.5). If the workspace row does not exist it is
 // created with status UNBOUND and the snapshot's creation time —
 // reconstruction never guesses live or parked (§16.5). Re-importing an
-// already-known snapshot id refreshes the discovered backend facts
-// (payload/seal ids, vault, digests, kind) but never touches the pinned
-// state or the pin audit list.
+// already-known snapshot id is COMPARED, never merged: the existing
+// row's witness-bearing fields (payload/seal backend ids, vault,
+// manifest/inventory digests, kind — the D017/D020 tamper witness) are
+// authoritative and are never overwritten by vault-derived values. An
+// exact match is a benign duplicate (the row is left completely
+// untouched, including its pinned state and pin audit); a divergence
+// returns *ErrWitnessDivergence with the row still untouched, for the
+// caller to surface as a suspicious finding (rebuild-from-catalog-LOSS
+// is unaffected: with no row there is nothing to conflict).
 func (c *Catalog) ImportDiscoveredSnapshot(wsID domain.WorkspaceID, wsName string, s Snapshot) error {
 	if wsID == "" {
 		return errors.New("catalog: discovered workspace id required")
@@ -220,17 +318,22 @@ func (c *Catalog) ImportDiscoveredSnapshot(wsID domain.WorkspaceID, wsName strin
 		if _, err := tx.Exec(wq, string(wsID), wsName, s.CreatedAt, WorkspaceUnbound); err != nil {
 			return fmt.Errorf("catalog: import workspace %s: %w", wsID, err)
 		}
+		// J4: compare before touching anything. The existing row IS the
+		// witness; the discovered candidate may only confirm it.
+		existing, gerr := getSnapshotForUpdate(tx, s.ID)
+		switch {
+		case gerr == nil:
+			if fields := witnessDivergence(existing, s); len(fields) > 0 {
+				return &ErrWitnessDivergence{SnapshotID: s.ID, Existing: existing, Incoming: s, Fields: fields}
+			}
+			return nil // benign duplicate: nothing to write, nothing to overwrite
+		case !errors.Is(gerr, ErrNotFound):
+			return gerr
+		}
 		const sq = `INSERT INTO snapshots
 			(id, workspace_id, created_at, payload_backend_id, seal_backend_id, vault_id,
 			 manifest_digest, inventory_digest, kind, pinned, pin_reasons)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-			ON CONFLICT(id) DO UPDATE SET
-				payload_backend_id = excluded.payload_backend_id,
-				seal_backend_id = excluded.seal_backend_id,
-				vault_id = excluded.vault_id,
-				manifest_digest = excluded.manifest_digest,
-				inventory_digest = excluded.inventory_digest,
-				kind = excluded.kind`
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
 		if _, err := tx.Exec(sq, string(s.ID), string(s.WorkspaceID), s.CreatedAt,
 			nullStr(s.PayloadBackendID), nullStr(s.SealBackendID), nullStr(string(s.VaultID)),
 			nullStr(s.ManifestDigest), nullStr(s.InventoryDigest), s.Kind, reasons); err != nil {

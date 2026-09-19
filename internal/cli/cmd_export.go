@@ -13,9 +13,13 @@
 //
 // Passphrase display contract: the generated capsule passphrase is the
 // user's recovery secret. It prints ONCE, to the terminal (stderr),
-// clearly marked — including under --json, whose machine output instead
-// names the output file and says the passphrase was displayed there. It
-// never enters argv, logs or the JSON envelope.
+// clearly marked — IMMEDIATELY after the publish rename durably places
+// the capsule it unlocks and BEFORE any fallible bookkeeping (Wave J
+// review J2: a post-publication bookkeeping failure is a warning on a
+// success, never the failure that silences the secret) — including
+// under --json, whose machine output instead names the output file and
+// says the passphrase was displayed there. It never enters argv, logs
+// or the JSON envelope.
 //
 // Exit contract: 0 capsule published; 2 malformed id / bad arguments /
 // unwired seam; 3 refused (trim/seal kind, unsealed payload, occupied
@@ -60,6 +64,11 @@ type exportDetails struct {
 	DestinationSealID    string   `json:"destination_seal_id,omitempty"`
 	Checks               []string `json:"checks,omitempty"`
 	Passphrase           string   `json:"passphrase,omitempty"` // guidance text, never the secret
+	// Warnings carry post-publication bookkeeping failures (J2): the
+	// capsule exists and its passphrase was displayed; the warnings name
+	// what durable bookkeeping (replica row, pin release, DONE close)
+	// did not land and how to reconcile it.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 func cmdExport(args []string, streams Streams, deps Deps) int {
@@ -148,6 +157,7 @@ func cmdExport(args []string, streams Streams, deps Deps) int {
 	if cErr != nil {
 		code := classifyExitCode(cErr)
 		env.Details = details
+		env.Warnings = append(env.Warnings, details.Warnings...)
 		if details.OperationID != "" {
 			env.OperationID = details.OperationID
 			env.SnapshotID = idArg
@@ -161,6 +171,7 @@ func cmdExport(args []string, streams Streams, deps Deps) int {
 	env.SnapshotID = idArg
 	env.WorkspaceID = string(ws.ID)
 	env.Details = details
+	env.Warnings = append(env.Warnings, details.Warnings...)
 	if *dryRun {
 		env.Conditions = []string{"dry-run"}
 	} else {
@@ -209,18 +220,14 @@ func runExport(ctx context.Context, sess *session, repoDir, passfile string,
 		return fmt.Errorf("export: begin operation: %w", err)
 	}
 	details.OperationID = string(opID)
-	if err := sess.cat.Pin(snap.ID, "export:"+string(opID)); err != nil {
-		return fmt.Errorf("export: take export pin: %w", err)
-	}
-	// BeginOperation journals at the generic PLANNED phase; move onto
-	// the export vocabulary before the capsule starts.
-	if err := sess.cat.AdvanceOperation(opID, catalog.PhasePlanned, catalog.PhaseExportPlanned); err != nil {
-		return fmt.Errorf("export: journal: %w", err)
-	}
-	// Whatever happens next, the duration pin is released and the op
-	// closed; capsule.Export itself removes its own partial/working
-	// artifacts on failure.
-	phase := catalog.PhaseExportPlanned
+
+	// Journal discipline (Wave J review J1/J1b): from the moment
+	// BeginOperation lands, EVERY failure — including the early ones
+	// between the begin and the first phase advance — routes through
+	// failClose, so neither a stuck-active operation nor a stale export
+	// pin can result. `phase` always names the journal's ACTUAL phase so
+	// failClose's CAS matches.
+	phase := catalog.PhasePlanned
 	failClose := func(failErr error) error {
 		_ = sess.cat.FailOperation(opID, phase, failErr.Error())
 		if aerr := sess.cat.AdvanceOperation(opID, phase, catalog.PhaseCanceled); aerr != nil {
@@ -228,17 +235,41 @@ func runExport(ctx context.Context, sess *session, repoDir, passfile string,
 		}
 		return failErr
 	}
-	releasePin := func() {
+	// releasePin closes the duration pin. It returns an error instead of
+	// swallowing one: after publication the caller reports the failure as
+	// a warning (J2), and before publication failClose's error already
+	// names the primary failure — the pin state is then visible via
+	// `ebb recover <op> --cancel`, which releases the pin audit-only.
+	releasePin := func() error {
 		if wasPinned {
 			// Audit-only release: the snapshot stays pinned by its
 			// original reasons (creation); the export adds no permanent
 			// obligation.
-			_ = sess.cat.RecordPinRelease(snap.ID, "export:"+string(opID))
-		} else {
-			// It was unpinned before the export: restore that state.
-			_ = sess.cat.Unpin(snap.ID, "export:"+string(opID), true)
+			if rerr := sess.cat.RecordPinRelease(snap.ID, "export:"+string(opID)); rerr != nil {
+				return fmt.Errorf("export: release export pin (audit-only): %w", rerr)
+			}
+			return nil
 		}
+		// It was unpinned before the export: restore that state.
+		if uerr := sess.cat.Unpin(snap.ID, "export:"+string(opID), true); uerr != nil {
+			return fmt.Errorf("export: release export pin (restore unpinned): %w", uerr)
+		}
+		return nil
 	}
+
+	if err := sess.cat.Pin(snap.ID, "export:"+string(opID)); err != nil {
+		return failClose(fmt.Errorf("export: take export pin: %w", err))
+	}
+	// BeginOperation journals at the generic PLANNED phase; move onto
+	// the export vocabulary before the capsule starts. The pin is
+	// already taken here, so a failed advance must also release it.
+	if err := sess.cat.AdvanceOperation(opID, catalog.PhasePlanned, catalog.PhaseExportPlanned); err != nil {
+		if perr := releasePin(); perr != nil {
+			details.Warnings = append(details.Warnings, perr.Error())
+		}
+		return failClose(fmt.Errorf("export: journal: %w", err))
+	}
+	phase = catalog.PhaseExportPlanned
 
 	res, xerr := capsule.Export(ctx, capsule.Params{
 		Store:          capStore,
@@ -271,34 +302,56 @@ func runExport(ctx context.Context, sess *session, repoDir, passfile string,
 		},
 	})
 	if xerr != nil {
-		releasePin()
+		// Nothing was published (capsule.Export removed its own partial
+		// on failure): a hard failure is honest. The pin release and the
+		// op close are part of the close-out; their own failures become
+		// warnings so the primary error is never masked.
+		if perr := releasePin(); perr != nil {
+			details.Warnings = append(details.Warnings, perr.Error())
+		}
 		return failClose(fmt.Errorf("export %s: %w", snap.ID, xerr))
 	}
 
-	// Success: replica receipt, pin release, DONE.
+	// The capsule is PUBLISHED (the no-clobber rename inside
+	// capsule.Export has completed; no .partial remains). Print the
+	// one-time passphrase IMMEDIATELY — before any fallible bookkeeping
+	// — so no later failure can destroy the crypto/rand secret that
+	// unlocks the artifact that now exists (Wave J review J2). Terminal
+	// (stderr) only, marked; never argv, logs or the JSON envelope.
 	details.CapsuleBytes = res.CapsuleBytes
 	details.DestinationRepoID = res.DestinationRepoID
 	details.DestinationPayloadID = res.DestinationPayload
 	details.DestinationSealID = res.DestinationSeal
 	details.Checks = res.Checks
 	details.Passphrase = "displayed on terminal only; not recorded in machine output"
+	fmt.Fprintf(streams.Err, "\nCAPSULE PASSPHRASE — shown ONCE, never stored by Ebb:\n  %s\n", res.Passphrase)
+	fmt.Fprintln(streams.Err, "Store it in a password manager now; without it the capsule cannot be opened.")
+
+	// Post-publication bookkeeping (replica receipt, pin release, DONE
+	// close) degrades to WARNINGS on a SUCCESS outcome (J2): the
+	// capsule exists and its passphrase was displayed, so a catalog
+	// hiccup must neither fail the export nor silence what already
+	// succeeded. Every warning discloses that the complete capsule sits
+	// at the final path.
+	warn := func(format string, a ...any) {
+		w := fmt.Sprintf(format, a...)
+		details.Warnings = append(details.Warnings, w)
+		fmt.Fprintf(streams.Err, "warning: %s\n", w)
+	}
 	if _, rerr := sess.cat.RecordReplica(catalog.Replica{
 		SnapshotID: snap.ID,
 		VerifiedAt: domain.FormatTime(time.Now().UTC()),
 		Scope:      "capsule-export:" + strings.Join(res.Checks, "+") + "+container-verified",
 		Path:       res.OutputPath,
 	}); rerr != nil {
-		releasePin()
-		return failClose(fmt.Errorf("export: record capsule replica: %w", rerr))
+		warn("recording the capsule replica receipt failed (%v); the COMPLETE capsule is published at %s and opens with the passphrase shown above — only the replicas bookkeeping row is missing", rerr, res.OutputPath)
 	}
-	releasePin()
+	if perr := releasePin(); perr != nil {
+		warn("%v; the COMPLETE capsule is published at %s — the export pin may still be taken (visible in `ebb status`; `ebb recover %s --cancel` releases it audit-only)", perr, res.OutputPath, opID)
+	}
 	if aerr := sess.cat.AdvanceOperation(opID, catalog.PhaseExportVerifying, catalog.PhaseDone); aerr != nil {
-		return failClose(fmt.Errorf("export: close operation DONE: %w", aerr))
+		warn("closing the export operation DONE failed (%v); the COMPLETE capsule is published at %s — the operation may still be active and block the workspace until closed with `ebb recover %s --cancel` (safe: the export owns no removal authority)", aerr, res.OutputPath, opID)
 	}
-
-	// The one-time passphrase block: terminal (stderr) only, marked.
-	fmt.Fprintf(streams.Err, "\nCAPSULE PASSPHRASE — shown ONCE, never stored by Ebb:\n  %s\n", res.Passphrase)
-	fmt.Fprintln(streams.Err, "Store it in a password manager now; without it the capsule cannot be opened.")
 	return nil
 }
 

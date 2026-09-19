@@ -716,36 +716,55 @@ func discoverCopiedPayload(before, after []domain.SnapshotRef) (string, error) {
 // the rollback itself is appended to the returned error honestly; a
 // leaked backend id is never hidden.
 func rollbackDestination(ctx context.Context, params *ImportParams, created []string, cause error) error {
-	if len(created) == 0 {
-		return cause
-	}
-	sort.Strings(created)
-	names := strings.Join(created, ", ")
-	if ferr := params.Store.Forget(ctx, params.DestRepoDir, params.DestPassfile, created); ferr != nil {
+	if rerr := RollbackImport(ctx, params.Store, params.DestRepoDir, params.DestPassfile, created); rerr != nil {
+		sort.Strings(created)
 		return fmt.Errorf(
-			"%w — ROLLBACK FAILED: backend snapshot(s) %s may remain in the destination vault (forget: %v); inspect and remove them explicitly",
-			cause, names, ferr)
+			"%w — ROLLBACK FAILED: backend snapshot(s) %s may remain in the destination vault (%s); inspect and remove them explicitly",
+			cause, strings.Join(created, ", "), rerr)
 	}
-	refs, lerr := params.Store.List(ctx, params.DestRepoDir, params.DestPassfile)
+	return cause
+}
+
+// RollbackImport is the exported form of the transport's List-verified
+// rollback (Wave J review J3): the CLI uses the SAME deletion mechanism
+// the transport already owns — never a second one — to roll back the
+// payload+seal pair a completed transport copied into the destination
+// vault when the caller's catalog registration fails before the
+// snapshot row exists. It forgets exactly the named ids and verifies by
+// List that they are gone. It returns nil only when the rollback is
+// List-verified complete; otherwise the error names the ids that may
+// remain (never hidden). Capsule-internal cleanup of its own copies is
+// this package's existing authority; nothing outside the destination
+// vault's named ids is touched.
+func RollbackImport(ctx context.Context, store Store, repoDir, passfile string, created []string) error {
+	if len(created) == 0 {
+		return nil
+	}
+	ids := append([]string(nil), created...)
+	sort.Strings(ids)
+	if ferr := store.Forget(ctx, repoDir, passfile, ids); ferr != nil {
+		return fmt.Errorf("forget: %v", ferr)
+	}
+	refs, lerr := store.List(ctx, repoDir, passfile)
 	if lerr != nil {
 		return fmt.Errorf(
-			"%w — rollback forget succeeded but could not be VERIFIED (listing the destination vault: %v); backend snapshot(s) %s may remain; inspect them explicitly",
-			cause, lerr, names)
+			"rollback forget succeeded but could not be VERIFIED (listing the destination vault: %v)", lerr)
+	}
+	present := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		present[r.BackendID] = true
 	}
 	var leaked []string
-	for _, r := range refs {
-		for _, id := range created {
-			if r.BackendID == id {
-				leaked = append(leaked, id)
-			}
+	for _, id := range ids {
+		if present[id] {
+			leaked = append(leaked, id)
 		}
 	}
 	if len(leaked) > 0 {
 		return fmt.Errorf(
-			"%w — ROLLBACK INCOMPLETE: %s still listed in the destination vault after forget; inspect and remove explicitly",
-			cause, strings.Join(leaked, ", "))
+			"%s still listed in the destination vault after forget", strings.Join(leaked, ", "))
 	}
-	return cause
+	return nil
 }
 
 // asCapsuleEvidence re-expresses the shared evidence core's refusal as

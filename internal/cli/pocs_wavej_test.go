@@ -10,8 +10,6 @@ package cli
 // specific misbehavior.
 
 import (
-	"context"
-	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,58 +18,18 @@ import (
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 	"ebb/internal/vault"
-
-	_ "modernc.org/sqlite"
 )
 
 // ---- helpers ------------------------------------------------------------
+// jStore and jLockCatalog live untagged in wave_j_regression_test.go so
+// this suite and the default regressions drive the same interpositions.
 
-// jStore wraps the Wave H disk-backed fake store with a DumpFile hook,
-// so a test can interpose at an exact backend call without modifying the
-// shared harness. Every other method (including the capsule Copy seam)
-// is promoted from *hStore.
-type jStore struct {
-	*hStore
-	onDumpFile func(repoDir, snapID, path string)
-}
-
-func (s *jStore) DumpFile(ctx context.Context, repoDir, passfile, snapID, path string) ([]byte, error) {
-	if s.onDumpFile != nil {
-		s.onDumpFile(repoDir, snapID, path)
-	}
-	return s.hStore.DumpFile(ctx, repoDir, passfile, snapID, path)
-}
-
-// jLockCatalog takes an EXCLUSIVE sqlite transaction on the catalog file
-// through a second connection and holds it until release. Every write on
-// the session's own connection then fails deterministically after its
-// busy_timeout (5 s per call) — the controlled "catalog just broke"
-// failure the J2/J3 orderings need, without corrupting anything.
-func jLockCatalog(t *testing.T, path string) (release func()) {
-	t.Helper()
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(500)")
-	if err != nil {
-		t.Fatalf("J lock: open: %v", err)
-	}
-	db.SetMaxOpenConns(1)
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		t.Fatalf("J lock: conn: %v", err)
-	}
-	if _, err := conn.ExecContext(context.Background(), "BEGIN EXCLUSIVE"); err != nil {
-		t.Fatalf("J lock: begin exclusive: %v", err)
-	}
-	return func() {
-		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-		_ = conn.Close()
-		_ = db.Close()
-	}
-}
-
-// ---- J1: a crashed export (or import) in an EXPORT_*/IMPORT_* phase is
-// unresolvable by every recovery verb, blocks the workspace and gc, and
-// gc's refusal actively misdirects the user to `ebb recover <op>` which
-// reports "nothing reconciled".
+// ---- J1 (post-fix contract): a crashed export (or import) in an
+// EXPORT_*/IMPORT_* phase is closable by `ebb recover <op> --cancel`
+// (the capsule transports own no removal authority, so cancel-after-
+// crash is always safe); plain recover stays report-only and names that
+// verb; gc's refusal names the verb that works for the kind; and the
+// workspace is unblocked afterwards.
 func TestJ1_CrashedExportOperationUnrecoverableAndBlocksWorkspaceAndGc(t *testing.T) {
 	h := newHHarness(t)
 	snap := h.captureSnapshot(t)
@@ -92,76 +50,73 @@ func TestJ1_CrashedExportOperationUnrecoverableAndBlocksWorkspaceAndGc(t *testin
 		}
 	}
 
-	// (a) gc is blocked globally — and its advice is wrong for this kind.
+	// (a) gc is blocked globally — and its advice names the verb that
+	// actually closes this kind's phases.
 	code, stdout, stderr := h.run("gc", "main", "--json")
 	if code != ExitBlocked {
 		t.Fatalf("J1: gc exit = %d, want %d (stdout %s stderr %s)", code, ExitBlocked, stdout, stderr)
 	}
-	if !strings.Contains(stdout+stderr, "ebb recover "+string(opID)) {
-		t.Errorf("J1: gc refusal does not direct at recover (message: %s %s)", stdout, stderr)
+	if !strings.Contains(stdout+stderr, "ebb recover "+string(opID)+" --cancel") {
+		t.Errorf("J1: gc refusal does not direct at `recover --cancel` for a capsule-transport op (message: %s %s)", stdout, stderr)
 	}
 
-	// (b) plain recover: report-only, phase unchanged, exit 0.
+	// (b) plain recover: report-only, phase unchanged, exit 0 — and it
+	// advises the closing verb.
 	code, stdout, stderr = h.run("recover", string(opID), "--json")
 	if code != ExitOK {
-		t.Logf("J1: plain recover exit = %d (%s %s)", code, stdout, stderr)
+		t.Fatalf("J1: plain recover exit = %d (%s %s)", code, stdout, stderr)
 	}
 	env := envelopeOf(t, stdout)
 	det, _ := env["details"].(map[string]any)
 	if det == nil || det["phase_after"] != catalog.PhaseExportCopying {
-		t.Errorf("J1: recover phase_after = %v (details %v) — want the phase UNCHANGED at %s",
+		t.Errorf("J1: recover phase_after = %v (details %v) — want the phase UNCHANGED at %s (report-only)",
 			det["phase_after"], det, catalog.PhaseExportCopying)
 	}
-	if na, _ := det["next_action"].(string); !strings.Contains(na, "no lifecycle action required") {
-		t.Logf("J1: recover next_action = %q", na)
+	if na, _ := det["next_action"].(string); !strings.Contains(na, "--cancel") {
+		t.Errorf("J1: recover next_action = %q — want it to advise `--cancel`", na)
 	}
 
-	// (c) the explicit cancel verb refuses the phase outright.
+	// (c) the explicit cancel verb closes the crashed transport op.
 	code, stdout, stderr = h.run("recover", string(opID), "--cancel")
-	if code == ExitOK {
-		t.Fatalf("J1: --cancel SUCCEEDED — the stuck op WAS closable; finding stale. stdout %s", stdout)
+	if code != ExitOK {
+		t.Fatalf("J1: --cancel failed (code %d): %s %s", code, stdout, stderr)
 	}
-	if !strings.Contains(stdout+stderr, "cancel applies to phases") {
-		t.Logf("J1: --cancel refusal wording: %s %s", stdout, stderr)
+	if !strings.Contains(stdout+stderr, catalog.PhaseCanceled) {
+		t.Errorf("J1: cancel report does not name CANCELED: %s %s", stdout, stderr)
 	}
 
-	// (d) the workspace is bricked for every future capture.
+	// (d) the workspace accepts new operations again.
 	code, stdout, stderr = h.run("snapshot", h.wsRoot)
-	if code == ExitOK {
-		t.Fatalf("J1: a new snapshot SUCCEEDED with the dead export op active — finding stale")
-	}
-	if !strings.Contains(stdout+stderr, string(opID)) {
-		t.Errorf("J1: snapshot refusal does not name the blocking op: %s %s", stdout, stderr)
+	if code != ExitOK {
+		t.Fatalf("J1: a new snapshot was refused after cancel (code %d): %s %s", code, stdout, stderr)
 	}
 
-	// (e) the op is still active afterwards — nothing above closed it.
+	// (e) the op is closed — terminal CANCELED, no longer active.
 	cat2 := h.cat()
-	active, err := cat2.ActiveOperations("")
+	op, err := cat2.GetOperation(opID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
-	for _, op := range active {
-		if op.ID == opID {
-			found = op.Phase == catalog.PhaseExportCopying
-		}
+	if op.Phase != catalog.PhaseCanceled {
+		t.Fatalf("J1: op phase = %s, want %s", op.Phase, catalog.PhaseCanceled)
 	}
-	if !found {
-		t.Fatalf("J1: op %s not active at %s — something closed it; finding stale (active=%v)", opID, catalog.PhaseExportCopying, active)
+	if active, err := cat2.ActiveOperations(""); err != nil || len(active) != 0 {
+		t.Fatalf("J1: active ops after cancel = %v (%v), want none", active, err)
 	}
-	t.Errorf("J1 CONFIRMED: a crashed export at %s cannot be closed by ANY verb — plain recover reports "+
-		"'nothing reconciled', --cancel refuses the phase, the workspace refuses new captures, gc is blocked "+
-		"globally — until manual catalog surgery; gc's refusal even directs the user at the recover command "+
-		"that cannot help", catalog.PhaseExportCopying)
+
+	// (f) cancel is idempotent: a rerun reports already-canceled, exit 0.
+	code, _, _ = h.run("recover", string(opID), "--cancel")
+	if code != ExitOK {
+		t.Fatalf("J1: idempotent cancel rerun failed (code %d)", code)
+	}
 }
 
-// J1b — the same unrecoverable active-op state is reachable WITHOUT a
-// crash: a transient catalog write failure during an otherwise normal
-// export (here: an exclusive lock, i.e. any SQLITE_BUSY-class window,
-// taken at the backend copy) makes the post-transport bookkeeping
-// (RecordReplica / failClose's CAS close) fail, leaving the op ACTIVE
-// at EXPORT_COPYING and the duration pin pin:export:<op> taken but
-// never released (releasePin's error is swallowed by design).
+// J1b (post-fix contract) — a transient catalog write failure during an
+// otherwise normal export (an exclusive lock, i.e. any SQLITE_BUSY-class
+// window, taken at the backend copy) still fails the transport honestly
+// (nothing was published), but the resulting stuck-active op is now
+// closable with `recover --cancel`, which ALSO releases the stale
+// duration pin audit-only — no manual catalog surgery, no permanent pin.
 func TestJ1b_TransientCatalogErrorLeavesUnrecoverableOpAndStalePin(t *testing.T) {
 	h := newHHarness(t)
 	js := &jStore{hStore: h.store}
@@ -171,9 +126,10 @@ func TestJ1b_TransientCatalogErrorLeavesUnrecoverableOpAndStalePin(t *testing.T)
 	catPath := filepath.Join(h.stateDir, vault.CatalogFile)
 
 	// Lock when the backend copy starts: the op row is already active at
-	// EXPORT_COPYING (pin taken, both journal advances committed) and the
-	// next catalog writes — releasePin's audit, RecordReplica, and
-	// failClose's CAS close — deterministically fail.
+	// EXPORT_COPYING (pin taken, both journal advances committed) and
+	// the next catalog writes — the phase advance to EXPORT_VERIFYING,
+	// releasePin's audit, and failClose's CAS close — deterministically
+	// fail.
 	unlock := func() {}
 	armed := true
 	js.hStore.onCopy = func(src, dst string, ids []string) error {
@@ -189,6 +145,9 @@ func TestJ1b_TransientCatalogErrorLeavesUnrecoverableOpAndStalePin(t *testing.T)
 	unlock()
 	if code == ExitOK {
 		t.Fatalf("J1b: export succeeded despite the locked catalog: %s", stdout)
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Fatalf("J1b: a capsule was published despite the locked catalog (pre-publication failure expected)")
 	}
 	cat := h.cat()
 	ops := exportOpsOf(t, cat, snap.WorkspaceID)
@@ -217,23 +176,45 @@ func TestJ1b_TransientCatalogErrorLeavesUnrecoverableOpAndStalePin(t *testing.T)
 	if !pinTaken || pinReleased {
 		t.Fatalf("J1b: duration-pin audit = %v (taken=%v released=%v) — pin state not the claimed stale shape", fresh.PinReasons, pinTaken, pinReleased)
 	}
-	// And the stuck op again admits no recovery verb.
+
+	// The fix: the J1 escape hatch closes the op AND releases the stale
+	// duration pin (audit-only; the snapshot stays pinned by creation).
 	code, stdout, _ = h.run("recover", string(ops[0].ID), "--cancel")
-	if code == ExitOK {
-		t.Fatalf("J1b: --cancel closed the EXPORT_PLANNED op — finding stale: %s", stdout)
+	if code != ExitOK {
+		t.Fatalf("J1b: --cancel could not close the crashed export op: %s", stdout)
 	}
-	t.Errorf("J1b CONFIRMED: one transient catalog write failure (busy lock) during a normal export left the "+
-		"operation ACTIVE at %s with the duration pin %s taken but never released; no recovery verb closes it "+
-		"(plain recover reports 'nothing reconciled', --cancel refuses the phase) — the same manual-surgery "+
-		"dead end as a hard crash, reachable in ordinary operation", ops[0].Phase, "pin:export:"+string(ops[0].ID))
+	cat2 := h.cat()
+	op, err := cat2.GetOperation(ops[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Phase != catalog.PhaseCanceled {
+		t.Fatalf("J1b: op phase after cancel = %s, want CANCELED", op.Phase)
+	}
+	fresh, err = cat2.GetSnapshot(snap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinReleased = false
+	for _, r := range fresh.PinReasons {
+		if strings.HasPrefix(r, "unpin:export:"+string(ops[0].ID)) {
+			pinReleased = true
+		}
+	}
+	if !pinReleased {
+		t.Fatalf("J1b: the stale duration pin was not released by cancel (audit: %v)", fresh.PinReasons)
+	}
+	if !fresh.Pinned {
+		t.Error("J1b: cancel dropped the snapshot's own pinned flag — cancel must never release recovery obligations (I07)")
+	}
 }
 
-// ---- J2: post-publication bookkeeping failures destroy the one-time
-// capsule passphrase. capsule.Export has already PUBLISHED (final name,
-// no partial) when RecordReplica runs; its failure walks failClose,
-// returns an error, and the passphrase print — the only place the
-// crypto/rand secret ever appears — is never reached. The user is left
-// with a complete, final-named capsule that can never be opened.
+// ---- J2 (post-fix contract): the passphrase prints IMMEDIATELY after
+// the publish rename and BEFORE any fallible bookkeeping, so a
+// post-publication bookkeeping failure (replicas row / DONE close)
+// degrades to a WARNING on a SUCCESS outcome — the capsule exists at
+// its final path, its secret was displayed, and the warning discloses
+// both plus how to reconcile the operation.
 func TestJ2_ExportPublishesThenLosesPassphraseOnBookkeepingFailure(t *testing.T) {
 	h := newHHarness(t)
 	js := &jStore{hStore: h.store}
@@ -258,28 +239,84 @@ func TestJ2_ExportPublishesThenLosesPassphraseOnBookkeepingFailure(t *testing.T)
 
 	code, stdout, stderr := h.run("export", "--json", string(snap.ID), "--output", out)
 	unlock() // free the catalog before asserting on durable state
-	if code == ExitOK {
-		t.Fatalf("J2: export SUCCEEDED despite the locked catalog — ordering changed; stdout %s", stdout)
+	if code != ExitOK {
+		t.Fatalf("J2: export FAILED after publication (code %d) — post-publication bookkeeping must be a warning on success: %s %s", code, stdout, stderr)
 	}
 	if _, err := os.Stat(out); err != nil {
-		t.Fatalf("J2: capsule NOT published at %s — the failure preceded publication; ordering changed: %v", out, err)
+		t.Fatalf("J2: capsule NOT published at %s: %v", out, err)
 	}
 	if _, err := os.Stat(out + ".partial"); err == nil {
 		t.Error("J2: a .partial also exists — unexpected double artifact")
 	}
-	if strings.Contains(stderr, "CAPSULE PASSPHRASE") || strings.Contains(stdout, "CAPSULE PASSPHRASE") {
-		t.Errorf("J2: the passphrase block WAS shown — finding stale")
+
+	// The one-time secret WAS displayed (exactly once, terminal only).
+	if !strings.Contains(stderr, "CAPSULE PASSPHRASE") {
+		t.Errorf("J2: the passphrase block was NOT shown on the terminal:\n%s", stderr)
 	}
-	t.Errorf("J2 CONFIRMED: the export FAILED after publication (capsule exists at the FINAL path %s) and the "+
-		"one-time passphrase was never displayed — a complete capsule whose crypto/rand secret is now "+
-		"unrecoverable, an error report that does not disclose that, no replicas row, and (§15.2) not the "+
-		"'identifiable partial artifact' a failed export is supposed to leave", out)
+	secret := passphraseOfBlock(stderr)
+	if secret == "" {
+		t.Fatal("J2: no passphrase line found in the block")
+	}
+	if strings.Contains(stdout, secret) {
+		t.Fatal("J2: THE CAPSULE PASSPHRASE LEAKED INTO THE JSON ENVELOPE")
+	}
+	if strings.Count(stderr, secret) != 1 {
+		t.Errorf("J2: passphrase printed %d times in stderr, want exactly 1", strings.Count(stderr, secret))
+	}
+
+	// The envelope is a SUCCESS with warnings that disclose the complete
+	// capsule at the final path and name the reconciliation verb.
+	env := envelopeOf(t, stdout)
+	if env["outcome"] != "ok" {
+		t.Fatalf("J2: envelope outcome = %v, want ok", env["outcome"])
+	}
+	warned := false
+	for _, w := range env["warnings"].([]any) {
+		ws, _ := w.(string)
+		if strings.Contains(ws, "COMPLETE capsule") && strings.Contains(ws, out) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("J2: no warning discloses the complete capsule at %s (warnings: %v)", out, env["warnings"])
+	}
+
+	// The stuck bits the warnings name are reconcilable with the J1
+	// verb: the op (still active — its DONE close failed) closes and
+	// the unreleased pin audit is released.
+	cat := h.cat()
+	ops := exportOpsOf(t, cat, snap.WorkspaceID)
+	if len(ops) != 1 || ops[0].Phase != catalog.PhaseExportVerifying {
+		t.Fatalf("J2: export ops = %+v, want one active at EXPORT_VERIFYING (DONE close failed)", ops)
+	}
+	code, stdout, _ = h.run("recover", string(ops[0].ID), "--cancel")
+	if code != ExitOK {
+		t.Fatalf("J2: recover --cancel could not close the bookkeeping-failed export op: %s", stdout)
+	}
+	fresh, err := h.cat().GetSnapshot(snap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	for _, r := range fresh.PinReasons {
+		if strings.HasPrefix(r, "unpin:export:"+string(ops[0].ID)) {
+			released = true
+		}
+	}
+	if !released {
+		t.Errorf("J2: the export pin was not released by cancel (audit: %v)", fresh.PinReasons)
+	}
+	if !fresh.Pinned {
+		t.Error("J2: the source snapshot lost its own pinned flag")
+	}
 }
 
-// ---- J3: a CLI-side registration failure after a successful import
-// transport leaves the copied payload+seal ORPHANED in the destination
-// vault (no rollback, no rows, op stuck active) and a rerun would copy
-// AGAIN.
+// ---- J3 (post-fix contract): a CLI-side registration failure after a
+// successful import transport rolls the copied payload+seal pair back
+// through the transport's List-verified forget (no orphans), reports
+// the rollback, and the rerun copies FRESH into a clean vault (after
+// the stuck op is closed with the J1 verb) instead of accumulating a
+// second pair.
 func TestJ3_ImportRegistrationFailureOrphansVaultSnapshots(t *testing.T) {
 	capPath, secret, snap := exportCapsuleOf(t)
 	ih := newImportHarness(t) // re-sets vault.EnvPassword for the destination world
@@ -308,42 +345,52 @@ func TestJ3_ImportRegistrationFailureOrphansVaultSnapshots(t *testing.T) {
 	code, stdout, stderr := ih.run("import", "--json", capPath)
 	unlock() // free the catalog before asserting on durable state
 	if code == ExitOK {
-		t.Fatalf("J3: import SUCCEEDED despite the locked catalog — ordering changed; stdout %s", stdout)
+		t.Fatalf("J3: import SUCCEEDED despite the locked catalog (registration failures stay failures): %s", stdout)
 	}
 
-	// The vault holds the copied pair with NO catalog row: orphaned.
-	leaked := ih.destSnaps(t)
-	if len(leaked) != 2 {
-		t.Fatalf("J3: destination vault holds %d snapshots, want exactly the leaked pair (2): %v", len(leaked), leaked)
+	// The copied pair was rolled back, List-verified gone: NO orphans.
+	if leaked := ih.destSnaps(t); len(leaked) != 0 {
+		t.Fatalf("J3: destination vault holds %d snapshot(s) after the rolled-back import, want 0: %v", len(leaked), leaked)
+	}
+	if !strings.Contains(stdout+stderr, "rolled back") {
+		t.Errorf("J3: the failure does not report the rollback: %s %s", stdout, stderr)
 	}
 	cat := ih.cat()
 	if _, err := cat.GetSnapshot(snap.ID); err == nil {
-		t.Fatalf("J3: a snapshot row exists despite the failed registration — finding stale")
+		t.Fatalf("J3: a snapshot row exists despite the failed registration")
 	}
 	ops := importOpsOf(t, cat)
 	if len(ops) != 1 {
 		t.Fatalf("J3: import ops = %+v, want exactly one", ops)
 	}
-	if ops[0].Phase != catalog.PhaseImportVerifying {
-		t.Logf("J3: stuck phase = %s (want %s)", ops[0].Phase, catalog.PhaseImportVerifying)
-	}
 	if act, _ := cat.ActiveOperations(""); len(act) == 0 {
-		t.Error("J3: the failed import's operation is not active — J1-class block absent")
+		t.Error("J3: the failed import's operation is not active (the locked catalog also broke failClose)")
 	}
-	if strings.Contains(stdout+stderr, "ROLLBACK") {
-		t.Error("J3: a rollback was reported — the transport's rollback fired after all; finding stale")
+
+	// Close the stuck op with the J1 verb, then rerun: the vault is
+	// clean, so the rerun copies exactly one fresh pair — not a second
+	// copy beside the orphaned one.
+	code, stdout, _ = ih.run("recover", string(ops[0].ID), "--cancel")
+	if code != ExitOK {
+		t.Fatalf("J3: recover --cancel could not close the failed import op: %s", stdout)
 	}
-	t.Errorf("J3 CONFIRMED: the import failed AFTER the transport succeeded — payload %s and seal %s remain "+
-		"in the destination vault with no catalog row, no rollback was attempted (the transport's "+
-		"List-verified rollback only covers transport errors), the operation is stuck active at %s, and a "+
-		"rerun (Known gate: no row) would copy the pair a SECOND time",
-		leaked[0], leaked[1], ops[0].Phase)
+	code, stdout, stderr = ih.run("import", "--json", capPath)
+	if code != ExitOK {
+		t.Fatalf("J3: the rerun failed (code %d): %s %s", code, stdout, stderr)
+	}
+	if got := ih.destSnaps(t); len(got) != 2 {
+		t.Fatalf("J3: rerun left %d backend snapshots, want exactly the one fresh pair (2): %v", len(got), got)
+	}
+	if _, err := ih.cat().GetSnapshot(snap.ID); err != nil {
+		t.Fatalf("J3: the rerun did not register the snapshot row: %v", err)
+	}
 }
 
-// ---- J8: forget's last-recovery-copy guard covers PARKED workspaces
-// only. The SAME sole snapshot, once its workspace is UNBOUND (the
-// catalog-rebuild / import state, where no local root exists either),
-// forgets under plain --yes with no --last-of-parked acknowledgement.
+// ---- J8 (post-fix contract): forget's last-recovery-copy guard covers
+// BOTH statuses that have no local root. The SAME sole snapshot, after
+// catalog loss + rebuild (workspace UNBOUND — no root, no local copy),
+// refuses under plain --yes exactly like the PARKED twin, and releases
+// only with the explicit --last-of-parked acknowledgement.
 func TestJ8_ForgetLastCopyGuardSkipsUnboundWorkspaces(t *testing.T) {
 	h := newEHarness(t)
 	snap := parkH(t, h)
@@ -357,7 +404,7 @@ func TestJ8_ForgetLastCopyGuardSkipsUnboundWorkspaces(t *testing.T) {
 
 	// Twin B: the SAME sole snapshot after catalog loss + rebuild — the
 	// workspace comes back UNBOUND (no root, no local copy) and the guard
-	// no longer applies.
+	// fires for it too now.
 	loseCatalog(t, h)
 	code, stdout, stderr := h.run("init", "--rebuild-catalog", "--json")
 	if code != ExitOK {
@@ -374,15 +421,20 @@ func TestJ8_ForgetLastCopyGuardSkipsUnboundWorkspaces(t *testing.T) {
 
 	before := len(h.store.snaps)
 	code, stdout, stderr = h.run("forget", string(snap.ID), "--yes")
+	if code != ExitBlocked || !strings.Contains(stdout+stderr, CodeForgetLastOfParked) {
+		t.Fatalf("J8: the UNBOUND sole-snapshot forget was NOT refused (code %d): %s %s", code, stdout, stderr)
+	}
+	if got := len(h.store.snaps); got != before {
+		t.Fatalf("J8: backend snapshots changed by the refused forget (%d -> %d)", before, got)
+	}
+
+	// With the explicit acknowledgement the deliberate release proceeds.
+	code, stdout, stderr = h.run("forget", string(snap.ID), "--yes", "--last-of-parked")
 	if code != ExitOK {
-		t.Fatalf("J8 CONFIRMED-negative: the UNBOUND sole-snapshot forget was refused (code %d): %s %s — finding stale", code, stdout, stderr)
+		t.Fatalf("J8: the acknowledged forget failed (code %d): %s %s", code, stdout, stderr)
 	}
 	after := len(h.store.snaps)
 	if after != before-2 {
 		t.Fatalf("J8: backend snapshots %d -> %d, want the P/S pair gone (before-2)", before, after)
 	}
-	t.Errorf("J8 CONFIRMED: forgetting the ONLY snapshot of the UNBOUND workspace %q required no "+
-		"--last-of-parked acknowledgement (plain --yes, exit 0, P/S pair gone) while the identical "+
-		"sole-snapshot forget of the PARKED twin refuses with %s — the guard protects exactly one of the "+
-		"two statuses that have no local root", wss[0].Name, CodeForgetLastOfParked)
 }
