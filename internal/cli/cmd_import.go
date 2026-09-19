@@ -16,22 +16,27 @@
 // var and the terminal option. An empty passphrase refuses (capsule
 // itself re-validates).
 //
-// Journal honesty (§12): import has NO workspace yet when the command
-// starts — the logical ids live inside the encrypted capsule — and
-// catalog.BeginOperation requires an existing workspace row (FK).
-// The operation therefore begins LAZILY: capsule verification
+// Journal honesty (§12): import has NO workspace row yet when the
+// command starts — the logical ids live inside the encrypted capsule —
+// and catalog.BeginOperation requires an existing workspace row (FK).
+// The workspace row is therefore ensured LAZILY: capsule verification
 // (container check, headroom, extraction, unlock, seal cross-checks,
-// digest re-derivation) is read-only against durable state and needs
-// no journal; the journal opens at the COPYING boundary — the first
-// destination-vault mutation — under a CLI-MINTED local workspace id.
-// The capsule's internal workspace id names a workspace on the
-// PRODUCING machine; it is reported (capsule_workspace_id), never
-// adopted locally. One consequence, accepted deliberately: the
-// capsule-side operation id (naming the transport's working dir and
-// the destination seal receipt) and the journal operation id are
-// minted separately and differ; every receipt reader checks the id
-// embedded in its own seal directory (I13), and the journal never
-// names the receipt.
+// digest re-derivation) is read-only against durable state and needs no
+// row; at the IDENTIFIED boundary — after verification, before the
+// duplicate gate and any vault mutation — the transport reports the
+// capsule's verified logical identity and the CLI ADOPTS it (§16.1
+// identity continuity: the capsule's logical workspace id becomes the
+// LOCAL workspace id, so multiple snapshots of one producer workspace
+// group under ONE row and `ebb open <name>` selects the latest). The
+// journal itself opens at the COPYING boundary — the first
+// destination-vault mutation. One consequence, accepted deliberately:
+// the capsule-side transport operation id (naming the transport's
+// working dir) and the journal operation id are minted separately and
+// differ; every receipt reader checks the id embedded in its own seal
+// directory (I13), and the journal never names the receipt. The LOCAL
+// seal the transport writes records the CAPTURE's operation id (see
+// internal/capsule writeImportSeal), so the imported pair loads exactly
+// like a native capture.
 //
 // Import NEVER implies forget, and never imports trust: the snapshot
 // registers pinned (I07) and imported action approvals stay empty even
@@ -55,7 +60,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -106,13 +110,10 @@ type importDetails struct {
 
 	// Verified facts (from the capsule's own bytes).
 	Workspace   string `json:"workspace,omitempty"`    // manifest main-root prefix (D003)
-	WorkspaceID string `json:"workspace_id,omitempty"` // CLI-minted LOCAL workspace id
+	WorkspaceID string `json:"workspace_id,omitempty"` // the ADOPTED capsule logical workspace id
 	SnapshotID  string `json:"snapshot_id,omitempty"`  // LOGICAL snapshot id from the capsule
 	Kind        string `json:"kind,omitempty"`
 	CreatedAt   string `json:"created_at,omitempty"`
-	// CapsuleWorkspaceID is the capsule-internal workspace id (the
-	// PRODUCER machine's identity); reported for traceability only.
-	CapsuleWorkspaceID string `json:"capsule_workspace_id,omitempty"`
 
 	AlreadyKnown     bool   `json:"already_known,omitempty"`
 	ManifestDigest   string `json:"manifest_digest,omitempty"`
@@ -251,50 +252,42 @@ func cmdImport(args []string, streams Streams, deps Deps) int {
 }
 
 // runImport performs the real import inside the vault closure: the
-// duplicate-gate policy (capsule's Known callback), the lazy journal
-// (the copying-boundary Phase hook), the transport itself, and on
-// success the catalog registration — workspace row (renamed to the
-// manifest's name), vault row, pinned snapshot row, replica receipt,
-// DONE.
+// identity adoption (capsule's Identified hook → EnsureWorkspace under
+// the CAPSULE's logical workspace id), the duplicate-gate policy
+// (capsule's Known callback), the lazy journal (the copying-boundary
+// Phase hook), the transport itself, and on success the catalog
+// registration — vault row, pinned snapshot row under the ADOPTED
+// workspace, replica receipt, DONE.
 func runImport(ctx context.Context, sess *session, capStore capsule.Store,
 	repoDir, passfile, destRepoID, capsulePath, passphrase string,
 	streams Streams, details *importDetails) error {
 
-	// The import's LOCAL workspace identity: minted here, registered at
-	// the copying boundary (the journal's FK) and at success (the
-	// snapshot row). The capsule's own workspace id stays report-only.
-	wsLocal := domain.WorkspaceID(domain.NewID())
-	// The capsule-side operation id names the transport's working dir
-	// and the destination seal receipt; the journal operation id is
-	// minted by catalog.BeginOperation at the copying boundary (see the
-	// file comment for why the two intentionally differ).
+	// The ADOPTED workspace identity: set by the Identified hook below
+	// (the capsule's own logical workspace id, verified from its bytes).
+	var wsAdopted domain.WorkspaceID
+	// The capsule-side transport operation id names the transport's
+	// working dir only; the journal operation id is minted by
+	// catalog.BeginOperation at the copying boundary, and the local seal
+	// records the CAPTURE's op id (see the file comment).
 	capsuleOpID := domain.OperationID(domain.NewID())
 
 	var (
 		opID  domain.OperationID
 		phase = catalog.PhaseImportPlanned // failClose tracks from here (export's pattern)
 	)
-	// beginJournal opens the workspace row and the operation and walks
-	// onto the import vocabulary. It runs at the copying boundary —
-	// after capsule verification, before the first destination-vault
-	// mutation. On a partial failure the caller's failClose closes
-	// whatever was opened (opID is set the moment BeginOperation
-	// succeeds).
+	// beginJournal opens the operation and walks onto the import
+	// vocabulary. It runs at the copying boundary — after capsule
+	// verification and identity adoption, before the first
+	// destination-vault mutation. On a partial failure the caller's
+	// failClose closes whatever was opened (opID is set the moment
+	// BeginOperation succeeds).
 	beginJournal := func() error {
-		if err := sess.cat.UpsertWorkspace(catalog.Workspace{
-			ID:     wsLocal,
-			Name:   provisionalImportWorkspaceName(capsulePath),
-			Status: catalog.WorkspaceUnbound,
-		}); err != nil {
-			return fmt.Errorf("import: journal workspace: %w", err)
-		}
-		id, err := sess.cat.BeginOperation(wsLocal, catalog.OpKindImport, capsulePath, "", "")
+		id, err := sess.cat.BeginOperation(wsAdopted, catalog.OpKindImport, capsulePath, "", "")
 		if err != nil {
 			return fmt.Errorf("import: begin operation: %w", err)
 		}
 		opID = id
 		details.OperationID = string(opID)
-		details.WorkspaceID = string(wsLocal)
 		steps := [][2]string{
 			{catalog.PhasePlanned, catalog.PhaseImportPlanned},
 			{catalog.PhaseImportPlanned, catalog.PhaseImportCopying},
@@ -333,6 +326,27 @@ func runImport(ctx context.Context, sess *session, capStore capsule.Store,
 		EbbVersion:   Version,
 		Progress:     streams.Err,
 		FreeSpace:    nil, // production default (build-tagged stdlib probe)
+		// Identity adoption (§16.1): the capsule's logical workspace id
+		// becomes the LOCAL workspace id. EnsureWorkspace is the
+		// never-modify insert — an existing row (LIVE or UNBOUND) is
+		// never clobbered and its name never changed — so adopting is
+		// safe to run before any gate. Note the AlreadyKnown path: Known
+		// returning true implies the snapshot ROW exists (the gate reads
+		// GetSnapshot), whose workspace_id references an existing
+		// workspace row (FK ON) — and that row carries this same adopted
+		// id whenever the prior registration was itself an import of
+		// this capsule, so EnsureWorkspace was a no-op; the one exotic
+		// shape (a snapshot hand-registered under a DIFFERENT workspace
+		// with the same manifest digest) leaves at most one extra
+		// UNBOUND label row behind, never a clobbered one.
+		Identified: func(id capsule.ImportIdentity) error {
+			wsAdopted = domain.WorkspaceID(id.WorkspaceID)
+			details.WorkspaceID = id.WorkspaceID
+			if err := sess.cat.EnsureWorkspace(wsAdopted, id.WorkspaceName); err != nil {
+				return fmt.Errorf("import: adopt workspace %s: %w", id.WorkspaceID, err)
+			}
+			return nil
+		},
 		// The duplicate gate is CLI-owned policy — the catalog is
 		// knowledge internal/capsule deliberately does not have:
 		// not-found proceeds; same id + same re-derived manifest digest
@@ -382,20 +396,18 @@ func runImport(ctx context.Context, sess *session, capStore capsule.Store,
 
 	if res.AlreadyKnown {
 		// The gate recognized the logical snapshot with the same
-		// manifest digest: the destination vault was not touched, no
-		// rows were written (the journal never opened) — exit 0.
+		// manifest digest: the destination vault was not touched and the
+		// journal never opened (Known fires after Identified — the
+		// EnsureWorkspace above was a no-op in this shape; see its
+		// comment) — exit 0.
 		return nil
 	}
 
-	// Registration order (FKs): rename the workspace to the manifest's
-	// name (the boundary row carried the capsule file's name), ensure
-	// the catalog's vault row (the same derivation capture uses), then
-	// the pinned snapshot row, the replica receipt, and DONE.
-	if err := sess.cat.UpsertWorkspace(catalog.Workspace{
-		ID: wsLocal, Name: res.WorkspaceName, Status: catalog.WorkspaceUnbound,
-	}); err != nil {
-		return failClose(fmt.Errorf("import: register workspace: %w", err))
-	}
+	// Registration order (FKs): ensure the catalog's vault row (the same
+	// derivation capture uses), then the pinned snapshot row under the
+	// ADOPTED workspace (ImportDiscoveredSnapshot re-runs the same
+	// never-modify workspace insert EnsureWorkspace used — a no-op
+	// now), the replica receipt, and DONE.
 	vaultRowID := lifecycle.VaultIDFor(destRepoID, repoDir)
 	details.VaultRowID = string(vaultRowID)
 	if err := sess.cat.RegisterVault(catalog.Vault{
@@ -403,9 +415,9 @@ func runImport(ctx context.Context, sess *session, capStore capsule.Store,
 	}); err != nil {
 		return failClose(fmt.Errorf("import: register vault row: %w", err))
 	}
-	if err := sess.cat.ImportDiscoveredSnapshot(wsLocal, res.WorkspaceName, catalog.Snapshot{
+	if err := sess.cat.ImportDiscoveredSnapshot(res.WorkspaceID, res.WorkspaceName, catalog.Snapshot{
 		ID:               res.LogicalSnapshotID,
-		WorkspaceID:      wsLocal,
+		WorkspaceID:      res.WorkspaceID,
 		CreatedAt:        res.CreatedAt,
 		PayloadBackendID: res.DestinationPayload,
 		SealBackendID:    res.DestinationSeal,
@@ -461,14 +473,6 @@ func capsulePassphrase(deps Deps, streams Streams) (string, error) {
 		CodeImportPassphrase, EnvCapsulePassword, EnvCapsulePassword))
 }
 
-// provisionalImportWorkspaceName labels the workspace row opened at
-// the copying boundary, before the capsule's manifest has been able
-// to name it (the verified name arrives with the import result). The
-// row is renamed to the manifest's main-root prefix on success.
-func provisionalImportWorkspaceName(capsulePath string) string {
-	return filepath.Base(capsulePath)
-}
-
 // importHeadroom estimates free bytes on the destination volume for
 // the dry-run plan (the real import re-measures inside its preflight).
 // known=false when no probe seam is wired or the probe fails — the
@@ -501,7 +505,7 @@ func (d *importDetails) fillPublic(info capsule.PublicInfo) {
 func (d *importDetails) fillResult(res capsule.ImportResult) {
 	d.SnapshotID = string(res.LogicalSnapshotID)
 	d.Workspace = res.WorkspaceName
-	d.CapsuleWorkspaceID = string(res.WorkspaceID)
+	d.WorkspaceID = string(res.WorkspaceID) // the ADOPTED capsule id (equal to the Identified report)
 	d.Kind = res.Kind
 	d.CreatedAt = res.CreatedAt
 	d.AlreadyKnown = res.AlreadyKnown

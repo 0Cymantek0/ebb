@@ -63,6 +63,12 @@ type importFakeStore struct {
 	copyErr    error
 	forgetErr  error
 	dumpTamper map[string]func([]byte) []byte
+	// dumpTamperIn scopes a tamper to ONE repository's dumps. The local
+	// import seal and the capsule's embedded seal share their tree path
+	// BY DESIGN after the capture-op-id fix (.ebb-seal-<capture op
+	// id>/receipt.json in both repositories), so a path-only key cannot
+	// distinguish them; this map is consulted first.
+	dumpTamperIn map[string]map[string]func([]byte) []byte
 
 	calls      []fakeCall
 	forgetIDs  [][]string
@@ -270,7 +276,9 @@ func (s *importFakeStore) DumpFile(ctx context.Context, repoDir, passfile, snapI
 		return nil, &domain.StoreError{Class: domain.StoreErrUsage,
 			Err: fmt.Errorf("fake: %q not found in snapshot %s", path, snapID)}
 	}
-	if f := s.dumpTamper[path]; f != nil {
+	if f := s.dumpTamperIn[filepath.Clean(repoDir)][path]; f != nil {
+		b = f(b)
+	} else if f := s.dumpTamper[path]; f != nil {
 		b = f(b)
 	}
 	return append([]byte(nil), b...), nil
@@ -388,6 +396,21 @@ func (s *importFakeStore) snapTags(repoDir, id string) map[string]string {
 
 func (s *importFakeStore) dumpFrom(repoDir, pass, id, path string) ([]byte, error) {
 	return s.DumpFile(context.Background(), repoDir, pass, id, path)
+}
+
+// tamperDumpIn installs a byte tamper for ONE dump path in ONE
+// repository only (see dumpTamperIn).
+func (s *importFakeStore) tamperDumpIn(repoDir, path string, f func([]byte) []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dumpTamperIn == nil {
+		s.dumpTamperIn = map[string]map[string]func([]byte) []byte{}
+	}
+	key := filepath.Clean(repoDir)
+	if s.dumpTamperIn[key] == nil {
+		s.dumpTamperIn[key] = map[string]func([]byte) []byte{}
+	}
+	s.dumpTamperIn[key][path] = f
 }
 
 // ---- the fake capsule fixture -------------------------------------------

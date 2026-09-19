@@ -136,13 +136,14 @@ func (h *iHarness) destSnaps(t *testing.T) []string {
 	return ids
 }
 
-// exportCapsule produces one real capsule in the export world and
+// exportCapsuleOf produces one real capsule in the export world and
 // returns its path, its passphrase (captured from the terminal block)
-// and the source snapshot's LOGICAL id.
-func exportCapsule(t *testing.T) (path, passphrase, snapID string) {
+// and the source snapshot's FULL row — the logical workspace id an
+// import must ADOPT travels in it.
+func exportCapsuleOf(t *testing.T) (path, passphrase string, snap catalog.Snapshot) {
 	t.Helper()
 	h := newHHarness(t)
-	snap := h.captureSnapshot(t)
+	snap = h.captureSnapshot(t)
 	out := filepath.Join(h.outDir, "capsule.ebb")
 	code, _, stderr := h.run("export", string(snap.ID), "--output", out)
 	if code != ExitOK {
@@ -152,7 +153,13 @@ func exportCapsule(t *testing.T) (path, passphrase, snapID string) {
 	if secret == "" {
 		t.Fatal("no passphrase in the export terminal block")
 	}
-	return out, secret, string(snap.ID)
+	return out, secret, snap
+}
+
+// exportCapsule is exportCapsuleOf with the snapshot id spelled out.
+func exportCapsule(t *testing.T) (path, passphrase, snapID string) {
+	p, s, snap := exportCapsuleOf(t)
+	return p, s, string(snap.ID)
 }
 
 // importOpsOf returns the import-kind operation rows across all
@@ -175,7 +182,8 @@ func importOpsOf(t *testing.T, cat *catalog.Catalog) []catalog.Operation {
 // ---- tests ---------------------------------------------------------------
 
 func TestImportHappyPathCLI(t *testing.T) {
-	capPath, secret, snapID := exportCapsule(t)
+	capPath, secret, snap := exportCapsuleOf(t)
+	snapID := string(snap.ID)
 	h := newImportHarness(t)
 	t.Setenv(EnvCapsulePassword, secret)
 
@@ -208,6 +216,14 @@ func TestImportHappyPathCLI(t *testing.T) {
 	if det["vault"] != "dest" || det["destination_payload_id"] == "" || det["destination_seal_id"] == "" {
 		t.Errorf("details vault/destination ids = %v / %v / %v", det["vault"], det["destination_payload_id"], det["destination_seal_id"])
 	}
+	// Identity adoption: the one reported workspace id IS the capsule's
+	// logical id, and the redundant report-only twin field is gone.
+	if det["workspace_id"] != string(snap.WorkspaceID) {
+		t.Errorf("details workspace_id = %v, want the ADOPTED capsule id %s", det["workspace_id"], snap.WorkspaceID)
+	}
+	if det["capsule_workspace_id"] != nil {
+		t.Errorf("the redundant capsule_workspace_id field survives: %v", det["capsule_workspace_id"])
+	}
 	if det["passphrase"] != nil {
 		t.Error("details carries a passphrase field")
 	}
@@ -218,7 +234,8 @@ func TestImportHappyPathCLI(t *testing.T) {
 	}
 
 	// Durable rows: one UNBOUND workspace named after the manifest's
-	// main-root prefix, the pinned snapshot bound to the destination
+	// main-root prefix and carrying the CAPSULE'S LOGICAL ID (identity
+	// adoption — §16.1), the pinned snapshot bound to the destination
 	// vault row, the replica receipt, one DONE import operation.
 	cat := h.cat()
 	wss, err := cat.ListWorkspaces()
@@ -228,31 +245,34 @@ func TestImportHappyPathCLI(t *testing.T) {
 	if wss[0].Status != catalog.WorkspaceUnbound || wss[0].RootPath != "" {
 		t.Errorf("imported workspace not UNBOUND: %+v", wss[0])
 	}
+	if wss[0].ID != snap.WorkspaceID {
+		t.Errorf("workspace id = %s, want the ADOPTED capsule logical id %s", wss[0].ID, snap.WorkspaceID)
+	}
 	if wss[0].Name != "ws" {
 		t.Errorf("workspace name = %q, want the manifest prefix %q", wss[0].Name, "ws")
 	}
-	snap, err := cat.GetSnapshot(domain.SnapshotID(snapID))
+	snapRow, err := cat.GetSnapshot(domain.SnapshotID(snapID))
 	if err != nil {
 		t.Fatalf("GetSnapshot: %v", err)
 	}
-	if !snap.Pinned {
+	if !snapRow.Pinned {
 		t.Error("imported snapshot not pinned")
 	}
-	if snap.WorkspaceID != wss[0].ID {
-		t.Errorf("snapshot workspace = %s, want the minted %s", snap.WorkspaceID, wss[0].ID)
+	if snapRow.WorkspaceID != wss[0].ID {
+		t.Errorf("snapshot workspace = %s, want the adopted %s", snapRow.WorkspaceID, wss[0].ID)
 	}
-	if snap.PayloadBackendID != det["destination_payload_id"] || snap.SealBackendID != det["destination_seal_id"] {
+	if snapRow.PayloadBackendID != det["destination_payload_id"] || snapRow.SealBackendID != det["destination_seal_id"] {
 		t.Errorf("snapshot backend ids = %s/%s, want %v/%v",
-			snap.PayloadBackendID, snap.SealBackendID, det["destination_payload_id"], det["destination_seal_id"])
+			snapRow.PayloadBackendID, snapRow.SealBackendID, det["destination_payload_id"], det["destination_seal_id"])
 	}
 	wantVaultRow := lifecycle.VaultIDFor(h.destRepoID(t), h.destRepo)
-	if snap.VaultID != wantVaultRow {
-		t.Errorf("snapshot vault = %s, want %s", snap.VaultID, wantVaultRow)
+	if snapRow.VaultID != wantVaultRow {
+		t.Errorf("snapshot vault = %s, want %s", snapRow.VaultID, wantVaultRow)
 	}
 	if _, verr := cat.GetVault(wantVaultRow); verr != nil {
 		t.Errorf("catalog vault row missing: %v", verr)
 	}
-	reps, err := cat.ListReplicas(snap.ID)
+	reps, err := cat.ListReplicas(snapRow.ID)
 	if err != nil || len(reps) != 1 {
 		t.Fatalf("replicas = %v (%v)", reps, err)
 	}
@@ -279,6 +299,99 @@ func TestImportHappyPathCLI(t *testing.T) {
 		if strings.HasPrefix(d.Name(), ".ebb-import-") {
 			t.Errorf("import scratch dir %s left behind", d.Name())
 		}
+	}
+}
+
+// TestImportAdoptsIdentityAcrossSnapshots — the §16.1 identity
+// continuity contract: importing capsules of TWO DIFFERENT snapshots
+// from the SAME producer workspace must register them under ONE
+// workspace row (the capsule's logical id — never a locally minted
+// fork), so `ebb open <name>` can select the latest of the group.
+func TestImportAdoptsIdentityAcrossSnapshots(t *testing.T) {
+	// One producer world, two captures of one workspace (same root ⇒
+	// same logical workspace id), exported into two capsules.
+	h := newHHarness(t)
+	snap1 := h.captureSnapshot(t)
+	snap2 := h.captureSnapshot(t)
+	if snap1.WorkspaceID != snap2.WorkspaceID {
+		t.Fatalf("fixture wiring: two captures of one workspace produced ids %s and %s",
+			snap1.WorkspaceID, snap2.WorkspaceID)
+	}
+	exportOne := func(snap catalog.Snapshot) (path, secret string) {
+		t.Helper()
+		out := filepath.Join(h.outDir, string(snap.ID)+".ebb")
+		code, _, stderr := h.run("export", string(snap.ID), "--output", out)
+		if code != ExitOK {
+			t.Fatalf("fixture export of %s failed (%d): %s", snap.ID, code, stderr)
+		}
+		secret = passphraseOfBlock(stderr)
+		if secret == "" {
+			t.Fatal("no passphrase in the export terminal block")
+		}
+		return out, secret
+	}
+	cap1, secret1 := exportOne(snap1)
+	cap2, secret2 := exportOne(snap2)
+
+	// Both capsules into ONE destination world.
+	ih := newImportHarness(t)
+	t.Setenv(EnvCapsulePassword, secret1)
+	if code, _, stderr := ih.run("import", cap1); code != ExitOK {
+		t.Fatalf("first import (%d): %s", code, stderr)
+	}
+	t.Setenv(EnvCapsulePassword, secret2)
+	code, stdout, stderr := ih.run("import", "--json", cap2)
+	if code != ExitOK {
+		t.Fatalf("second import (%d): %s", code, stderr)
+	}
+	env := envelopeOf(t, stdout)
+	det := env["details"].(map[string]any)
+	if det["workspace_id"] != string(snap1.WorkspaceID) {
+		t.Errorf("second import reports workspace_id %v, want the ADOPTED %s",
+			det["workspace_id"], snap1.WorkspaceID)
+	}
+
+	// ONE workspace row carrying the capsule's logical id; TWO snapshot
+	// rows under it, both pinned; two DONE import operations.
+	cat := ih.cat()
+	wss, err := cat.ListWorkspaces()
+	if err != nil || len(wss) != 1 {
+		t.Fatalf("workspaces after both imports = %v (%v), want exactly ONE", wss, err)
+	}
+	if wss[0].ID != snap1.WorkspaceID {
+		t.Errorf("workspace id = %s, want the capsule's logical %s (identity continuity)", wss[0].ID, snap1.WorkspaceID)
+	}
+	if wss[0].Status != catalog.WorkspaceUnbound || wss[0].Name != "ws" {
+		t.Errorf("adopted workspace row = %+v, want UNBOUND named %q", wss[0], "ws")
+	}
+	snaps, err := cat.ListSnapshots(snap1.WorkspaceID)
+	if err != nil || len(snaps) != 2 {
+		t.Fatalf("snapshots under the adopted workspace = %v (%v), want both %s and %s",
+			snaps, err, snap1.ID, snap2.ID)
+	}
+	gotIDs := map[domain.SnapshotID]bool{}
+	for _, s := range snaps {
+		if !s.Pinned {
+			t.Errorf("snapshot %s is not pinned", s.ID)
+		}
+		gotIDs[s.ID] = true
+	}
+	if !gotIDs[snap1.ID] || !gotIDs[snap2.ID] {
+		t.Errorf("registered snapshot ids = %v, want both capsule ids", gotIDs)
+	}
+	iops := importOpsOf(t, cat)
+	if len(iops) != 2 {
+		t.Fatalf("import ops = %d, want one journal per import", len(iops))
+	}
+	for _, op := range iops {
+		if op.WorkspaceID != snap1.WorkspaceID || op.Phase != catalog.PhaseDone {
+			t.Errorf("import op = %+v, want DONE under the adopted workspace", op)
+		}
+	}
+
+	// The destination vault holds both pairs (2 payloads + 2 seals).
+	if ids := ih.destSnaps(t); len(ids) != 4 {
+		t.Errorf("destination vault holds %d snapshots (%v), want 4 (two payloads + two seals)", len(ids), ids)
 	}
 }
 
@@ -593,9 +706,9 @@ func TestImportCopyFailureClosesOperation(t *testing.T) {
 	if iops[0].LastError == "" {
 		t.Error("CANCELED operation carries no last_error")
 	}
-	// The lazily opened workspace row remains (UNBOUND, provisional
-	// name — the audit trail of the failed attempt), but nothing else
-	// registered.
+	// The adopted workspace row remains (UNBOUND, named from the
+	// capsule's manifest — the audit trail of the failed attempt; the
+	// journal never names a snapshot), but nothing else registered.
 	if _, err := cat.GetSnapshot(domain.SnapshotID(snapID)); err == nil {
 		t.Error("a snapshot row was registered from a failed import")
 	}

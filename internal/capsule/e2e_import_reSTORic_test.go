@@ -32,15 +32,16 @@ package capsule
 //	   refuses with *ErrCopyIntegrity (reproduced end to end by
 //	   importing the same capsule twice without the duplicate gate).
 //
-// KNOWN FINDING this suite pins (see the report; production was NOT
-// modified): the flagship's "product verification path" and "full open"
-// subtests currently FAIL because the import's local seal records the
-// IMPORT's operation id while every lifecycle-shaped receipt consumer
+// KNOWN FINDING this suite pinned (now FIXED in this branch): the
+// flagship's "product verification path" and "full open" subtests
+// failed because the import's local seal recorded the IMPORT's
+// operation id while every lifecycle-shaped receipt consumer
 // (restore's loadSeal→loadDocuments, discovery's requireOpDir) derives
 // the payload's frozen .ebb-op-<32hex> dir from the RECEIPT's operation
 // id — which belongs to the original capture, not to the import. The
-// subtests assert the §15.3 contract as specified and fail with the
-// concrete seam error; flipping them green requires the production fix.
+// subtests assert the §15.3 contract as specified (unmodified) and
+// pass since writeImportSeal derives the seal's dir name, operation_id
+// field and ebb-op tag from the CAPTURE's op id (ev.OpDirName).
 //
 // Skips with a reason when restic is not usable (EBB_TEST_RESTIC_BIN
 // overrides the lookup target — the shared e2eBin seam).
@@ -377,9 +378,7 @@ func TestE2EResticExportImportRoundTrip(t *testing.T) {
 	seed := e2eVaultListing(t, w.store, dest.repoDir, dest.passfile)
 
 	var phases []string
-	var impOp string
 	imp, err := w.importCapsule(t, dest, out, exp.Passphrase, func(p *ImportParams) {
-		impOp = string(p.OperationID)
 		p.Phase = func(step string) error {
 			phases = append(phases, step)
 			return nil
@@ -458,8 +457,12 @@ func TestE2EResticExportImportRoundTrip(t *testing.T) {
 		if payloadTags["ebb-kind"] != "payload" {
 			t.Errorf("destination payload tags = %v, want ebb-kind=payload", payloadTags)
 		}
-		if sealTags["ebb-kind"] != "seal" || sealTags["ebb-op"] != impOp || sealTags["ws"] != string(imp.WorkspaceID) {
-			t.Errorf("destination seal tags = %v, want ebb-kind=seal ebb-op=%s ws=%s", sealTags, impOp, imp.WorkspaceID)
+		// The local seal records the CAPTURE's operation id (the payload's
+		// frozen op dir id), not the import's transport op id — the I13
+		// dir==receipt rule every lifecycle consumer applies.
+		wantOpTag := strings.TrimPrefix(w.ev.OpDirName, ".ebb-op-")
+		if sealTags["ebb-kind"] != "seal" || sealTags["ebb-op"] != wantOpTag || sealTags["ws"] != string(imp.WorkspaceID) {
+			t.Errorf("destination seal tags = %v, want ebb-kind=seal ebb-op=%s ws=%s", sealTags, wantOpTag, imp.WorkspaceID)
 		}
 		if imp.DestinationPayload == exp.DestinationPayload {
 			t.Logf("NOTE: the destination payload id equals the capsule-internal id (ids CAN survive cross-repository copy; discovery did not rely on it)")
