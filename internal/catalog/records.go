@@ -26,6 +26,7 @@ const (
 	OpKindTrim   = "trim"
 	OpKindForget = "forget"
 	OpKindExport = "export" // Wave H: portable-capsule production (§15.2)
+	OpKindImport = "import" // Wave I: capsule registration into a vault (§15.3)
 )
 
 // Operation phases — Foundation §12.4 recovery state machine, verbatim.
@@ -55,6 +56,19 @@ const (
 	PhaseExportPlanned   = "EXPORT_PLANNED"
 	PhaseExportCopying   = "EXPORT_COPYING"
 	PhaseExportVerifying = "EXPORT_VERIFYING"
+)
+
+// Import operations (kind "import", Wave I) register a snapshot
+// discovered inside a capsule into a destination vault (Foundation
+// §15.3) without publishing a working directory. They mirror the export
+// phase set: copying moves the payload through the destination backend,
+// verifying covers coverage/readback plus the destination seal, and a
+// controlled failure closes CANCELED after removing the import's own
+// working artifacts.
+const (
+	PhaseImportPlanned   = "IMPORT_PLANNED"
+	PhaseImportCopying   = "IMPORT_COPYING"
+	PhaseImportVerifying = "IMPORT_VERIFYING"
 )
 
 // Terminal phases: the operation's reconciliation is over; it is no
@@ -104,6 +118,9 @@ var validPhases = map[string]bool{
 	PhaseExportPlanned:    true,
 	PhaseExportCopying:    true,
 	PhaseExportVerifying:  true,
+	PhaseImportPlanned:    true,
+	PhaseImportCopying:    true,
+	PhaseImportVerifying:  true,
 }
 
 // terminalPhases are the phases ActiveOperations excludes.
@@ -124,6 +141,7 @@ var validOpKinds = map[string]bool{
 	OpKindTrim:   true,
 	OpKindForget: true,
 	OpKindExport: true,
+	OpKindImport: true,
 }
 
 // PinReasonCreation is the reason every snapshot is pinned with at
