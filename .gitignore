@@ -18,3 +18,4 @@ lab/git-probe/scratch/
 # drill run artifacts (scratch; regenerated every run)
 lab/drill/run/
 lab/drill/run-invocation.log
+lab/mermaid-check/node_modules/

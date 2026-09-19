@@ -22,7 +22,7 @@ ebb status        # what Ebb knows
 
 ## Status
 
-Pre-release (v0.1.0-dev), actively developed. Windows (native NTFS) is the verified platform; Linux builds and its platform layer are implemented but not yet exercised by native test runs. See **Known limitations** below before trusting any destructive operation.
+Pre-release (v0.1.0-dev), actively developed. Windows (native NTFS) is the primary verified platform; the full suite is additionally certified natively on Linux (linux/amd64, Debian 13 container, restic 0.19.1 — `lab/linux-cert/RESULTS.md`). See **Known limitations** below before trusting any destructive operation.
 
 What works, end to end, verified against the real restic 0.19.1 binary (`internal/lifecycle/e2e_reSTORic_test.go`):
 
@@ -68,7 +68,7 @@ State lives in `os.UserConfigDir()/ebb` (Windows: `%AppData%\ebb`): `catalog.db`
 
 - `park` requires a stopped-writers assertion: interactive confirm in a terminal, or `--assert-writers-stopped` for automation. `--yes` never supplies it.
 - Policies are optional `Ebbfile.toml` files; without one, everything unknown is preserved (conservative default). Generated-output removal requires an explicit `[[regenerate]]` declaration — a lockfile alone never marks a tree disposable.
-- Snapshots stay pinned after open; deliberate release is `ebb forget` (with a last-recovery-copy guard for parked workspaces).
+- Snapshots stay pinned after open; deliberate release is `ebb forget` (with a last-recovery-copy guard for parked and UNBOUND workspaces).
 
 ## Documentation
 
@@ -85,5 +85,5 @@ State lives in `os.UserConfigDir()/ebb` (Windows: `%AppData%\ebb`): `catalog.db`
 - Rebuild executes approved actions with your privileges — there is no sandbox (Foundation §9.5); the approval prompt shows the exact command, tool hash, inputs and outputs before anything runs.
 - Rebuild approvals pin the full authorization surface (exact command, tool hash, inputs, working root, output ownership, env allowlist, network): any drift — including an Ebbfile edit that widens an action's outputs — re-prompts, and an action asking for Ebb's own vault password is refused outright, never prompted. Recovery paths consult the filesystem rather than trusting journal rows (Wave G audit findings G1–G4 all fixed; see lab/security-review/wave-G/FINDINGS.md).
 - Hardlink relationships, NTFS alternate data streams, sparse flags and ACLs are captured as inventory facts but not restored (documented per-snapshot in the manifest's `not_promised` capabilities).
-- Linux: builds clean and the platform layer is implemented, but no native Linux test run has certified it; macOS is unsupported.
+- Linux: the full suite is certified natively on linux/amd64 in a pinned Docker environment (`lab/linux-cert`; keyring credential storage, NTFS streams/xattrs, and writer inspection remain declared-unsupported honest gaps there). That certification covers container-native filesystem semantics, not every distro/arch. macOS is unsupported.
 - Full §11.4 readback uses one streaming `restic dump --archive tar` subprocess per tree (measured ~17x faster than the former per-file transport on a small fixture; see `docs/BENCHMARKS.md` for the baseline). Very large single files still dominate readback time by bytes.
