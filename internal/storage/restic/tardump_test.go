@@ -106,6 +106,8 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
@@ -139,6 +141,17 @@ func archive() []byte {
 }
 
 func main() {
+	// Fixture portability: the /truncexit0 script models the LYING
+	// producer (broken-pipe write ignored, clean exit 0). On Windows a
+	// write into a closed pipe is a plain error this helper already
+	// ignores; on Linux the Go runtime KILLS fd-1/2 writers with SIGPIPE
+	// before user code runs, which would turn the abandoned-consumer
+	// scenario into a producer signal death and change which Close gate
+	// fires. Ignoring SIGPIPE makes the fixture behave identically on
+	// every platform (writes return EPIPE errors the helper ignores).
+	// No-op on Windows.
+	signal.Ignore(syscall.SIGPIPE)
+
 	script := os.Args[len(os.Args)-1]
 	full := archive()
 	switch script {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -65,6 +66,14 @@ func TestOpenDirVerifiedIdentitySpelling(t *testing.T) {
 		for _, de := range want {
 			wantNames = append(wantNames, de.Name())
 		}
+		// The seam's contract is SET equality through the verified handle,
+		// not order: os.File.ReadDir yields entries in raw directory order
+		// (getdents64 on Linux — ext4 hashes, NOT sorted; NTFS B-trees
+		// happen to be), while os.ReadDir sorts by filename. Comparing
+		// unsorted-vs-sorted only passes on filesystems whose directory
+		// order is sorted; sort both sides before DeepEqual.
+		sort.Strings(gotNames)
+		sort.Strings(wantNames)
 		if !reflect.DeepEqual(gotNames, wantNames) {
 			t.Errorf("%s: handle enumeration %v != path enumeration %v", d, gotNames, wantNames)
 		}

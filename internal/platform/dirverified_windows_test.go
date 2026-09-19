@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -68,6 +69,11 @@ func TestOpenDirVerifiedIdentitySpelling(t *testing.T) {
 		for _, de := range want {
 			wantNames = append(wantNames, de.Name())
 		}
+		// Set equality, not order (see the Linux twin): os.File.ReadDir is
+		// raw directory order, os.ReadDir sorts by filename. NTFS order is
+		// sorted in practice, so this only future-proofs the comparison.
+		sort.Strings(gotNames)
+		sort.Strings(wantNames)
 		if !reflect.DeepEqual(gotNames, wantNames) {
 			t.Errorf("%s: handle enumeration %v != path enumeration %v", d, gotNames, wantNames)
 		}
