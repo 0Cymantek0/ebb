@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"ebb/internal/version"
 )
 
 // run executes Main against buffers with the stub deps.
@@ -204,11 +206,30 @@ func TestVersionJSON(t *testing.T) {
 	if env.Command != "version" || env.Outcome != "ok" {
 		t.Fatalf("envelope head = %+v", env)
 	}
-	if env.Details.Version != Version || env.Details.ResticTarget != "0.19.1" {
+	if env.Details.Version != version.Version || env.Details.ResticTarget != "0.19.1" {
 		t.Fatalf("details = %+v", env.Details)
 	}
 	if !strings.HasPrefix(env.Details.GoVersion, "go") {
 		t.Fatalf("go version = %q", env.Details.GoVersion)
+	}
+}
+
+// TestVersionSingleSource pins the lockstep structurally on the human
+// output path: `ebb version` must report internal/version.Version —
+// the same single build-version authority internal/lifecycle freezes
+// into manifests/receipts — so no second hard-coded version copy can
+// silently reappear in the CLI layer.
+func TestVersionSingleSource(t *testing.T) {
+	code, _, stderr := run("version")
+	if code != ExitOK {
+		t.Fatalf("code = %d, stderr = %s", code, stderr)
+	}
+	first := stderr
+	if i := strings.IndexByte(first, '\n'); i >= 0 {
+		first = first[:i]
+	}
+	if first != "ebb "+version.Version {
+		t.Fatalf("version line = %q, want %q", first, "ebb "+version.Version)
 	}
 }
 

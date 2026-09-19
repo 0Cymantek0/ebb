@@ -14,6 +14,7 @@ import (
 	"ebb/internal/domain"
 	"ebb/internal/inventory"
 	"ebb/internal/policy"
+	"ebb/internal/version"
 )
 
 // Strict-schema documents (Foundation §16.2-16.4). Every writer emits
@@ -426,7 +427,7 @@ func buildManifest(
 		SnapshotID:    string(snapshotID),
 		WorkspaceID:   string(wsID),
 		CreatedAt:     created,
-		Producer:      producerString,
+		Producer:      producerString(),
 		Contract: contractDoc{
 			Scope: scope, Consistency: consistency, ConsistencySource: src,
 			Fidelity: captured, Network: string(pol.Rules.Network),
@@ -576,7 +577,7 @@ func buildReceipt(
 		RequiredFeatures: []string{},
 		Verification: receiptVerification{
 			Checks: checks, Scope: scope, Time: at,
-			ToolVersions: map[string]string{"ebb": ProducerEbbVersion, "backend": ProducerBackend},
+			ToolVersions: map[string]string{"ebb": version.Version, "backend": ProducerBackend},
 		},
 		OperationID: string(opID), Retention: "pinned",
 	}

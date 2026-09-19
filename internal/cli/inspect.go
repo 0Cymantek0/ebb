@@ -29,6 +29,7 @@ import (
 	"ebb/internal/capsule"
 	"ebb/internal/domain"
 	"ebb/internal/planner"
+	"ebb/internal/version"
 )
 
 func cmdInspect(args []string, streams Streams, deps Deps) int {
@@ -200,7 +201,7 @@ func cmdInspectCapsule(path string, streams Streams, deps Deps, jsonOut bool) in
 			DestPassfile: "inspect-not-used",
 			DestRepoID:   "inspect-not-used",
 			OperationID:  domain.OperationID(domain.NewID()),
-			EbbVersion:   Version,
+			EbbVersion:   version.Version,
 			Known:        func(string, string) (bool, error) { return true, nil },
 		})
 		if ierr != nil {
