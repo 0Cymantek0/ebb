@@ -216,12 +216,12 @@ func runDoctorChecks() []doctorCheck {
 			Detail: "named-stream enumeration unavailable on this platform/filesystem (honest v1 gap)"})
 	}
 
-	// Config dir: os.UserConfigDir()/ebb, created if absent.
-	if cfgBase, err := os.UserConfigDir(); err != nil {
+	// Config dir: the same authority the session uses (EBB_STATE_DIR
+	// override, else os.UserConfigDir()/ebb), created if absent.
+	if cfgDir, err := vault.DefaultConfigDir(); err != nil {
 		checks = append(checks, doctorCheck{Name: "config-dir", Status: "warn",
-			Detail: "os.UserConfigDir: " + err.Error()})
+			Detail: "resolve config dir: " + err.Error()})
 	} else {
-		cfgDir := filepath.Join(cfgBase, "ebb")
 		probeFile := filepath.Join(cfgDir, ".doctor-probe")
 		if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 			checks = append(checks, doctorCheck{Name: "config-dir", Status: "warn",

@@ -14,3 +14,7 @@ graphify-out/cache/
 # probe scratch (regenerable fixtures)
 lab/git-probe/scratch/
 .zcodeignore
+
+# drill run artifacts (scratch; regenerated every run)
+lab/drill/run/
+lab/drill/run-invocation.log

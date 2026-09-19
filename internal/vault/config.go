@@ -22,11 +22,28 @@ const (
 	CatalogFile = "catalog.db"
 )
 
+// EnvStateDir is the environment override for the Ebb state directory.
+// When set, it replaces the default user-config location for EVERYTHING
+// the state dir holds (catalog.db, vaults.json, locator.json,
+// approvals.json): automation, tests and cold-machine drills get a
+// fully isolated install without touching the real per-user state. The
+// value is absolutized once here so a relative setting cannot make the
+// state location depend on the process working directory. It carries
+// no secret. Empty/unset means the documented default path.
+const EnvStateDir = "EBB_STATE_DIR"
+
 // DefaultConfigDir returns the Ebb config directory:
-// os.UserConfigDir()/ebb (Windows: %AppData%\ebb, Linux:
-// ~/.config/ebb... per XDG). It does not create the directory and does
-// not require it to exist.
+// EBB_STATE_DIR when set, else os.UserConfigDir()/ebb (Windows:
+// %AppData%\ebb, Linux: ~/.config/ebb... per XDG). It does not create
+// the directory and does not require it to exist.
 func DefaultConfigDir() (string, error) {
+	if dir := os.Getenv(EnvStateDir); dir != "" {
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return "", fmt.Errorf("vault: %s %q: %w", EnvStateDir, dir, err)
+		}
+		return abs, nil
+	}
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("vault: user config dir: %w", err)
