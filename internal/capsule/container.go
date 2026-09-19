@@ -30,8 +30,10 @@ package capsule
 // extraction discipline to our own package: only the bounded set of
 // regular files/directories below the declared repo prefix is accepted;
 // absolute names, traversal, backslashes, drive-alias spellings, Windows
-// device-name basenames, duplicate names, non-STORED methods, length
-// inconsistencies and declared-total mismatches are all rejected.
+// device-name basenames, duplicate names, names differing only by case,
+// the Win32 illegal-character set (* ? < > | " and C0 controls),
+// over-long path components, non-STORED methods, length inconsistencies
+// and declared-total mismatches are all rejected.
 
 import (
 	"archive/zip"
@@ -41,11 +43,13 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
 // Container layout constants.
@@ -56,6 +60,21 @@ const (
 	containerVer   = 1
 	exportDocKind  = "ebb-export"
 	exportStateRun = "verifying" // the only state a written partial can carry
+
+	// maxSegmentUTF16Units is the NTFS per-path-component limit: a single
+	// entry-name segment longer than 255 UTF-16 code units can never be
+	// created on the primary supported platform, so it is refused at
+	// verify (wave-J hardening note 3), not discovered mid-extraction as
+	// an opaque I/O error.
+	maxSegmentUTF16Units = 255
+
+	// maxDeclaredRepoBytes is the plausibility ceiling for the export
+	// document's declared repository byte total (2^62 = 4 EiB). A declared
+	// total at or above it is not a real repository, and it is exactly the
+	// magnitude at which the import preflight's ×2 headroom arithmetic
+	// would overflow — verifyPackage refuses it so every consumer of the
+	// verified totals stays overflow-free by construction (J7).
+	maxDeclaredRepoBytes = int64(1) << 62
 )
 
 // bootstrapDoc is the PUBLIC descriptor (§15.1). It exposes ONLY
@@ -295,6 +314,26 @@ func validateEntryName(name string, wantRepo bool) error {
 		if seg == "." || seg == ".." {
 			return fmt.Errorf("traversal segment in entry name %q", name)
 		}
+		// J5 (wave-J review): the full Win32 illegal-character class,
+		// rejected host-agnostically. A segment containing one of
+		// `* ? < > | "` or any C0 control character (0x00–0x1F; NUL is
+		// already refused above at the whole-name level) can never be
+		// created on the primary supported platform (live-probed on
+		// Win11 26200: every one fails at create with
+		// ERROR_INVALID_NAME), so a container carrying such a name is
+		// not "structurally verified" — it is refused at verify on every
+		// host, per D028's judged-identically-everywhere rule, instead
+		// of surfacing mid-extraction as an I/O error that names
+		// neither the defect class nor the gate that should have caught
+		// it.
+		if strings.ContainsAny(seg, `*?<>|"`) {
+			return fmt.Errorf("entry name %q segment %q contains a Win32 illegal filename character (one of * ? < > | or double-quote); such a name can never extract on the primary platform", name, seg)
+		}
+		for _, r := range seg {
+			if r < 0x20 {
+				return fmt.Errorf("entry name %q segment %q contains a C0 control character (%#U), illegal in Win32 filenames; such a name can never extract on the primary platform", name, seg, r)
+			}
+		}
 		// Windows alias surface (§15.3 hostile-input discipline): a colon
 		// ANYWHERE in a segment names an alternate data stream on NTFS
 		// ("ab:cd" is a stream of file "ab", not a file "ab:cd"), and a
@@ -322,6 +361,20 @@ func validateEntryName(name string, wantRepo bool) error {
 		if windowsDeviceNames[strings.ToUpper(base)] {
 			return fmt.Errorf("Windows device-name segment %q in entry name %q", seg, name)
 		}
+		// Hardening note 3 (wave-J review): NTFS allows at most 255
+		// UTF-16 code units per path component; a longer segment can
+		// never extract on the primary platform, so it is refused at
+		// verify rather than discovered mid-extraction as an I/O error.
+		// The length is measured in UTF-16 code units (utf16.Encode
+		// length), not bytes, so non-ASCII names are judged correctly
+		// (an astral-plane character occupies two units). A UTF-16
+		// encoding is never longer than the byte form, so only
+		// byte-over-long segments need the exact count.
+		if len(seg) > maxSegmentUTF16Units {
+			if units := utf16Len(seg); units > maxSegmentUTF16Units {
+				return fmt.Errorf("entry name %q has a segment %d UTF-16 code units long — beyond the %d-unit NTFS per-component limit; such a name can never extract on the primary platform", name, units, maxSegmentUTF16Units)
+			}
+		}
 	}
 	if wantRepo {
 		if !strings.HasPrefix(name, repoPrefix+"/") {
@@ -333,6 +386,25 @@ func validateEntryName(name string, wantRepo bool) error {
 		return fmt.Errorf("unexpected top-level entry %q (only %s and %s may appear besides %s/)", name, bootstrapName, exportDocName, repoPrefix)
 	}
 	return nil
+}
+
+// utf16Len returns the length of s in UTF-16 code units — the unit the
+// NTFS per-component limit is measured in. Invalid UTF-8 bytes each
+// decode to one U+FFFD (one unit), so hostile byte strings still get a
+// deterministic, conservative count.
+func utf16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
+
+// caseFold is the case-insensitive fold used for entry-name collision
+// detection (J6). Rule — deliberately the simplest defensible one: the
+// plain strings.ToLower of the UTF-8 entry name. It is not a bit-exact
+// replica of NTFS's $UpCase table, but it is IDENTICAL on every host,
+// which is what D028 requires; where the two disagree the direction is
+// conservative (a pair the filesystem would have kept distinct is
+// REFUSED, never mis-extracted).
+func caseFold(name string) string {
+	return strings.ToLower(name)
 }
 
 // containerCheck is the verified view of one written package.
@@ -363,6 +435,15 @@ func verifyPackage(partialPath string) (containerCheck, error) {
 	}
 
 	seen := make(map[string]bool, len(zr.File))
+	// J6 (wave-J review): duplicate detection additionally folds names
+	// case-insensitively (caseFold above documents the chosen rule). Two
+	// entries that differ only by case extract as two distinct files on a
+	// case-sensitive filesystem but collide on the case-insensitive
+	// primary platform (the second O_EXCL create fails with an opaque
+	// "file exists"), so D028's judged-identically-everywhere rule is
+	// broken between verify and extract. The container itself is
+	// therefore refused — on every host, with the colliding pair named.
+	seenFolded := make(map[string]string, len(zr.File))
 	var gotRepoEntries int64
 	var gotRepoBytes int64
 	var out containerCheck
@@ -371,6 +452,12 @@ func verifyPackage(partialPath string) (containerCheck, error) {
 			return containerCheck{}, fmt.Errorf("capsule: duplicate entry name %q in container", zf.Name)
 		}
 		seen[zf.Name] = true
+		if first, clash := seenFolded[caseFold(zf.Name)]; clash {
+			return containerCheck{}, fmt.Errorf(
+				"capsule: case-collision entries %q and %q differ only by case (folded form %q); the case-insensitive primary platform cannot hold both files, so the container is refused on every platform (D028: a capsule is judged identically everywhere)",
+				first, zf.Name, caseFold(zf.Name))
+		}
+		seenFolded[caseFold(zf.Name)] = zf.Name
 		isRepo := strings.HasPrefix(zf.Name, repoPrefix+"/")
 		if err := validateEntryName(zf.Name, isRepo); err != nil {
 			return containerCheck{}, err
@@ -422,6 +509,20 @@ func verifyPackage(partialPath string) (containerCheck, error) {
 	}
 	if !seen[bootstrapName] || !seen[exportDocName] {
 		return containerCheck{}, fmt.Errorf("capsule: container is missing its %s or %s document", bootstrapName, exportDocName)
+	}
+	// J7 companion (wave-J review): refuse an absurd declared repository
+	// byte total at verify. A declared total at or above 2^62 bytes is
+	// not a real repository (verified STORED entries at that scale
+	// cannot exist in practice), and it is exactly the magnitude at which
+	// the import preflight's `2 * RepoBytes` headroom computation would
+	// overflow int64 — refusing here keeps every consumer of the
+	// verified totals (import headroom, extraction budget, inspect)
+	// overflow-free by construction instead of relying on each caller to
+	// re-check.
+	if out.ExportDoc.RepoBytes >= maxDeclaredRepoBytes {
+		return containerCheck{}, fmt.Errorf(
+			"capsule: declared repository byte total %d reaches the %d-byte plausibility ceiling — not a real repository; refusing (verified totals must keep the headroom arithmetic overflow-free)",
+			out.ExportDoc.RepoBytes, maxDeclaredRepoBytes)
 	}
 	if gotRepoEntries != out.ExportDoc.RepoEntries || gotRepoBytes != out.ExportDoc.RepoBytes {
 		return containerCheck{}, fmt.Errorf(
@@ -494,7 +595,25 @@ func extractRepository(containerPath, dstDir string, maxBytes int64) error {
 	// verify and extract must not write more than that budget. Extraction
 	// therefore enforces maxBytes itself (cumulative written bytes), so
 	// the §15.3 headroom promise holds even if the verified file changed.
-	var written int64
+	//
+	// J7 (wave-J review): the remaining-allowance arithmetic is computed
+	// in uint64 and SATURATES. The previous int64 form
+	// `remaining := maxBytes - written + 1` overflowed to MinInt64 at
+	// maxBytes == math.MaxInt64, and the negative clamp then fed
+	// io.LimitReader(0): every entry extracted as a ZERO-byte file with a
+	// nil error — the overflow was indistinguishable from success. A
+	// negative budget is likewise refused outright instead of silently
+	// writing nothing.
+	if maxBytes < 0 {
+		return fmt.Errorf("capsule: extraction byte budget %d is negative; refusing", maxBytes)
+	}
+	budget := uint64(maxBytes) // maxBytes >= 0 here, so the conversion is safe
+	var written uint64
+	// Defense in depth (J6): verifyPackage already refused case-colliding
+	// names; the same fold is enforced here so a caller that skips verify
+	// gets the same named refusal instead of a platform-divergent
+	// mid-extraction error.
+	seenFolded := make(map[string]string)
 	for _, zf := range zr.File {
 		if !strings.HasPrefix(zf.Name, repoPrefix+"/") {
 			continue // the two public documents are not repository content
@@ -503,6 +622,12 @@ func extractRepository(containerPath, dstDir string, maxBytes int64) error {
 		if err := validateEntryName(zf.Name, true); err != nil {
 			return err
 		}
+		if first, clash := seenFolded[caseFold(zf.Name)]; clash {
+			return fmt.Errorf(
+				"capsule: case-collision entries %q and %q differ only by case; the case-insensitive primary platform cannot hold both files (D028: judged identically everywhere)",
+				first, zf.Name)
+		}
+		seenFolded[caseFold(zf.Name)] = zf.Name
 		target := filepath.Join(dstDir, filepath.FromSlash(rel))
 		// Defense in depth: the joined target must still resolve inside
 		// dstDir lexically after cleaning (validateEntryName already
@@ -524,19 +649,25 @@ func extractRepository(containerPath, dstDir string, maxBytes int64) error {
 		}
 		// Cap each entry at the remaining budget + 1 so an over-budget
 		// write is detected (LimitReader reports EOF at the limit; one
-		// extra byte proves there was more).
-		remaining := maxBytes - written + 1
-		if remaining < 0 {
-			remaining = 0
+		// extra byte proves there was more). The allowance lives in
+		// uint64, where budget+1-written cannot overflow (written <=
+		// budget is the loop invariant — the check below refuses the
+		// moment it breaks) and is at most 2^63; it is then saturated to
+		// MaxInt64 for LimitReader's int64 limit, costing at most one
+		// unit of headroom at a scale no real entry reaches while keeping
+		// the over-budget detection intact.
+		allow := budget + 1 - written
+		if allow > uint64(math.MaxInt64) {
+			allow = uint64(math.MaxInt64)
 		}
-		n, cerr := io.Copy(out, io.LimitReader(rc, remaining))
+		n, cerr := io.Copy(out, io.LimitReader(rc, int64(allow)))
 		if cerr != nil {
 			rc.Close()
 			out.Close()
 			return fmt.Errorf("capsule: extract %s: %w", rel, cerr)
 		}
-		written += n
-		if written > maxBytes {
+		written += uint64(n)
+		if written > budget {
 			rc.Close()
 			out.Close()
 			return fmt.Errorf("capsule: extraction exceeded the verified byte budget (%d bytes) at %s — the container does not match what the headroom gate accounted; refusing", maxBytes, rel)
