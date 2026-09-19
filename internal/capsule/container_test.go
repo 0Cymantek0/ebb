@@ -488,6 +488,161 @@ func TestVerifyPackageRejectsAbsurdDeclaredRepoBytes(t *testing.T) {
 	}
 }
 
+// TestVerifyPackageRejectsFileVersusImpliedDirectoryConflict guards the
+// J6 residual fix: an entry naming a FILE at a path another entry's path
+// passes through as a DIRECTORY (repo/data/ab + repo/data/ab/x) was
+// accepted by verifyPackage pre-fix and failed only at extraction, on
+// EVERY platform, with an opaque order-dependent error naming neither
+// the defect class nor the pair (live-probed on Win11 26200: file-first
+// gives `mkdir ...: The system cannot find the path specified`, dir-first
+// gives `open ...: is a directory`). The refusal is now explicit, at
+// verify and at the skip-verify extraction defense, with the pair named.
+func TestVerifyPackageRejectsFileVersusImpliedDirectoryConflict(t *testing.T) {
+	// Order 1: the file entry sorts before the deep entry.
+	path := filepath.Join(t.TempDir(), "x.zip")
+	docs := validDocs(2, 9)
+	docs["repo/data/ab"] = []byte("file!")
+	docs["repo/data/ab/x"] = []byte("deep")
+	craftZip(t, path, docs, zip.Store, nil)
+	_, err := verifyPackage(path)
+	if err == nil || !strings.Contains(err.Error(), "file/directory conflict") {
+		t.Fatalf("file-vs-implied-directory (file first): err = %v (must refuse with the class named)", err)
+	}
+	for _, want := range []string{"repo/data/ab", "repo/data/ab/x"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not name %q: %v", want, err)
+		}
+	}
+	// Defense in depth: skipping verify gets the same named refusal.
+	if exErr := extractRepository(path, filepath.Join(t.TempDir(), "out"), 1<<62); exErr == nil ||
+		!strings.Contains(exErr.Error(), "file/directory conflict") ||
+		!strings.Contains(exErr.Error(), "repo/data/ab") {
+		t.Errorf("extraction defense: err = %v (must refuse with the pair named)", exErr)
+	}
+	// Order 2: the file entry comes AFTER the entry that implies the
+	// directory (appended past the sorted names) — same refusal.
+	path2 := filepath.Join(t.TempDir(), "y.zip")
+	docs2 := validDocs(2, 7) // "deep" (4) + appended duplicate body "dup" (3)
+	docs2["repo/data/ab/x"] = []byte("deep")
+	craftZip(t, path2, docs2, zip.Store, []string{"repo/data/ab"})
+	if _, err := verifyPackage(path2); err == nil || !strings.Contains(err.Error(), "file/directory conflict") {
+		t.Errorf("file-vs-implied-directory (file last): err = %v (order must not decide the verdict)", err)
+	}
+}
+
+// TestVerifyPackageRejectsEntryCaseCollisionWithImpliedDirectory guards
+// the J6 residual fix: an entry file whose name differs only by case
+// from another entry's IMPLIED directory (repo/data/Ab file +
+// repo/data/ab/x file) verified clean pre-fix, then the case-insensitive
+// primary platform failed the second operation with the same opaque
+// order-dependent error as the exact conflict while a case-sensitive
+// platform extracted both — the J6 divergence one level up, refused on
+// every platform with the pair named.
+func TestVerifyPackageRejectsEntryCaseCollisionWithImpliedDirectory(t *testing.T) {
+	// Order 1: the colliding file entry sorts first.
+	path := filepath.Join(t.TempDir(), "x.zip")
+	docs := validDocs(2, 9)
+	docs["repo/data/Ab"] = []byte("upper")
+	docs["repo/data/ab/x"] = []byte("deep")
+	craftZip(t, path, docs, zip.Store, nil)
+	_, err := verifyPackage(path)
+	if err == nil || !strings.Contains(err.Error(), "case-collision") {
+		t.Fatalf("entry-vs-implied-directory case collision (file first): err = %v (must refuse with the class named)", err)
+	}
+	for _, want := range []string{"repo/data/Ab", "repo/data/ab"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not name %q: %v", want, err)
+		}
+	}
+	if exErr := extractRepository(path, filepath.Join(t.TempDir(), "out"), 1<<62); exErr == nil ||
+		!strings.Contains(exErr.Error(), "repo/data/Ab") {
+		t.Errorf("extraction defense: err = %v (must refuse with the pair named)", exErr)
+	}
+	// Order 2: the implied directory is created first (its entry sorts
+	// before the colliding file) — same refusal, proving the verdict is
+	// not extraction-order-dependent.
+	path2 := filepath.Join(t.TempDir(), "y.zip")
+	docs2 := validDocs(2, 9)
+	docs2["repo/data/Ab/x"] = []byte("deep")
+	docs2["repo/data/ab"] = []byte("lower")
+	craftZip(t, path2, docs2, zip.Store, nil)
+	if _, err := verifyPackage(path2); err == nil || !strings.Contains(err.Error(), "case-collision") {
+		t.Errorf("entry-vs-implied-directory case collision (dir first): err = %v", err)
+	}
+}
+
+// TestVerifyPackageRejectsImpliedDirectoryCaseMerge guards the J6
+// residual fix's subtlest class: two entries implying directories that
+// differ only by case (repo/data/Ab/x + repo/data/ab/y). Live-probed,
+// extraction of this shape returns a NIL error on both platform
+// families — but the case-insensitive primary platform MERGES the
+// directories (one `data/Ab` holding both files) while a case-sensitive
+// one keeps both (WSL ext4 probe: `Ab` and `ab` coexist). No error fires
+// anywhere, so the pre-fix gates were blind to it; the resulting
+// extracted tree shape depends on the host, which D028 refuses.
+func TestVerifyPackageRejectsImpliedDirectoryCaseMerge(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.zip")
+	docs := validDocs(2, 6)
+	docs["repo/data/Ab/x"] = []byte("one")
+	docs["repo/data/ab/y"] = []byte("two")
+	craftZip(t, path, docs, zip.Store, nil)
+	_, err := verifyPackage(path)
+	if err == nil || !strings.Contains(err.Error(), "tree-shape divergence") {
+		t.Fatalf("implied-directory case merge: err = %v (must refuse with the class named)", err)
+	}
+	for _, want := range []string{"repo/data/Ab/x", "repo/data/ab/y", "repo/data/Ab", "repo/data/ab"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not name %q: %v", want, err)
+		}
+	}
+	// Defense in depth: the skip-verify extraction refuses with the pair
+	// named instead of silently producing a platform-shaped tree.
+	if exErr := extractRepository(path, filepath.Join(t.TempDir(), "out"), 1<<62); exErr == nil ||
+		!strings.Contains(exErr.Error(), "tree-shape divergence") {
+		t.Errorf("extraction defense: err = %v (must refuse, not silently merge or split)", exErr)
+	}
+}
+
+// TestVerifyPackageImpliedDirectoryNamespaceNoOverRejection proves the
+// implied-directory namespace checks do not refuse collision-free
+// containers: mixed-case directory names that never fold-collide verify
+// AND extract cleanly — including the same SEGMENT spelling at different
+// paths (repo/A/x + repo/B/a/y share no path prefix, so `A` and `a`
+// never meet), fold-distinct directories, and shared exact spellings.
+func TestVerifyPackageImpliedDirectoryNamespaceNoOverRejection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ok.zip")
+	entries := map[string][]byte{
+		"repo/Data/Ab": []byte("shared-dir-mixed-case"),
+		"repo/Data/cd": []byte("same-parent"),
+		"repo/A/x":     []byte("seg-a-upper"),
+		"repo/B/a/y":   []byte("seg-a-lower"),
+		"repo/Keys/k1": []byte("fold-distinct"),
+		"repo/index/1": []byte("lowercase-sibling"),
+	}
+	var total int64
+	for _, b := range entries {
+		total += int64(len(b))
+	}
+	docs := validDocs(int64(len(entries)), total)
+	for k, v := range entries {
+		docs[k] = v
+	}
+	craftZip(t, path, docs, zip.Store, nil)
+	if _, err := verifyPackage(path); err != nil {
+		t.Fatalf("collision-free mixed-case container refused: %v", err)
+	}
+	dst := t.TempDir()
+	if err := extractRepository(path, dst, total); err != nil {
+		t.Fatalf("collision-free mixed-case container does not extract: %v", err)
+	}
+	for name, body := range entries {
+		b, err := os.ReadFile(filepath.Join(dst, filepath.FromSlash(strings.TrimPrefix(name, "repo/"))))
+		if err != nil || !bytes.Equal(b, body) {
+			t.Errorf("extracted %s = %q (%v) — must round trip byte-identical", name, b, err)
+		}
+	}
+}
+
 // TestExtractRepositorySaturatingBudget guards the J7 fix: the remaining
 // allowance saturates instead of overflowing, so a MaxInt64 budget
 // extracts the REAL bytes exactly like the MaxInt64-1 control (pre-fix
