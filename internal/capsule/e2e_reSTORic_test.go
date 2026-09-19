@@ -262,7 +262,7 @@ func TestE2EResticExportHappyPath(t *testing.T) {
 
 	t.Run("capsule opens only with the generated passphrase", func(t *testing.T) {
 		extracted := t.TempDir()
-		if err := extractRepository(out, extracted); err != nil {
+		if err := extractRepository(out, extracted, 1<<62); err != nil {
 			t.Fatalf("extract: %v", err)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -289,7 +289,7 @@ func TestE2EResticExportHappyPath(t *testing.T) {
 
 	t.Run("destination seal and content verified from the packaged artifact", func(t *testing.T) {
 		extracted := t.TempDir()
-		if err := extractRepository(out, extracted); err != nil {
+		if err := extractRepository(out, extracted, 1<<62); err != nil {
 			t.Fatal(err)
 		}
 		pf := passfileOf(res.Passphrase, t)

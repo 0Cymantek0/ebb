@@ -73,9 +73,10 @@ func TestPackageRoundTripManyEntries(t *testing.T) {
 		t.Errorf("declared entries = %d, walked %d", check.ExportDoc.RepoEntries, len(files))
 	}
 
-	// Extraction round trip: every file byte-identical.
+	// Extraction round trip: every file byte-identical. The budget is the
+	// package's own verified repo total (unbounded for the round trip).
 	extract := t.TempDir()
-	if err := extractRepository(out, extract); err != nil {
+	if err := extractRepository(out, extract, check.ExportDoc.RepoBytes); err != nil {
 		t.Fatalf("extractRepository: %v", err)
 	}
 	for _, rel := range files {

@@ -884,7 +884,7 @@ func TestE2EResticImportSilentSkipIntegrity(t *testing.T) {
 	// The capsule's own repository, extracted exactly the way Import
 	// extracts it, unlocked with the real generated passphrase.
 	extracted := filepath.Join(t.TempDir(), "repo")
-	if err := extractRepository(out, extracted); err != nil {
+	if err := extractRepository(out, extracted, 1<<62); err != nil {
 		t.Fatalf("extract the capsule repository for the direct probe: %v", err)
 	}
 	capsulePassfile := passfileOf(exp.Passphrase, t)

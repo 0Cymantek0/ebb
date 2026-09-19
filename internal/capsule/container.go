@@ -295,8 +295,31 @@ func validateEntryName(name string, wantRepo bool) error {
 		if seg == "." || seg == ".." {
 			return fmt.Errorf("traversal segment in entry name %q", name)
 		}
-		base := strings.ToUpper(strings.TrimSuffix(seg, filepath.Ext(seg)))
-		if windowsDeviceNames[base] {
+		// Windows alias surface (§15.3 hostile-input discipline): a colon
+		// ANYWHERE in a segment names an alternate data stream on NTFS
+		// ("ab:cd" is a stream of file "ab", not a file "ab:cd"), and a
+		// trailing dot or space is silently stripped by the filesystem on
+		// write. Either would make the extracted path differ from the
+		// capsule's declared name — mis-extraction, not a clean refusal —
+		// so both are rejected here regardless of the host OS.
+		if strings.Contains(seg, ":") {
+			return fmt.Errorf("entry name %q segment %q contains a colon (an NTFS alternate-data-stream alias, not a portable file name)", name, seg)
+		}
+		if strings.HasSuffix(seg, ".") || strings.HasSuffix(seg, " ") {
+			return fmt.Errorf("entry name %q segment %q ends in a dot or space (silently stripped by Windows on write)", name, seg)
+		}
+		// Device-name basenames are reserved on Windows regardless of how
+		// many extensions follow: strip EVERY trailing ".<ext>" so that
+		// "con.foo.bar" reduces to "con" exactly as "con.txt" does.
+		base := seg
+		for {
+			ext := filepath.Ext(base)
+			if ext == "" {
+				break
+			}
+			base = strings.TrimSuffix(base, ext)
+		}
+		if windowsDeviceNames[strings.ToUpper(base)] {
 			return fmt.Errorf("Windows device-name segment %q in entry name %q", seg, name)
 		}
 	}
@@ -449,7 +472,7 @@ func checkBootstrap(b bootstrapDoc) error {
 // same bounded-name discipline (§15.3): every name was already
 // validated by verifyPackage; extraction refuses to create anything but
 // regular files and their parent directories inside the OWN destination.
-func extractRepository(containerPath, dstDir string) error {
+func extractRepository(containerPath, dstDir string, maxBytes int64) error {
 	f, err := os.Open(containerPath)
 	if err != nil {
 		return fmt.Errorf("capsule: open container for extraction: %w", err)
@@ -466,6 +489,12 @@ func extractRepository(containerPath, dstDir string) error {
 	if err := os.MkdirAll(dstDir, 0o700); err != nil {
 		return fmt.Errorf("capsule: create extraction root: %w", err)
 	}
+	// Defense in depth (HI-2): the headroom gate budgets against the
+	// container's declared totals, but a container swapped in between
+	// verify and extract must not write more than that budget. Extraction
+	// therefore enforces maxBytes itself (cumulative written bytes), so
+	// the §15.3 headroom promise holds even if the verified file changed.
+	var written int64
 	for _, zf := range zr.File {
 		if !strings.HasPrefix(zf.Name, repoPrefix+"/") {
 			continue // the two public documents are not repository content
@@ -493,10 +522,24 @@ func extractRepository(containerPath, dstDir string) error {
 			rc.Close()
 			return fmt.Errorf("capsule: create extracted file %s: %w", rel, cerr)
 		}
-		if _, cerr = io.Copy(out, rc); cerr != nil {
+		// Cap each entry at the remaining budget + 1 so an over-budget
+		// write is detected (LimitReader reports EOF at the limit; one
+		// extra byte proves there was more).
+		remaining := maxBytes - written + 1
+		if remaining < 0 {
+			remaining = 0
+		}
+		n, cerr := io.Copy(out, io.LimitReader(rc, remaining))
+		if cerr != nil {
 			rc.Close()
 			out.Close()
 			return fmt.Errorf("capsule: extract %s: %w", rel, cerr)
+		}
+		written += n
+		if written > maxBytes {
+			rc.Close()
+			out.Close()
+			return fmt.Errorf("capsule: extraction exceeded the verified byte budget (%d bytes) at %s — the container does not match what the headroom gate accounted; refusing", maxBytes, rel)
 		}
 		rc.Close()
 		if err := out.Close(); err != nil {

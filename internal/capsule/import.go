@@ -293,7 +293,7 @@ func Import(ctx context.Context, params ImportParams) (ImportResult, error) {
 	params.progress("import %s: extracting the capsule repository (headroom %d bytes free, %d budgeted)\n",
 		params.OperationID, free, 2*check.ExportDoc.RepoBytes)
 	extractedRepo := filepath.Join(workDir, repoPrefix)
-	if err := extractRepository(params.CapsulePath, extractedRepo); err != nil {
+	if err := extractRepository(params.CapsulePath, extractedRepo, check.ExportDoc.RepoBytes); err != nil {
 		return ImportResult{}, &ErrNotACapsule{Path: params.CapsulePath, Details: []string{err.Error()}}
 	}
 

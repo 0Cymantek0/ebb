@@ -258,11 +258,12 @@ func Export(ctx context.Context, params Params) (Result, error) {
 			return err
 		}
 		res.CapsuleBytes = size
-		if _, err := verifyPackage(partialPath); err != nil {
+		check, err := verifyPackage(partialPath)
+		if err != nil {
 			return err
 		}
 		extractDir := filepath.Join(workDir, "extracted")
-		if err := extractRepository(partialPath, extractDir); err != nil {
+		if err := extractRepository(partialPath, extractDir, check.ExportDoc.RepoBytes); err != nil {
 			return err
 		}
 		if err := verifyExtractedRepo(ctx, &params, extractDir, dstPassfile, dstRepoID, dstPayloadID, dstSealID, sealBytes); err != nil {
