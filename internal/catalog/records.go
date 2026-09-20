@@ -21,12 +21,13 @@ const (
 
 // Operation kind values (operations.kind).
 const (
-	OpKindPark   = "park"
-	OpKindOpen   = "open"
-	OpKindTrim   = "trim"
-	OpKindForget = "forget"
-	OpKindExport = "export" // Wave H: portable-capsule production (§15.2)
-	OpKindImport = "import" // Wave I: capsule registration into a vault (§15.3)
+	OpKindPark    = "park"
+	OpKindOpen    = "open"
+	OpKindTrim    = "trim"
+	OpKindForget  = "forget"
+	OpKindExport  = "export"  // Wave H: portable-capsule production (§15.2)
+	OpKindImport  = "import"  // Wave I: capsule registration into a vault (§15.3)
+	OpKindRestore = "restore" // D033: in-place recreation of trimmed groups on a live workspace
 )
 
 // Operation phases — Foundation §12.4 recovery state machine, verbatim.
@@ -93,6 +94,22 @@ const (
 	PhaseTrimDone    = "TRIM_DONE"
 )
 
+// Restore operations (kind "restore", D033) re-execute a sealed trim's
+// recorded recipes in-place on the live workspace. They mirror the trim
+// precedent of a small dedicated phase set: RESTORE_PLANNED covers
+// workspace/trim selection, document readback and the gates; the
+// RESTORE_RUNNING transition gates recipe execution; RESTORE_DONE is
+// terminal. RESTORE_FAILED is deliberately NON-terminal (the same
+// posture as REBUILD_FAILED): a failed restore is resumable by simply
+// rerunning `ebb restore` — package managers tolerate existing partial
+// output directories — and the rerun supersedes the dead row.
+const (
+	PhaseRestorePlanning = "RESTORE_PLANNED"
+	PhaseRestoreRunning  = "RESTORE_RUNNING"
+	PhaseRestoreDone     = "RESTORE_DONE"
+	PhaseRestoreFailed   = "RESTORE_FAILED"
+)
+
 // validPhases is the closed v1 phase vocabulary accepted by the journal
 // API; a typo'd phase would be an unrecoverable journal state, so it is
 // rejected at the API edge.
@@ -121,10 +138,14 @@ var validPhases = map[string]bool{
 	PhaseImportPlanned:    true,
 	PhaseImportCopying:    true,
 	PhaseImportVerifying:  true,
+	PhaseRestorePlanning:  true,
+	PhaseRestoreRunning:   true,
+	PhaseRestoreDone:      true,
+	PhaseRestoreFailed:    true,
 }
 
 // terminalPhases are the phases ActiveOperations excludes.
-var terminalPhases = []string{PhaseCanceled, PhaseDone, PhaseTrimDone}
+var terminalPhases = []string{PhaseCanceled, PhaseDone, PhaseTrimDone, PhaseRestoreDone}
 
 // validSnapshotKinds and validOpKinds are the closed v1 kind
 // vocabularies for snapshots and operations.
@@ -136,12 +157,13 @@ var validSnapshotKinds = map[string]bool{
 }
 
 var validOpKinds = map[string]bool{
-	OpKindPark:   true,
-	OpKindOpen:   true,
-	OpKindTrim:   true,
-	OpKindForget: true,
-	OpKindExport: true,
-	OpKindImport: true,
+	OpKindPark:    true,
+	OpKindOpen:    true,
+	OpKindTrim:    true,
+	OpKindForget:  true,
+	OpKindExport:  true,
+	OpKindImport:  true,
+	OpKindRestore: true,
 }
 
 // PinReasonCreation is the reason every snapshot is pinned with at

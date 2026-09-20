@@ -26,6 +26,16 @@ const (
 	CodeRebuildFailed     = "EBB_E_REBUILD_FAILED"
 	CodeProtectedChanged  = "EBB_E_PROTECTED_CHANGED"
 	CodeVaultOverlap      = "EBB_E_VAULT_OVERLAP"
+
+	// Live-restore (`ebb restore`, D033) blocker codes.
+	CodeNothingToRestore  = "EBB_E_NOTHING_TO_RESTORE"
+	CodeGitConflict       = "EBB_E_GIT_CONFLICT"
+	CodeBranchMismatch    = "EBB_E_BRANCH_MISMATCH"
+	CodeBranchSwitch      = "EBB_E_BRANCH_SWITCH"
+	CodeAlreadyRestored   = "EBB_E_ALREADY_RESTORED"
+	CodeStrategyRequired  = "EBB_E_STRATEGY_REQUIRED"
+	CodeRestoreDeclined   = "EBB_E_RESTORE_DECLINED"
+	CodeLiveRestoreFailed = "EBB_E_LIVE_RESTORE_FAILED"
 )
 
 // ErrNotOpenable reports that the selected snapshot cannot be opened at
@@ -253,3 +263,168 @@ func (e *ErrVaultOverlap) Error() string {
 }
 
 func (e *ErrVaultOverlap) Code() string { return CodeVaultOverlap }
+
+// ---- live restore (`ebb restore`, D033) typed errors ----------------------
+//
+// Every gate outcome of the in-place restore driver is one of these;
+// the CLI maps them onto §17.5 exit codes (blocked = 3, execution
+// failure = 6) and every error carries a stable EBB_E_ code.
+
+// ErrNothingToRestore reports that no recorded cleanup exists to
+// re-create: the workspace has no trim operation in TRIM_DONE (or the
+// root resolves to no recorded workspace at all). Nothing ran.
+type ErrNothingToRestore struct {
+	Root string
+}
+
+func (e *ErrNothingToRestore) Error() string {
+	return fmt.Sprintf("restore: %s has no recorded cleanup to re-create (no completed trim operation for this workspace)",
+		e.Root)
+}
+
+func (e *ErrNothingToRestore) Code() string { return CodeNothingToRestore }
+
+// ErrGitConflict reports the fail-closed in-flight gate (D033 rule 2):
+// the live workspace has unresolved merge/rebase/cherry-pick/revert
+// state (unmerged index entries or an operation marker present), so no
+// recipe may run — interactive or not. Nothing ran.
+type ErrGitConflict struct {
+	Root    string
+	Details []string
+}
+
+func (e *ErrGitConflict) Error() string {
+	return fmt.Sprintf("restore: %s is mid Git operation (%s); running install recipes now could pollute a half-finished merge/rebase. Safe action: finish or abort the in-flight Git operation, then rerun `ebb restore`",
+		e.Root, strings.Join(e.Details, ", "))
+}
+
+func (e *ErrGitConflict) Code() string { return CodeGitConflict }
+
+// ErrBranchMismatch reports the branch gate (D033 rule 1): the trim was
+// recorded on a different Git context than the live workspace has now
+// (branch name, or commit id when the trim was recorded detached), and
+// no resolution was chosen. Nothing ran. Recorded/Live carry the
+// human-readable Git contexts for the report.
+type ErrBranchMismatch struct {
+	Root     string
+	Recorded string
+	Live     string
+	// Detached records that the comparison is commit-based (the trim was
+	// recorded on a detached HEAD).
+	Detached bool
+}
+
+func (e *ErrBranchMismatch) Error() string {
+	what := "branch"
+	if e.Detached {
+		what = "commit"
+	}
+	return fmt.Sprintf("restore: %s mismatch: the trim was recorded on %s %q, the workspace is now on %s %q; cross-branch dependency pollution is possible, so Ebb never auto-decides. Safe action: rerun `ebb restore` in a terminal to choose (switch back / rebuild for the current branch / cancel), or switch branches yourself and rerun",
+		e.Root, what, e.Recorded, what, e.Live)
+}
+
+func (e *ErrBranchMismatch) Code() string { return CodeBranchMismatch }
+
+// ErrBranchSwitchAdvice reports the chosen resolution "switch back to
+// the recorded branch first": nothing ran, and the exact native
+// command is printed for the user. Restoring after the switch is the
+// user's next invocation.
+type ErrBranchSwitchAdvice struct {
+	Root       string
+	Recorded   string
+	SwitchArgv []string
+}
+
+func (e *ErrBranchSwitchAdvice) Error() string {
+	return fmt.Sprintf("restore: nothing ran — switch back to the recorded %q first, then rerun `ebb restore`: %s",
+		e.Recorded, strings.Join(e.SwitchArgv, " "))
+}
+
+func (e *ErrBranchSwitchAdvice) Code() string { return CodeBranchSwitch }
+
+// ErrAlreadyRestored reports the outputs-present gate: every group's
+// outputs already exist non-empty and no failed/interrupted restore
+// operation makes the rerun a resume. Nothing ran.
+type ErrAlreadyRestored struct {
+	Root   string
+	TrimOp string
+}
+
+func (e *ErrAlreadyRestored) Error() string {
+	return fmt.Sprintf("restore: %s already carries every recorded group's outputs (trim %s); there is nothing to re-create. Safe action: to force a fresh install anyway, remove the output directories first (e.g. node_modules)",
+		e.Root, e.TrimOp)
+}
+
+func (e *ErrAlreadyRestored) Code() string { return CodeAlreadyRestored }
+
+// ErrStrategyRequired reports un-reconciled drift without a strategy:
+// recipe inputs differ from the frozen baseline and neither an explicit
+// --strategy nor an interactive choice resolved the divergence. The
+// Drift table carries the exact per-path states for the report.
+type ErrStrategyRequired struct {
+	Root  string
+	Drift []DriftEntry
+}
+
+func (e *ErrStrategyRequired) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "restore: %s has drifted from the recorded trim baseline and no reconciliation strategy was chosen; Ebb never auto-decides. Safe action: rerun with --strategy merge|current|baseline after reviewing the drift, or in a terminal to choose interactively\n", e.Root)
+	for _, d := range e.Drift {
+		fmt.Fprintf(&b, "  drift: group %s input %s: %s\n", d.Group, d.Path, d.Describe())
+	}
+	return b.String()
+}
+
+func (e *ErrStrategyRequired) Code() string { return CodeStrategyRequired }
+
+// ErrRestoreDeclined reports a declined interactive prompt (branch or
+// strategy menu). Nothing ran.
+type ErrRestoreDeclined struct {
+	Root   string
+	Detail string
+}
+
+func (e *ErrRestoreDeclined) Error() string {
+	msg := fmt.Sprintf("restore: %s: the interactive choice was declined", e.Root)
+	if e.Detail != "" {
+		msg += " (" + e.Detail + ")"
+	}
+	return msg + "; nothing ran"
+}
+
+func (e *ErrRestoreDeclined) Code() string { return CodeRestoreDeclined }
+
+// ErrLiveRestoreFailed reports a restore operation that began executing
+// and failed: a recipe exited non-zero (or was refused by the runner),
+// an overlay could not be applied, or the post-flight protected-file
+// integrity gate caught an unexpected change. The operation lands at
+// RESTORE_FAILED (non-terminal): rerunning `ebb restore` resumes —
+// package managers tolerate existing partial output directories and a
+// FAILED/RUNNING prior op deliberately does not trip the
+// already-restored gate. Err wraps the primary cause (which may be
+// *ErrProtectedChanged or context.Canceled for the exit-130 path).
+type ErrLiveRestoreFailed struct {
+	OperationID  domain.OperationID
+	TrimOp       domain.OperationID
+	FailedAction string
+	Reason       string
+	Err          error
+}
+
+func (e *ErrLiveRestoreFailed) Error() string {
+	msg := fmt.Sprintf("restore: operation %s failed", e.OperationID)
+	if e.FailedAction != "" {
+		msg += " (action " + e.FailedAction + ")"
+	}
+	if e.Reason != "" {
+		msg += ": " + e.Reason
+	}
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg + "; the workspace keeps whatever the recipes produced (nothing is undone) and the operation is resumable by rerunning `ebb restore`"
+}
+
+func (e *ErrLiveRestoreFailed) Unwrap() error { return e.Err }
+
+func (e *ErrLiveRestoreFailed) Code() string { return CodeLiveRestoreFailed }
