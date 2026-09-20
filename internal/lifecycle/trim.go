@@ -300,13 +300,17 @@ func (c *Coordinator) trimRemoval(ctx context.Context, st *captureState) (int, e
 //
 // D034 carve-out: a requested group that policy cancelled (F53) may be
 // carved instead of refused, but ONLY when opts.CarveOut carries the
-// recorded consent. The cancelling file/link entries become overlay
-// patches (captured into the op dir and sealed with P) and join the
-// member set; the clean bulk under the outputs is removed normally.
-// Without consent — or when the carve is refused (un-carve-able entry,
-// budget or case collision) — the group is blocked exactly as before,
-// with text that names the missing --carve-out authorization or the
-// honest refusal reason.
+// recorded consent AND every carve candidate's path is in the approved
+// list opts.CarveOutPaths (F8: consent is pinned to the exact paths the
+// consent surface displayed — lifecycle re-derives the carve set from
+// its own scan, so a canceller that appeared between the two scans
+// refuses the group instead of being removed unseen). The cancelling
+// file/link entries become overlay patches (captured into the op dir
+// and sealed with P) and join the member set; the clean bulk under the
+// outputs is removed normally. Without consent — or when the carve is
+// refused (un-carve-able entry, budget, case collision or approved-list
+// drift) — the group is blocked exactly as before, with text that names
+// the missing --carve-out authorization or the honest refusal reason.
 func buildTrimPlan(st *captureState, groupIDs []string) (plan []trimGroupPlan, skipped []string, err error) {
 	decisions := make(map[string]bool, len(st.resolved.Groups))
 	reasons := make(map[string]string, len(st.resolved.Groups))
@@ -326,6 +330,11 @@ func buildTrimPlan(st *captureState, groupIDs []string) (plan []trimGroupPlan, s
 			switch {
 			case st.opts.CarveOut:
 				if r := carvePlanBlocker(id, cls); r != "" {
+					blocked = append(blocked, r)
+				} else if r := carveConsentBlocker(id, cls, st.opts.CarveOutPaths); r != "" {
+					// F8: the approved-list drift check runs only for an
+					// otherwise carve-able group (shape/budget honesty
+					// first); drift refuses it with the pinned-set text.
 					blocked = append(blocked, r)
 				}
 			case len(cls.Refusals) > 0:
