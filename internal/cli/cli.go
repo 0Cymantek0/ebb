@@ -219,6 +219,10 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdForget(args[1:], streams, deps)
 	case "gc":
 		return cmdGc(args[1:], streams, deps)
+	case "delete":
+		return cmdDelete(args[1:], streams, deps)
+	case "config":
+		return cmdConfig(args[1:], streams, deps)
 	case "verify":
 		return cmdVerify(args[1:], streams, deps)
 	case "export":
