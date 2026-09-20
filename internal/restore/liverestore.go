@@ -295,6 +295,30 @@ func (o *LiveRestorer) LiveRestore(ctx context.Context, vault VaultRef, root str
 		return res, &ErrAlreadyRestored{Root: absRoot, TrimOp: string(trimOp.ID)}
 	}
 
+	// ---- supersede dead restore rows (BEFORE any later refusal) ---------
+	// Close stale RUNNING/FAILED restore rows of THIS workspace to CANCELED
+	// here — ahead of the refusals below that return WITHOUT opening an
+	// operation (headless drift without --strategy returning
+	// ErrStrategyRequired in particular). The rerun may not proceed, but
+	// it must still un-wedge the dead row: a restore owns no removal
+	// authority, so closing it is always safe, while leaving it open
+	// blocks every later destructive operation (trim/reclaim/park) until
+	// someone runs the cancel verb (Wave 1 restore review F3). A dry run
+	// stays zero-effects and leaves superseding to a real rerun.
+	if !opts.DryRun {
+		for _, prev := range ops {
+			if prev.Kind != catalog.OpKindRestore {
+				continue
+			}
+			switch prev.Phase {
+			case catalog.PhaseRestoreRunning, catalog.PhaseRestoreFailed:
+				_ = o.cat.FailOperation(prev.ID, prev.Phase,
+					"superseded by a restore rerun (D033: a failed restore is resumable by rerunning; `ebb recover <op> --cancel` closes it when no rerun can proceed)")
+				_ = o.cat.AdvanceOperation(prev.ID, prev.Phase, catalog.PhaseCanceled)
+			}
+		}
+	}
+
 	// ---- drift detection -------------------------------------------------
 	drift := detectDrift(absRoot, docs.plan.Groups)
 	res.Drift = drift
@@ -360,20 +384,7 @@ func (o *LiveRestorer) LiveRestore(ctx context.Context, vault VaultRef, root str
 		return res, &ErrLiveRestoreFailed{
 			OperationID: opID, TrimOp: trimOp.ID, FailedAction: action, Reason: reason, Err: cause}
 	}
-	// Supersede dead restore rows (crash-left RUNNING or FAILED): the
-	// rerun IS the resume; the superseded rows close CANCELED so they
-	// never block the workspace's future operations.
-	for _, prev := range ops {
-		if prev.Kind != catalog.OpKindRestore {
-			continue
-		}
-		switch prev.Phase {
-		case catalog.PhaseRestoreRunning, catalog.PhaseRestoreFailed:
-			_ = o.cat.FailOperation(prev.ID, prev.Phase,
-				fmt.Sprintf("superseded by restore rerun %s (D033: a failed restore is resumable by rerunning)", opID))
-			_ = o.cat.AdvanceOperation(prev.ID, prev.Phase, catalog.PhaseCanceled)
-		}
-	}
+	// (Dead restore rows were already superseded by the early loop above.)
 	if err := o.cat.SetBackendRefs(opID, snap.PayloadBackendID, snap.SealBackendID); err != nil {
 		return res, fmt.Errorf("restore: record backend refs: %w", err)
 	}
@@ -434,6 +445,29 @@ func (o *LiveRestorer) LiveRestore(ctx context.Context, vault VaultRef, root str
 	after, werr2 := walkProtected(absRoot, outputRoots)
 	if werr2 != nil {
 		return fail("", "re-walking the live root for the protected-file gate", werr2)
+	}
+	// F1 (Wave 1 restore review): a group executed via its recreate_live
+	// variant under merge/current runs a plain `pnpm install` / `npm
+	// install` / `uv sync`, which legitimately REWRITES recipe-input paths
+	// at the workspace root — most notably the lockfile, which regenerates
+	// whenever the unioned/current manifests differ from what it recorded,
+	// even when the lockfile itself never drifted. Exempt ALL of those
+	// groups' recorded input paths from the after-pass comparison and
+	// REPORT each input whose digest actually changed as a warning instead
+	// of a failure. Baseline (frozen commands: --frozen-lockfile, npm ci,
+	// --locked) adds NO exemptions: those commands must not touch their
+	// inputs, and the gate stays strict there.
+	for _, p := range sortedBoolKeys(liveVariantInputs(docs.plan.Groups, drift, strategy)) {
+		if exempt[p] {
+			continue // the strategy itself wrote it (already reported)
+		}
+		exempt[p] = true
+		b, bok := before[p]
+		a, aok := after[p]
+		if bok && aok && b.kind == "file" && a.kind == "file" && a.digest != b.digest {
+			res.Warnings = append(res.Warnings, fmt.Sprintf(
+				"input %s rewritten by the native resolver (expected under merge/current)", p))
+		}
 	}
 	if changes := compareProtected(before, after, exempt); len(changes) > 0 {
 		return fail("", "protected-file integrity gate", &ErrProtectedChanged{Changes: changes})
@@ -784,6 +818,32 @@ func groupCommand(g removalGroupReader, strategy Strategy, drifted bool, warning
 	}
 }
 
+// liveVariantInputs returns the recipe-input paths of every group whose
+// command under the chosen strategy is the recreate_live variant — the
+// same predicate groupCommand uses to select that argv (merge/current on
+// a drifted group that records one). The native resolver behind those
+// commands may legitimately rewrite ANY of the group's inputs (a unioned
+// package.json forces lockfile regeneration even when the lockfile never
+// drifted), so the post-flight protected-file gate exempts them all and
+// the caller reports the actual rewrites as warnings. The frozen
+// (baseline / no-drift) commands add no exemptions: lockfile-pinned
+// installs must not touch their inputs, and the gate stays strict there.
+func liveVariantInputs(groups []removalGroupReader, drift []DriftEntry, strategy Strategy) map[string]bool {
+	out := map[string]bool{}
+	if strategy != StrategyMerge && strategy != StrategyCurrent {
+		return out
+	}
+	for _, g := range groups {
+		if !groupDrifted(drift, g.GroupID) || len(g.RecreateLive) == 0 {
+			continue
+		}
+		for _, in := range g.RecipeInputs {
+			out[in.Path] = true
+		}
+	}
+	return out
+}
+
 // previewGroups assembles the per-group report view (command selection
 // plus the group's own drift slice and overlay list).
 func previewGroups(groups []removalGroupReader, drift []DriftEntry, strategy Strategy) []RestoredGroup {
@@ -822,6 +882,17 @@ func overlaysOf(g removalGroupReader) []string {
 //	baseline — back the live files up and write the FROZEN input bytes
 //	           back (digest-verified from the payload).
 //
+// Every manifest-derived write path (the input itself AND its
+// `.bak-drift-<stamp>` sibling — the backup name is derived from the
+// input path by appending a suffix of dots, dashes, alphanumerics and a
+// timestamp, so a base that passes the strict gate keeps the sibling
+// portable too) must first pass validPortableLivePath, the SAME strict
+// gate the overlay writer uses: the weaker read-time contract lets a
+// colon at position >1 through (an NTFS alternate-data-stream write
+// channel onto a protected file) and accepts `.` segments. An input that
+// fails is refused honestly — the strategy is unavailable for it, the
+// live file is kept and a warning explains the fallback.
+//
 // Ebb NEVER edits lockfiles: only package.json / Cargo.toml /
 // pyproject.toml participate in unions, and resolution stays 100%
 // native tool (D033 golden rule).
@@ -832,6 +903,11 @@ func (o *LiveRestorer) applyStrategy(ctx context.Context, vault VaultRef, docs t
 	}
 	stamp := o.now().Format("20060102-150405")
 	for _, d := range drift {
+		if err := validPortableLivePath(d.Path); err != nil {
+			*warnings = append(*warnings, fmt.Sprintf(
+				"%s unavailable for %s (%v); keeping the live file — the native tool resolves", strategy, d.Path, err))
+			continue
+		}
 		livePath := filepath.Join(root, filepath.FromSlash(d.Path))
 		switch strategy {
 		case StrategyCurrent:
@@ -1018,10 +1094,19 @@ func unionJSONManifest(live, recorded []byte) ([]byte, []string, bool) {
 		if err := json.Unmarshal(recRaw, &recSec); err != nil {
 			return nil, []string{fmt.Sprintf("frozen package.json %s is not an object: %v", section, err)}, false
 		}
+		// F4 (Wave 1 restore review): JSON null leaves the target map nil
+		// (Unmarshal of null is a no-op) — a later assignment into a nil
+		// map panics. Normalize both sides to empty maps.
+		if recSec == nil {
+			recSec = map[string]json.RawMessage{}
+		}
 		liveSec := map[string]json.RawMessage{}
 		if liveRaw, ok := liveTop[section]; ok {
 			if err := json.Unmarshal(liveRaw, &liveSec); err != nil {
 				return nil, []string{fmt.Sprintf("live package.json %s is not an object: %v", section, err)}, false
+			}
+			if liveSec == nil {
+				liveSec = map[string]json.RawMessage{}
 			}
 		}
 		added := 0
@@ -1309,7 +1394,7 @@ func unionTOMLArrayKey(live, recorded *tomlFile, header, key, label string, note
 	if liveSec == nil {
 		liveSec = live.ensureSection(header)
 	}
-	liveEntries, _ := parseEntries(liveSec)
+	liveEntries, liveRest := parseEntries(liveSec)
 	for i := range liveEntries {
 		if liveEntries[i].key != key {
 			continue
@@ -1333,6 +1418,21 @@ func unionTOMLArrayKey(live, recorded *tomlFile, header, key, label string, note
 			added++
 		}
 		if added > 0 {
+			// F2 (Wave 1 restore review): re-rendering the section can only
+			// emit key-block lines — every rest line the live parse produced
+			// (a comment, a blank line, or the continuation body of a
+			// multi-line basic string like `description = """`) would be
+			// silently DELETED, and a vanished string body yields invalid
+			// TOML. Refuse the rewrite (and with it the whole union: the
+			// caller keeps the live file byte-for-byte and the native tool
+			// resolves — the documented honest fallback) unless the section
+			// is purely key-block lines.
+			if len(liveRest) > 0 {
+				*notes = append(*notes, fmt.Sprintf(
+					"%s: the live [%s] section carries comment, blank or multi-line-string lines the line-oriented union cannot preserve; merge unavailable",
+					label, header))
+				return false
+			}
 			rendered := make([]string, 0, len(liveItems))
 			for _, it := range liveItems {
 				rendered = append(rendered, "\t"+quoteTOMLString(it)+",")
@@ -1350,9 +1450,13 @@ func unionTOMLArrayKey(live, recorded *tomlFile, header, key, label string, note
 	return true
 }
 
-// rebuildSectionLines re-renders parsed entries interleaved with their
-// non-entry lines; comments that preceded the FIRST entry stay ahead of
-// it (approximate but honest: unions never delete content).
+// rebuildSectionLines re-renders ONLY the parsed key-block lines — every
+// rest line of the section (comments, blanks, continuation bodies of
+// multi-line basic strings) is dropped by construction. It is therefore
+// called exclusively on sections whose parse produced NO rest lines: the
+// F2 gate in unionTOMLArrayKey declines the whole union for any section
+// that is not purely key-block lines, keeping the live file byte-for-byte
+// instead of deleting content it cannot represent.
 func rebuildSectionLines(entries []tomlEntry) []string {
 	var out []string
 	for _, e := range entries {
@@ -1552,10 +1656,19 @@ func (a sealedManifestApprover) Matches(def actions.Definition, tool actions.Too
 // groupDefinition builds one group's actions.Definition. The argv is
 // the manifest-frozen argv EXACTLY (never reconstructed from policy);
 // inputs are the group's recipe inputs, minus inputs recorded missing
-// at trim time that are still absent (reported, never guessed).
+// at trim time that are still absent (reported, never guessed), and
+// minus inputs whose paths fail the STRICT portable gate (F5: a
+// manifest-derived path Ebb cannot safely touch is fenced out of the
+// runner's contract entirely — reported, never guessed).
 func groupDefinition(root string, trimOpID domain.OperationID, g removalGroupReader, drift []DriftEntry, strategy Strategy, warnings *[]string) (actions.Definition, error) {
 	var inputs []string
 	for _, in := range g.RecipeInputs {
+		if perr := validPortableLivePath(in.Path); perr != nil {
+			*warnings = append(*warnings, fmt.Sprintf(
+				"group %s input %s is not a portable live path (%v); excluded from the action's input contract",
+				g.GroupID, in.Path, perr))
+			continue
+		}
 		if !in.Missing {
 			inputs = append(inputs, in.Path)
 			continue
@@ -1814,6 +1927,16 @@ func compareProtected(before, after map[string]protFact, exempt map[string]bool)
 }
 
 func sortedKeys(m map[string]protFact) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// sortedBoolKeys sorts a set's members for deterministic reporting.
+func sortedBoolKeys(m map[string]bool) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

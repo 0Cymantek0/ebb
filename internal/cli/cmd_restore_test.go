@@ -389,3 +389,111 @@ func stringList(v any) []string {
 	}
 	return out
 }
+
+// ---- Wave 1 restore review regressions ------------------------------------
+
+// TestRestoreJSONOnTerminalNeverPrompts pins F6: `--json` is machine
+// mode, so even on a terminal the branch mismatch refuses with its
+// typed error instead of dropping a scripted consumer into a menu.
+func TestRestoreJSONOnTerminalNeverPrompts(t *testing.T) {
+	h, runner := newRestoreHarness(t)
+	recorded := domain.GitObservation{IsRepo: true, HeadBranch: "feature-payments",
+		HeadCommit: "9a8f3b2c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a"}
+	h.deps.ObserveGit = liveObserve(recorded)
+	trimCliws(t, h)
+	h.deps.ObserveGit = liveObserve(domain.GitObservation{IsRepo: true, HeadBranch: "main"})
+
+	// A terminal is attached AND --json is set: no menu may appear.
+	h.tty = true
+	h.lines = nil // nothing queued: a menu read would fail the test later
+	code, stdout, stderr := h.run("restore", "--json", h.wsRoot)
+	if code != ExitBlocked {
+		t.Fatalf("code = %d, stderr = %s", code, stderr)
+	}
+	if strings.Contains(stderr, "Select:") || strings.Contains(stderr, "Branch mismatch:") {
+		t.Fatalf("--json must not render an interactive menu:\n%s", stderr)
+	}
+	env := envelopeOf(t, stdout)
+	errs := strings.Join(stringList(env["errors"]), " ")
+	if !strings.Contains(errs, restore.CodeBranchMismatch) {
+		t.Fatalf("envelope must carry the typed mismatch code %s: %v", restore.CodeBranchMismatch, errs)
+	}
+	if !strings.Contains(errs, "feature-payments") || !strings.Contains(errs, "main") {
+		t.Fatalf("mismatch must name both branches: %v", errs)
+	}
+	if runner.count() != 0 {
+		t.Fatalf("nothing may run on a refused mismatch")
+	}
+}
+
+// partialFailRunner fails its first execution (leaving a partial output
+// tree behind, the RESTORE_FAILED reality) and succeeds on later ones.
+type partialFailRunner struct {
+	gRunner
+	failed bool
+}
+
+func (r *partialFailRunner) Run(ctx context.Context, def actions.Definition, wsRoot string, appr actions.Approver, capture actions.OutputSink) (actions.Result, error) {
+	if !r.failed {
+		r.failed = true
+		if err := os.MkdirAll(filepath.Join(wsRoot, "node_modules"), 0o755); err != nil {
+			return actions.Result{ExitCode: -1}, err
+		}
+		if err := os.WriteFile(filepath.Join(wsRoot, "node_modules", "partial.txt"), []byte("partial"), 0o644); err != nil {
+			return actions.Result{ExitCode: -1}, err
+		}
+		return actions.Result{ExitCode: 3, OutputExcerpt: "--- stderr ---\nEPERM"}, nil
+	}
+	return r.gRunner.Run(ctx, def, wsRoot, appr, capture)
+}
+
+// TestRestoreHeadlessRefusalUnwedgesDeadRowForLaterTrim pins F3's driver
+// ordering end to end: a restore that failed (RESTORE_FAILED), then a
+// headless rerun over drift with no --strategy (exit 3,
+// ErrStrategyRequired — no operation opened) STILL supersedes the dead
+// row, so a following trim proceeds instead of answering ErrOpInProgress
+// forever.
+func TestRestoreHeadlessRefusalUnwedgesDeadRowForLaterTrim(t *testing.T) {
+	h, _ := newRestoreHarness(t)
+	trimCliws(t, h)
+
+	// A failed restore leaves the dead row plus partial outputs.
+	h.deps.NewActionRunner = func() restore.ActionRunner { return &partialFailRunner{} }
+	if code, _, stderr := h.run("restore", h.wsRoot); code != ExitRebuildFailed {
+		t.Fatalf("first restore code = %d, stderr = %s", code, stderr)
+	}
+	var deadOp *catalog.Operation
+	for _, op := range operationsOf(t, h.cat()) {
+		op := op
+		if op.Kind == catalog.OpKindRestore && op.Phase == catalog.PhaseRestoreFailed {
+			deadOp = &op
+		}
+	}
+	if deadOp == nil {
+		t.Fatal("no RESTORE_FAILED row recorded")
+	}
+
+	// Wednesday drift + headless rerun without --strategy: blocked (3)
+	// with the strategy error — and the dead row superseded anyway.
+	if err := os.WriteFile(filepath.Join(h.wsRoot, "package.json"),
+		[]byte(`{"name":"cliws","version":"1.0.0","private":true,"dependencies":{"left-pad":"1.3.0","chalk":"5.0.0"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, _ := h.run("restore", "--json", h.wsRoot)
+	if code != ExitBlocked {
+		t.Fatalf("headless rerun code = %d, want blocked (3)", code)
+	}
+	env := envelopeOf(t, stdout)
+	if errs := strings.Join(stringList(env["errors"]), " "); !strings.Contains(errs, restore.CodeStrategyRequired) {
+		t.Fatalf("expected the strategy-required blocker: %v", errs)
+	}
+	fresh, gerr := h.cat().GetOperation(deadOp.ID)
+	if gerr != nil || fresh.Phase != catalog.PhaseCanceled {
+		t.Fatalf("dead row must be superseded despite the refusal: phase=%s err=%v", fresh.Phase, gerr)
+	}
+
+	// The workspace is un-wedged: a later trim proceeds.
+	if code, _, stderr := h.run("trim", "--groups", "deps", "--yes", h.wsRoot); code != ExitOK {
+		t.Fatalf("trim after the un-wedging rerun must proceed: code=%d stderr=%s", code, stderr)
+	}
+}
