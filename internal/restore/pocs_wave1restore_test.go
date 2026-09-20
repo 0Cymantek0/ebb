@@ -19,11 +19,13 @@ package restore
 //     supersedes the workspace's dead restore rows.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -391,5 +393,58 @@ func TestLiveRestoreHeadlessRefusalStillSupersedesDeadRow(t *testing.T) {
 	active, aerr := f.cat.ActiveOperations(f.wsID)
 	if aerr != nil || len(active) != 0 {
 		t.Fatalf("workspace must carry no active operations after the supersede: %v (%v)", active, aerr)
+	}
+}
+
+// ---- F7/F9 reader side: witnessed link sidecars + permission bits ------
+
+// TestLiveRestoreWitnessedLinkSidecarTamperRefused pins F7's reader side:
+// a post-amendment link record (non-empty digest over the .ebb-link
+// sidecar's target-text bytes) whose payload sidecar disagrees is vault
+// tampering and must refuse exactly like a tampered file overlay.
+func TestLiveRestoreWitnessedLinkSidecarTamperRefused(t *testing.T) {
+	recGit, liveGit := noDriftGit()
+	f := buildTrimFixture(t, trimFixtureSpec{recordedGit: recGit, liveGit: liveGit})
+	writeFile(t, filepath.Join(f.parent, f.opDir, "overlay", lrGroupName, "node_modules", "kept", "link.ebb-link"),
+		[]byte("../lib/tool.js"))
+	f.reloadPlan(t, f.planWithOverlays(t, []overlayPatchReader{{
+		Path: "node_modules/kept/link", Copy: "overlay/" + lrGroupName + "/node_modules/kept/link.ebb-link",
+		Digest: digestBytes([]byte("C:/attacker/controlled/target")), Kind: overlayKindLink,
+	}}))
+	_, err := f.newLiveRestorer(&lrRunner{}).LiveRestore(context.Background(), f.vault, f.wsRoot, LiveRestoreOptions{})
+	var failed *ErrLiveRestoreFailed
+	if !errors.As(err, &failed) || !strings.Contains(err.Error(), "tampering suspected") {
+		t.Fatalf("expected sidecar-digest failure, got %v", err)
+	}
+	if _, lerr := os.Lstat(filepath.Join(f.wsRoot, "node_modules", "kept", "link")); lerr == nil {
+		t.Fatal("tampered link was recreated despite the witness mismatch")
+	}
+}
+
+// TestLiveRestoreAppliesRecordedOverlayMode pins F9's reader side: the
+// captured permission bits come back with the file (exec shims stay
+// executable on POSIX); a legacy 0 mode keeps the safe default.
+func TestLiveRestoreAppliesRecordedOverlayMode(t *testing.T) {
+	recGit, liveGit := noDriftGit()
+	f := buildTrimFixture(t, trimFixtureSpec{recordedGit: recGit, liveGit: liveGit})
+	content := []byte("#!/bin/sh\necho shim\n")
+	writeFile(t, filepath.Join(f.parent, f.opDir, "overlay", lrGroupName, "node_modules", "kept", "tool"), content)
+	f.reloadPlan(t, f.planWithOverlays(t, []overlayPatchReader{{
+		Path: "node_modules/kept/tool", Copy: "overlay/" + lrGroupName + "/node_modules/kept/tool",
+		Digest: digestBytes(content), Kind: overlayKindFile, Mode: 0o755,
+	}}))
+	if _, err := f.newLiveRestorer(&lrRunner{}).LiveRestore(context.Background(), f.vault, f.wsRoot, LiveRestoreOptions{}); err != nil {
+		t.Fatalf("restore with recorded mode failed: %v", err)
+	}
+	p := filepath.Join(f.wsRoot, "node_modules", "kept", "tool")
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, rerr := os.ReadFile(p); rerr != nil || !bytes.Equal(b, content) {
+		t.Fatalf("overlay content wrong: %v", rerr)
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o755 {
+		t.Fatalf("perm = %o, want 755", fi.Mode().Perm())
 	}
 }

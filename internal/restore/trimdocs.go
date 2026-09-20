@@ -70,12 +70,17 @@ type recipeInputReader struct {
 }
 
 // overlayPatchReader mirrors the D034 overlayPatchRecord the trim-side
-// writer freezes (identical JSON tags; "" digest for links).
+// writer freezes (identical JSON tags). Digest: files = sha256 of the
+// file bytes; links = sha256 of the .ebb-link sidecar's target-text
+// bytes (post-amendment witness) or "" (pre-amendment, unwitnessed).
+// Mode = source permission bits at capture (0/absent = pre-amendment or
+// link; a safe default applies on write).
 type overlayPatchReader struct {
 	Path   string `json:"path"`   // root-relative slash path of the original
 	Copy   string `json:"copy"`   // op-dir-relative copy: "overlay/<groupID>/<path>"
-	Digest string `json:"digest"` // sha256 hex of the file bytes ("" for links)
+	Digest string `json:"digest"` // sha256 hex (see semantics above)
 	Kind   string `json:"kind"`   // "file" | "link"
+	Mode   uint32 `json:"mode,omitempty"`
 }
 
 // trimMemberReader is one removal-manifest member line. Members are the
@@ -252,8 +257,11 @@ func validateTrimPlan(plan trimPlanDocReader) error {
 
 // validOverlayPatch gates one carve-out record: a portable live path
 // (full capsule-discipline name gate) plus a frozen copy confined to the
-// group's overlay/ prefix, a known kind, and a digest contract (64-hex
-// for files, empty for links).
+// group's overlay/ prefix, a known kind, and a digest contract: 64-hex
+// for files (the file bytes); for links either 64-hex (the .ebb-link
+// sidecar's target-text bytes — the post-amendment witness) or empty
+// (pre-amendment manifests, unwitnessed and tolerated). Mode is the
+// source permission bits at capture (0/absent = pre-amendment or link).
 func validOverlayPatch(p overlayPatchReader, groupID string) error {
 	if err := validPortableLivePath(p.Path); err != nil {
 		return fmt.Errorf("trim group %s overlay patch: %v", groupID, err)
@@ -267,8 +275,8 @@ func validOverlayPatch(p overlayPatchReader, groupID string) error {
 			return fmt.Errorf("trim group %s file overlay patch %s: digest %q is not 64-hex", groupID, p.Path, p.Digest)
 		}
 	case overlayKindLink:
-		if p.Digest != "" {
-			return fmt.Errorf("trim group %s link overlay patch %s: digest must be empty for links", groupID, p.Path)
+		if p.Digest != "" && !isHex64(p.Digest) {
+			return fmt.Errorf("trim group %s link overlay patch %s: digest %q is not 64-hex", groupID, p.Path, p.Digest)
 		}
 	default:
 		return fmt.Errorf("trim group %s overlay patch %s: unknown kind %q", groupID, p.Path, p.Kind)

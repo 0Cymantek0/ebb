@@ -1764,6 +1764,17 @@ func (o *LiveRestorer) applyOverlays(ctx context.Context, vault VaultRef, docs t
 			}
 			target := filepath.Join(root, filepath.FromSlash(p.Path))
 			if p.Kind == overlayKindLink {
+				// Post-amendment witnesses bind the sidecar's target-text
+				// bytes cryptographically (F7): a payload-only rewrite of
+				// the link target is refused here, exactly like a tampered
+				// file overlay. Pre-amendment records ("" digest) are
+				// unwitnessed and proceed.
+				if p.Digest != "" {
+					if got := digestBytes(raw); got != p.Digest {
+						return applied, fmt.Errorf(
+							"restore: overlay link %s: sidecar digest %s, manifest records %s — vault tampering suspected (D017)", p.Path, got, p.Digest)
+					}
+				}
 				if err := o.recreateOverlayLink(target, string(raw)); err != nil {
 					return applied, fmt.Errorf("restore: overlay link %s: %w", p.Path, err)
 				}
@@ -1776,6 +1787,13 @@ func (o *LiveRestorer) applyOverlays(ctx context.Context, vault VaultRef, docs t
 			}
 			if err := writeFileProtected(target, raw); err != nil {
 				return applied, err
+			}
+			// F9: restore the captured permission bits (exec shims stay
+			// executable on POSIX); 0/absent keeps the safe 0600 default.
+			if p.Mode != 0 {
+				if cerr := os.Chmod(target, fs.FileMode(p.Mode)&fs.ModePerm); cerr != nil {
+					return applied, fmt.Errorf("restore: overlay %s: applying recorded mode %#o: %w", p.Path, p.Mode, cerr)
+				}
 			}
 			got, derr := actions.DigestFile(target)
 			if derr != nil || got != p.Digest {
