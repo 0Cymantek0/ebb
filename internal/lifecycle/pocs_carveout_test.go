@@ -177,6 +177,7 @@ func TestPoCCarveOutsideLinkTextOnlyNeverFollowed(t *testing.T) {
 
 	opts := carveOpts(t, ws, "deps")
 	opts.CarveOut = true
+	opts.CarveOutPaths = []string{"node_modules/kept/outside-link"}
 	opts.ApprovalReady = func(string) error { return nil }
 	if _, err := h.coord().Trim(context.Background(), h.vault, root, opts); err != nil {
 		t.Fatalf("link carve trim: %v", err)
@@ -193,8 +194,11 @@ func TestPoCCarveOutsideLinkTextOnlyNeverFollowed(t *testing.T) {
 	if rec == nil {
 		t.Fatalf("CARVE-POC(d): the outside link was not carved: %+v", g.OverlayPatches)
 	}
-	if rec.Kind != overlayKindLink || rec.Digest != "" || !strings.HasSuffix(rec.Copy, linkSidecarSuffix) {
+	if rec.Kind != overlayKindLink || !strings.HasSuffix(rec.Copy, linkSidecarSuffix) {
 		t.Fatalf("CARVE-POC(d): link record shape wrong: %+v", rec)
+	}
+	if rec.Digest == "" {
+		t.Fatalf("CARVE-POC(d): link sidecar bytes are unwitnessed (empty digest)")
 	}
 	// Sidecar content == link text, != target content.
 	c := h.coord()
@@ -207,6 +211,9 @@ func TestPoCCarveOutsideLinkTextOnlyNeverFollowed(t *testing.T) {
 	}
 	if string(sidecar) == carveOutsideTxt {
 		t.Fatalf("CARVE-POC(d) CONFIRMED: the link was followed — the sidecar holds target content")
+	}
+	if rec.Digest != digestBytes(sidecar) {
+		t.Fatalf("CARVE-POC(d) CONFIRMED: link digest %s does not bind the sidecar bytes (%s)", rec.Digest, digestBytes(sidecar))
 	}
 	if _, serr := os.Lstat(outside); serr != nil {
 		t.Fatalf("CARVE-POC(d) CONFIRMED: the outside target was damaged: %v", serr)
@@ -255,9 +262,15 @@ func TestPoCCarveNestedGitAdminTreeByteExact(t *testing.T) {
 		t.Fatalf("nested .git must cancel the group without carve consent, got %v", err)
 	}
 
-	// With consent: the admin tree is carved as plain files.
+	// With consent: the admin tree is carved as plain files. The approved
+	// set is the CLI-displayed candidate list (F8).
 	opts := trimOpts(t, ws, "deps")
 	opts.CarveOut = true
+	opts.CarveOutPaths = []string{
+		"node_modules/nested/.git/HEAD",
+		"node_modules/nested/.git/config",
+		"node_modules/nested/.git/objects/ab/cdef01",
+	}
 	opts.ApprovalReady = func(string) error { return nil }
 	if _, err := h.coord().Trim(context.Background(), h.vault, root, opts); err != nil {
 		t.Fatalf("nested .git carve trim: %v", err)
@@ -368,6 +381,7 @@ func TestPoCCarveUnicodeLongPathsRoundTrip(t *testing.T) {
 
 	opts := carveOpts(t, ws, "deps")
 	opts.CarveOut = true
+	opts.CarveOutPaths = []string{unicodeRel, longRel}
 	opts.ApprovalReady = func(string) error { return nil }
 	if _, err := h.coord().Trim(context.Background(), h.vault, root, opts); err != nil {
 		t.Fatalf("unicode/long carve trim: %v", err)

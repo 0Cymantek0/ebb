@@ -118,6 +118,19 @@ type CaptureOptions struct {
 	// only when this is true (defense in depth under the CLI's own
 	// typed confirmation / --carve-out, mirroring ApprovalReady).
 	CarveOut bool
+	// CarveOutPaths (F8) pins that consent to the exact root-relative
+	// slash paths the approval surface displayed — the SET is the
+	// authority, CarveOut above is the master switch. Lifecycle
+	// re-derives the carve set from its OWN scan, so an entry is carved
+	// ONLY when its path is in this list; a plan-time canceller that is
+	// not (e.g. a file that became git-tracked between the CLI's
+	// discovery scan and the trim's scan) refuses the group with drift
+	// text instead of being captured and removed unseen. The CLI
+	// populates it from the same candidate list it rendered (typed
+	// confirmation) or from its classification of the discovery scan
+	// (the --carve-out headless displayed-equivalent set). Cancelling
+	// directories are not candidates and never join the list.
+	CarveOutPaths []string
 	// GitTrackedPaths carries the caller's hardened git-index
 	// observation (root-relative tracked paths, D004). Trim re-annotates
 	// git:tracked evidence onto its OWN scan before resolving, so the

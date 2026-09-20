@@ -17,7 +17,12 @@ package lifecycle
 //   - Consent is never inferred. A carve happens only when
 //     opts.CarveOut is true (the CLI gates that behind its own typed
 //     confirmation or --carve-out; lifecycle re-checks, mirroring
-//     ApprovalReady).
+//     ApprovalReady) AND the entry's path is in the caller's approved
+//     carve list opts.CarveOutPaths (F8: consent is pinned to the exact
+//     candidate paths the consent surface displayed — the SET is the
+//     authority, the boolean is defense in depth). A plan-time
+//     canceller that is not in the set is drift between the two scans
+//     and refuses the group exactly as a missing consent would.
 //   - Carved entries are ordinary permit members: the removal walk
 //     re-digests every file and re-verifies every link's text
 //     immediately before removal (E08), exactly like bulk members, so
@@ -343,6 +348,39 @@ func carvePlanBlocker(groupID string, cls carveClassification) string {
 	return ""
 }
 
+// carveConsentBlocker enforces F8 consent pinning: the carve set is
+// re-derived from lifecycle's OWN scan at plan time, so consent must be
+// pinned to the exact candidate paths the approval surface displayed
+// (opts.CarveOutPaths), not to a set-level boolean. A plan-time
+// canceller whose path is not in the approved list is drift between the
+// two scans (e.g. a file that became git-tracked after the CLI's
+// discovery); the group refuses exactly as it would without consent,
+// with text naming the drift. Empty string means every candidate is
+// approved. (Cancelling DIRECTORIES are not candidates — they are never
+// displayed, so they cannot drift; the recipe recreates the tree.)
+func carveConsentBlocker(groupID string, cls carveClassification, approvedPaths []string) string {
+	if len(cls.Carved) == 0 {
+		return ""
+	}
+	approved := make(map[string]bool, len(approvedPaths))
+	for _, p := range approvedPaths {
+		approved[p] = true
+	}
+	var drift []string
+	for _, e := range cls.Carved {
+		if !approved[e.Path] {
+			drift = append(drift, e.Path)
+		}
+	}
+	if len(drift) == 0 {
+		return ""
+	}
+	sort.Strings(drift)
+	return fmt.Sprintf(
+		"regenerate group %s is not applicable for removal: carve candidate %s was not part of the approved carve list (the workspace changed between the carve confirmation and this scan; the entry was never displayed for consent, so nothing was carved or removed). Safe action: rerun the command and confirm the current candidate list",
+		groupID, strings.Join(drift, ", "))
+}
+
 // carveCaseFoldCollisions reports carved-path collisions (case-
 // insensitive) against the bulk and against other carved entries — on a
 // case-insensitive filesystem two such entries are the same file, so the
@@ -392,6 +430,13 @@ func writeOverlayCopies(st *captureState, gp trimGroupPlan) ([]overlayPatchRecor
 		src := filepath.Join(st.rootAbs, filepath.FromSlash(e.Path))
 		switch carveKindOf(e.Kind) {
 		case overlayKindFile:
+			// F9: record the source permission bits the platform reports
+			// at capture time, so the restore side can reapply them
+			// (carved executables must not come back 0600).
+			fi, err := os.Stat(src)
+			if err != nil {
+				return nil, fmt.Errorf("lifecycle: carve-out stat %s: %w", e.Path, err)
+			}
 			b, err := os.ReadFile(src)
 			if err != nil {
 				return nil, fmt.Errorf("lifecycle: carve-out read %s: %w", e.Path, err)
@@ -405,7 +450,10 @@ func writeOverlayCopies(st *captureState, gp trimGroupPlan) ([]overlayPatchRecor
 			if err := writeOpDirFile(st, rel, b); err != nil {
 				return nil, err
 			}
-			recs = append(recs, overlayPatchRecord{Path: e.Path, Copy: rel, Digest: e.Digest, Kind: overlayKindFile})
+			recs = append(recs, overlayPatchRecord{
+				Path: e.Path, Copy: rel, Digest: e.Digest,
+				Kind: overlayKindFile, Mode: uint32(fi.Mode().Perm()),
+			})
 		case overlayKindLink:
 			target, err := os.Readlink(src)
 			if err != nil {
@@ -416,11 +464,19 @@ func writeOverlayCopies(st *captureState, gp trimGroupPlan) ([]overlayPatchRecor
 					"carve-out link %s changed between scan and capture (text %q, sealed %q); the overlay must capture exactly the sealed link text",
 					e.Path, target, e.LinkTarget)}}
 			}
+			// The sidecar bytes are exactly the re-verified link text; the
+			// recorded digest is over THESE bytes (F7), so the sidecar is
+			// witnessed in durable state and payload-only tampering that
+			// rewrites a carved link's target is detectable at restore
+			// time. Links carry no permission bits of their own: Mode 0.
+			sidecar := []byte(target)
 			rel := overlayDirName + "/" + gp.GroupID + "/" + e.Path + linkSidecarSuffix
-			if err := writeOpDirFile(st, rel, []byte(target)); err != nil {
+			if err := writeOpDirFile(st, rel, sidecar); err != nil {
 				return nil, err
 			}
-			recs = append(recs, overlayPatchRecord{Path: e.Path, Copy: rel, Digest: "", Kind: overlayKindLink})
+			recs = append(recs, overlayPatchRecord{
+				Path: e.Path, Copy: rel, Digest: digestBytes(sidecar), Kind: overlayKindLink,
+			})
 		default:
 			return nil, fmt.Errorf("lifecycle: carve-out entry %s has kind %q with no overlay encoding (internal inconsistency)", e.Path, e.Kind)
 		}

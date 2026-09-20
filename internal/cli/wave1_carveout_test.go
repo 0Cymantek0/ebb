@@ -66,6 +66,7 @@ type cliOverlayPlan struct {
 			Copy   string `json:"copy"`
 			Digest string `json:"digest"`
 			Kind   string `json:"kind"`
+			Mode   uint32 `json:"mode"` // F9: source permission bits (0 = legacy/link)
 		} `json:"overlay_patches"`
 		RecreateLive []string `json:"recreate_live"`
 	} `json:"groups"`

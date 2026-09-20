@@ -140,9 +140,18 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 	opts.GitTrackedPaths = gitTrackedPathsOf(disc.Entries)
 	// ---- D034 carve-out consent (no silent carve, ever) ----------------
 	// A carve means files that were preserved now get removed after
-	// capture; that material change needs its own explicit yes.
+	// capture; that material change needs its own explicit yes. Consent
+	// is pinned to the exact candidate paths on display (F8): the same
+	// list feeds opts.CarveOutPaths, so a canceller that only shows up
+	// in lifecycle's later scan refuses the trim instead of being
+	// removed unseen.
 	if *carveOutFlag {
 		opts.CarveOut = true
+		// Headless pre-authorization: pin the set to the CLI's
+		// classification of the discovery scan — the displayed-
+		// equivalent candidate list the interactive confirmation would
+		// have rendered.
+		opts.CarveOutPaths = carveOfferPaths(eligibleCarveOffers(disc.Resolved, groups))
 	} else if offers := eligibleCarveOffers(disc.Resolved, groups); len(offers) > 0 {
 		ids := carveOfferIDs(offers)
 		if deps.StdinIsTerminal != nil && deps.StdinIsTerminal() {
@@ -153,6 +162,7 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 					CodeApprovalDeclined, strings.Join(ids, ","), strings.Join(groups, ",")))
 			}
 			opts.CarveOut = true
+			opts.CarveOutPaths = carveOfferPaths(offers)
 		} else {
 			return emitFailure(env, *jsonOut, streams, ExitBlocked, fmt.Sprintf(
 				"%s [trim]: group(s) %s are cancelled by preserved entries inside their outputs; a carve-out (capture to vault, then remove) needs explicit authorization that stdin cannot give. Safe action: rerun with --yes --carve-out after reviewing the entries, or run in a terminal and confirm the carve prompt",
@@ -338,6 +348,22 @@ func carveOfferIDs(offers []carveOffer) []string {
 		ids = append(ids, o.Group)
 	}
 	return ids
+}
+
+// carveOfferPaths renders the approved carve-path set (F8) from the
+// offers the consent surface displayed — or, headless, from the same
+// classification of the discovery scan the confirmation would have
+// displayed. Lifecycle carves ONLY these root-relative slash paths;
+// anything else its own later scan classifies as a canceller refuses
+// the group as consent drift.
+func carveOfferPaths(offers []carveOffer) []string {
+	var out []string
+	for _, o := range offers {
+		for _, c := range o.Candidates {
+			out = append(out, c.Path)
+		}
+	}
+	return out
 }
 
 // gitTrackedPathsOf extracts the git:tracked paths from the discovery

@@ -271,17 +271,34 @@ type removalManifestDoc struct {
 //     whose entire byte content is the link's TARGET TEXT (never the
 //     target's content — links are never followed); the restore driver
 //     re-creates the link from that text.
-//   - Digest is the sha256 hex of the ORIGINAL file bytes for kind
-//     "file" (identical to the sealed member entry's digest, verified
-//     again immediately before removal); "" for kind "link".
+//   - Digest binds the carved bytes to durable state so payload-only
+//     tampering is detectable at restore time. Its meaning is per kind
+//     (F7 amendment): for kind "file" it is the sha256 hex of the
+//     ORIGINAL file bytes (identical to the sealed member entry's
+//     digest, verified again immediately before removal); for kind
+//     "link" it is the sha256 hex OF THE SIDECAR TARGET-TEXT BYTES —
+//     the exact bytes written to Copy, re-verified against the sealed
+//     link text at capture time. "" means "unwitnessed" (a writer that
+//     predates the F7 amendment); readers tolerate it only for those
+//     legacy manifests.
 //   - Kind is "file" for regular files and "link" for symlinks,
 //     junctions and mount points alike (any kind whose identity is link
 //     text).
+//   - Mode (F9 amendment) is the source file's permission bits as the
+//     platform reported them at capture time (0o644/0o755/...), recorded
+//     so restore can reapply them instead of a blanket 0600. 0 means
+//     "writer predates the field" (readers apply a safe default); links
+//     always record 0 (link text carries no permission bits of its own).
 type overlayPatchRecord struct {
-	Path   string `json:"path"`   // root-relative slash path of the original
-	Copy   string `json:"copy"`   // op-dir-relative copy: "overlay/<groupID>/<path>" (links: "....ebb-link")
-	Digest string `json:"digest"` // sha256 hex of the file bytes ("" for links)
-	Kind   string `json:"kind"`   // "file" | "link"
+	Path string `json:"path"` // root-relative slash path of the original
+	Copy string `json:"copy"` // op-dir-relative copy: "overlay/<groupID>/<path>" (links: "....ebb-link")
+	// Digest: file-kind = sha256 of the file bytes; link-kind = sha256 of
+	// the sidecar target-text bytes; "" = unwitnessed legacy (see above).
+	Digest string `json:"digest"`
+	Kind   string `json:"kind"` // "file" | "link"
+	// Mode is the source permission bits (0o644/0o755/...); 0 = field
+	// predates the amendment or the entry is a link.
+	Mode uint32 `json:"mode,omitempty"`
 }
 
 type recipeInput struct {

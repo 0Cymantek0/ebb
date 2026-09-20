@@ -381,7 +381,8 @@ func cmdReclaim(args []string, streams Streams, deps Deps) int {
 // a separate typed carve confirmation on a terminal (declined → the
 // step is skipped); headless runs need --carve-out together with --yes,
 // otherwise the step is skipped with a blocker naming the flag. The
-// lifecycle re-checks consent and performs the carve only then.
+// lifecycle re-checks consent — pinned to the displayed candidate paths
+// (F8) — and performs the carve only then.
 func runReclaimTrimStep(
 	ctx context.Context, sess *session, coord *lifecycle.Coordinator,
 	deps Deps, streams Streams, disc discovery, opts lifecycle.CaptureOptions,
@@ -421,6 +422,8 @@ func runReclaimTrimStep(
 	// lifecycle re-validates policy and applicability itself).
 	trimOpts.ApprovalReady = func(string) error { return nil }
 	// ---- D034 carve consent (no silent carve, ever) --------------------
+	// Consent is pinned to the offer's candidate paths (F8): the same
+	// list the carve confirmation displays becomes trimOpts.CarveOutPaths.
 	if offer, isCancelled := carveOfferFor(disc.Resolved, groupID); isCancelled {
 		switch {
 		case !offer.Eligible:
@@ -428,6 +431,7 @@ func runReclaimTrimStep(
 			// refuse with its authoritative blocker text.
 		case carveOut:
 			trimOpts.CarveOut = true
+			trimOpts.CarveOutPaths = carveOfferPaths([]carveOffer{offer})
 		case deps.StdinIsTerminal != nil && deps.StdinIsTerminal():
 			fmt.Fprint(streams.Err, carveApprovalText(disc.Root, []carveOffer{offer}))
 			if !confirmYes(deps, streams.Err, "") {
@@ -435,6 +439,7 @@ func runReclaimTrimStep(
 				return step, nil
 			}
 			trimOpts.CarveOut = true
+			trimOpts.CarveOutPaths = carveOfferPaths([]carveOffer{offer})
 		default:
 			step.Reason = fmt.Sprintf(
 				"carve-out consent missing: the group is cancelled by preserved entries inside its outputs; rerun with --carve-out (together with --yes) or answer the interactive carve confirmation to capture them as an overlay patch and remove them after capture")

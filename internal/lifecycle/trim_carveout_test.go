@@ -118,6 +118,16 @@ func dumpTrimPlanFromP(t *testing.T, h *harness, ws domain.WorkspaceID) trimPlan
 	return plan
 }
 
+// carveApproveFixture is the CLI-equivalent approved carve set for the
+// standard carve fixture: exactly the candidate paths the consent
+// surface would display (F8 pins consent to this list).
+func carveApproveFixture(extra ...string) []string {
+	return append([]string{
+		"node_modules/kept/fix.js",
+		"node_modules/kept/deep/note.txt",
+	}, extra...)
+}
+
 // TestTrimCarveOutRoundTrip: with consent, a group cancelled by a
 // preserve rule inside its outputs is carved (overlay patches sealed in
 // P, byte-exact) and the whole group is removed; the manifest freezes
@@ -148,6 +158,7 @@ func TestTrimCarveOutRoundTrip(t *testing.T) {
 
 	opts := carveOpts(t, ws, "deps")
 	opts.CarveOut = true
+	opts.CarveOutPaths = carveApproveFixture()
 	opts.ApprovalReady = func(string) error { return nil }
 	res, err := h.coord().Trim(context.Background(), h.vault, root, opts)
 	if err != nil {
@@ -302,6 +313,7 @@ func TestTrimCarveOutGitTrackedEvidenceParity(t *testing.T) {
 	optsA := trimOpts(t, wsA, "deps") // plain policy, no preserve rule
 	optsA.GitTrackedPaths = []string{"node_modules/a.js"}
 	optsA.CarveOut = true
+	optsA.CarveOutPaths = []string{"node_modules/a.js"} // the CLI-displayed set
 	optsA.ApprovalReady = func(string) error { return nil }
 	if _, err := h.coord().Trim(context.Background(), h.vault, rootA, optsA); err != nil {
 		t.Fatalf("trim with tracked carve: %v", err)
@@ -351,6 +363,7 @@ func TestTrimCarveOutLinkSidecar(t *testing.T) {
 
 	opts := carveOpts(t, ws, "deps")
 	opts.CarveOut = true
+	opts.CarveOutPaths = carveApproveFixture("node_modules/kept/outside-link")
 	opts.ApprovalReady = func(string) error { return nil }
 	if _, err := h.coord().Trim(context.Background(), h.vault, root, opts); err != nil {
 		t.Fatalf("trim with link carve: %v", err)
@@ -370,8 +383,11 @@ func TestTrimCarveOutLinkSidecar(t *testing.T) {
 	if linkRec.Kind != overlayKindLink {
 		t.Errorf("link record kind = %q, want %q", linkRec.Kind, overlayKindLink)
 	}
-	if linkRec.Digest != "" {
-		t.Errorf("link record digest = %q, want empty (links carry no content digest)", linkRec.Digest)
+	if linkRec.Digest == "" {
+		t.Errorf("link record digest is empty: the sidecar target-text bytes must be witnessed (F7)")
+	}
+	if linkRec.Mode != 0 {
+		t.Errorf("link record mode = %o, want 0 (links carry no permission bits)", linkRec.Mode)
 	}
 	if !strings.HasSuffix(linkRec.Copy, ".ebb-link") {
 		t.Errorf("link record copy = %q, want an .ebb-link sidecar", linkRec.Copy)
@@ -406,6 +422,11 @@ func TestTrimCarveOutLinkSidecar(t *testing.T) {
 	}
 	if string(sidecar) != member.LinkTarget {
 		t.Errorf("sidecar text %q != sealed link target %q", string(sidecar), member.LinkTarget)
+	}
+	// F7: the recorded digest is the sha256 of the EXACT sidecar bytes
+	// held in durable state (== the sealed link text).
+	if linkRec.Digest != digestBytes(sidecar) {
+		t.Errorf("link digest = %s, want sha256 of the sidecar bytes (%s)", linkRec.Digest, digestBytes(sidecar))
 	}
 	// The link itself is gone; the outside target is untouched.
 	mustLstatErrNotExist(t, filepath.Join(root, "node_modules"))
@@ -442,6 +463,7 @@ func TestTrimCarveOutOverlayTamperFailsVerification(t *testing.T) {
 
 	opts := carveOpts(t, ws, "deps")
 	opts.CarveOut = true
+	opts.CarveOutPaths = carveApproveFixture()
 	opts.ApprovalReady = func(string) error { return nil }
 	_, err := h.coord().Trim(context.Background(), h.vault, root, opts)
 	var verr *ErrVerification
@@ -478,6 +500,7 @@ func TestTrimCarveOutSourceChangedUnderOverlay(t *testing.T) {
 
 	opts := carveOpts(t, ws, "deps")
 	opts.CarveOut = true
+	opts.CarveOutPaths = carveApproveFixture()
 	opts.ApprovalReady = func(string) error { return nil }
 	_, err := h.coord().Trim(context.Background(), h.vault, root, opts)
 	var sc *ErrSourceChanged
@@ -617,6 +640,7 @@ func TestTrimCarveOutRecoverSealingResumes(t *testing.T) {
 	}
 	opts := carveOpts(t, ws, "deps")
 	opts.CarveOut = true
+	opts.CarveOutPaths = carveApproveFixture()
 	opts.ApprovalReady = func(string) error { return nil }
 	_, err := h.coord().Trim(ctx, h.vault, root, opts)
 	if err == nil || !errors.Is(err, context.Canceled) {
