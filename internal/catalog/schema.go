@@ -3,7 +3,7 @@ package catalog
 // Forward-only schema migrations. The slice index is the version
 // recorded in schema_migrations; migration N runs inside one transaction
 // together with its version insert (see Catalog.migrate).
-var migrations = []string{schemaV1, schemaV2}
+var migrations = []string{schemaV1, schemaV2, schemaV3}
 
 // schemaMigrationsDDL is created separately from any versioned
 // migration so a fresh database can record versions at all.
@@ -130,4 +130,38 @@ CREATE INDEX idx_operations_workspace ON operations(workspace_id, updated_at);
 // snapshot remain representable. Non-destructive ALTERs only.
 const schemaV2 = `
 ALTER TABLE replicas ADD COLUMN path TEXT;
+`
+
+// schemaV3 (Wave 2, D040 tier 3) adds the docker_images table: the
+// durable row of one Freeze-to-Vault capture. A dedicated table (not a
+// snapshots row with a new kind) is the minimal additive representation:
+// freeze entries have no workspace (snapshots.workspace_id is NOT NULL),
+// no manifest/inventory digests, and their own witness set — the stream
+// digest, the byte count, the --stdin-filename inside the restic
+// snapshot and the daemon-removal audit. A CREATE TABLE touches no
+// existing row shape, no closed vocabulary and no witness comparison.
+//
+// pinned defaults to 1 mirroring I07 (a frozen image creates a recovery
+// obligation; it is presumed retained until an explicit forget path
+// exists). verified_at stays NULL until the independent readback digest
+// check passes; an unverified row is retained AND pinned (§11.3: nothing
+// is auto-forgotten on failure). daemon_removed_at records the audited
+// docker rmi (only ever executed behind the CLI's separate typed
+// confirmation after a verified freeze).
+const schemaV3 = `
+CREATE TABLE docker_images (
+	id TEXT PRIMARY KEY,
+	image_id TEXT NOT NULL,
+	vault_id TEXT REFERENCES vaults(id),
+	snapshot_id TEXT NOT NULL,
+	filename TEXT NOT NULL,
+	sha256 TEXT NOT NULL,
+	bytes INTEGER NOT NULL,
+	created_at TEXT NOT NULL,
+	verified_at TEXT,
+	pinned INTEGER NOT NULL DEFAULT 1,
+	daemon_removed_at TEXT
+);
+
+CREATE INDEX idx_docker_images_image ON docker_images(image_id, created_at);
 `

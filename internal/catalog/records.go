@@ -1,6 +1,13 @@
 package catalog
 
-import "ebb/internal/domain"
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"ebb/internal/domain"
+)
 
 // Workspace status values (Foundation §16.5). After a catalog rebuild
 // the status is UNBOUND, never a guessed live/parked: a seal proves a
@@ -269,4 +276,191 @@ type RetentionIntent struct {
 	Acknowledged bool
 	CreatedAt    string // RFC3339Nano UTC
 	CompletedAt  string // RFC3339Nano UTC, "" until completed
+}
+
+// DockerImage is one row of the docker_images table (schemaV3, D040
+// tier 3): the durable record of one Freeze-to-Vault capture. It is the
+// restore authority for `ebb freeze --restore`: snapshot_id + filename
+// address the blob inside the vault, sha256 + bytes are the readback
+// witness recorded in-flight at freeze time, and VerifiedAt/RemovedAt
+// carry the verification and daemon-removal audit. A row with an empty
+// VerifiedAt was captured but never proven by independent readback — it
+// is retained and pinned, never trusted as evidence (Foundation §11.3).
+type DockerImage struct {
+	ID              domain.ID
+	ImageID         string // canonical docker image id (e.g. sha256:<64hex>) or tag spelling
+	VaultID         domain.VaultID
+	SnapshotID      string // restic backend snapshot id (64 hex)
+	Filename        string // --stdin-filename of the blob inside the snapshot
+	SHA256          string // digest of the docker-save stream, hashed in-flight
+	Bytes           int64  // byte count of the stream
+	CreatedAt       string // RFC3339Nano UTC
+	VerifiedAt      string // RFC3339Nano UTC, "" until readback verification passed
+	Pinned          bool
+	DaemonRemovedAt string // RFC3339Nano UTC, "" while the image is still in the daemon
+}
+
+// ---- docker_images rows (schemaV3, D040 tier 3) ------------------------
+
+const dockerImageCols = `id, image_id, vault_id, snapshot_id, filename, sha256, bytes,
+	created_at, verified_at, pinned, daemon_removed_at`
+
+// RecordDockerImage inserts one freeze row. The row is always recorded
+// pinned (I07 posture for the new recovery obligation); verified_at
+// starts empty and is only ever set by MarkDockerImageVerified after the
+// independent readback digest check. Re-freezing the same image appends
+// a new row (entries are append-only history; lookup prefers the newest
+// verified row).
+func (c *Catalog) RecordDockerImage(im DockerImage) (domain.ID, error) {
+	if im.ImageID == "" {
+		return "", errors.New("catalog: docker image id required")
+	}
+	if im.SnapshotID == "" || im.Filename == "" || im.SHA256 == "" || im.Bytes <= 0 {
+		return "", fmt.Errorf("catalog: docker image %s: snapshot id, filename, sha256 and a positive byte count are required (got snapshot=%q filename=%q sha256=%q bytes=%d)",
+			im.ImageID, im.SnapshotID, im.Filename, im.SHA256, im.Bytes)
+	}
+	if im.ID == "" {
+		im.ID = domain.NewID()
+	}
+	if im.CreatedAt == "" {
+		im.CreatedAt = domain.FormatTime(time.Now())
+	}
+	return im.ID, withTx(c.db, func(tx *sql.Tx) error {
+		const q = `INSERT INTO docker_images
+			(` + dockerImageCols + `)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, NULL)`
+		if _, err := tx.Exec(q, string(im.ID), im.ImageID, nullStr(string(im.VaultID)),
+			im.SnapshotID, im.Filename, im.SHA256, im.Bytes, im.CreatedAt); err != nil {
+			return fmt.Errorf("catalog: record docker image %s: %w", im.ID, err)
+		}
+		return nil
+	})
+}
+
+// GetDockerImage returns the freeze row for id, or ErrNotFound.
+func (c *Catalog) GetDockerImage(id domain.ID) (DockerImage, error) {
+	const q = `SELECT ` + dockerImageCols + ` FROM docker_images WHERE id = ?`
+	im, err := scanDockerImage(c.db.QueryRow(q, string(id)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return DockerImage{}, fmt.Errorf("%w: docker image entry %s", ErrNotFound, id)
+	}
+	if err != nil {
+		return DockerImage{}, fmt.Errorf("catalog: get docker image %s: %w", id, err)
+	}
+	return im, nil
+}
+
+// FindDockerImages returns the freeze rows whose image_id matches
+// imageID exactly (the CLI resolves a user-supplied image id or tag),
+// oldest first. The caller prefers the newest VERIFIED row and refuses
+// to trust unverified rows as evidence.
+func (c *Catalog) FindDockerImages(imageID string) ([]DockerImage, error) {
+	const q = `SELECT ` + dockerImageCols + ` FROM docker_images
+		WHERE image_id = ? ORDER BY created_at, id`
+	rows, err := c.db.Query(q, imageID)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: find docker images %q: %w", imageID, err)
+	}
+	defer rows.Close()
+	var out []DockerImage
+	for rows.Next() {
+		im, err := scanDockerImage(rows)
+		if err != nil {
+			return nil, fmt.Errorf("catalog: find docker images %q: %w", imageID, err)
+		}
+		out = append(out, im)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: find docker images %q: %w", imageID, err)
+	}
+	return out, nil
+}
+
+// ListDockerImages returns every freeze row, oldest first (the status
+// view; `ebb freeze --restore` resolves through FindDockerImages).
+func (c *Catalog) ListDockerImages() ([]DockerImage, error) {
+	const q = `SELECT ` + dockerImageCols + ` FROM docker_images ORDER BY created_at, id`
+	rows, err := c.db.Query(q)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: list docker images: %w", err)
+	}
+	defer rows.Close()
+	var out []DockerImage
+	for rows.Next() {
+		im, err := scanDockerImage(rows)
+		if err != nil {
+			return nil, fmt.Errorf("catalog: list docker images: %w", err)
+		}
+		out = append(out, im)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: list docker images: %w", err)
+	}
+	return out, nil
+}
+
+// MarkDockerImageVerified stamps the row's verified_at — only after the
+// caller proved the vault's bytes read back to the recorded digest and
+// byte count (Foundation §11.4; the stamp itself never creates proof).
+func (c *Catalog) MarkDockerImageVerified(id domain.ID, at string) error {
+	if at == "" {
+		return errors.New("catalog: verification timestamp required")
+	}
+	return withTx(c.db, func(tx *sql.Tx) error {
+		res, err := tx.Exec(`UPDATE docker_images SET verified_at = ? WHERE id = ?`, at, string(id))
+		if err != nil {
+			return fmt.Errorf("catalog: mark docker image %s verified: %w", id, err)
+		}
+		n, rerr := res.RowsAffected()
+		if rerr != nil {
+			return fmt.Errorf("catalog: mark docker image %s verified: %w", id, rerr)
+		}
+		if n != 1 {
+			return fmt.Errorf("%w: docker image entry %s", ErrNotFound, id)
+		}
+		return nil
+	})
+}
+
+// MarkDockerImageRemoved records the audited docker rmi of a VERIFIED
+// freeze row (the daemon-side removal only ever runs behind the CLI's
+// separate typed confirmation). Refuses an unverified row: removal
+// authority requires proven evidence, exactly like workspace removal.
+func (c *Catalog) MarkDockerImageRemoved(id domain.ID, at string) error {
+	if at == "" {
+		return errors.New("catalog: removal timestamp required")
+	}
+	return withTx(c.db, func(tx *sql.Tx) error {
+		var verified sql.NullString
+		if err := tx.QueryRow(`SELECT verified_at FROM docker_images WHERE id = ?`,
+			string(id)).Scan(&verified); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: docker image entry %s", ErrNotFound, id)
+			}
+			return fmt.Errorf("catalog: mark docker image %s removed: %w", id, err)
+		}
+		if !verified.Valid || verified.String == "" {
+			return fmt.Errorf("catalog: docker image %s is UNVERIFIED; the daemon image can only be removed after a verified freeze", id)
+		}
+		if _, err := tx.Exec(`UPDATE docker_images SET daemon_removed_at = ? WHERE id = ?`,
+			at, string(id)); err != nil {
+			return fmt.Errorf("catalog: mark docker image %s removed: %w", id, err)
+		}
+		return nil
+	})
+}
+
+func scanDockerImage(r rowScanner) (DockerImage, error) {
+	var im DockerImage
+	var vaultID, verified, removed sql.NullString
+	var pinned int64
+	if err := r.Scan(&im.ID, &im.ImageID, &vaultID, &im.SnapshotID, &im.Filename,
+		&im.SHA256, &im.Bytes, &im.CreatedAt, &verified, &pinned, &removed); err != nil {
+		return DockerImage{}, err
+	}
+	im.VaultID = domain.VaultID(vaultID.String)
+	im.VerifiedAt = verified.String
+	im.Pinned = pinned != 0
+	im.DaemonRemovedAt = removed.String
+	return im, nil
 }

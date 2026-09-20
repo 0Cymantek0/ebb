@@ -236,6 +236,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdOpen(args[1:], streams, deps)
 	case "restore":
 		return cmdRestore(args[1:], streams, deps)
+	case "freeze":
+		return cmdFreeze(args[1:], streams, deps)
 	case "recover":
 		return cmdRecover(args[1:], streams, deps)
 	case "forget":
@@ -326,6 +328,9 @@ commands:
                              (bare "ebb open" on a terminal offers an interactive picker)
   restore [path]             recreate trimmed dependencies in place on a live workspace
                              (the inverse of reclaim; git-gated, drift-reconciled)
+  freeze <image-id>          stream a docker image into the vault (docker save | restic --stdin),
+                             hash in flight and verify by readback; --restore loads it back,
+                             --remove drops the daemon copy behind its own confirmation
   delete <name-or-snapshot-id>
                              end recovery obligations AND prune freed vault storage in one action
   config <subcommand>        manage global settings (projects_dir scan roots for analyse)
@@ -376,6 +381,15 @@ restore flags:
                             top-level manifest union, native tool resolves; current: rebuild live
                             manifests; baseline: revert to the frozen copies)
   --dry-run                  report the selected trim, commands, drift table and overlays without effects
+
+freeze flags:
+  --dry-run                  show the size estimate (docker image inspect) without effects
+  --yes                      accept the freeze confirmation headlessly (NEVER answers --remove)
+  --restore <entry-or-image-id>
+                            stream a frozen image back into the daemon (digest verified
+                            BEFORE docker load receives a single byte)
+  --remove                   after a VERIFIED freeze, offer the daemon-image removal
+  --yes-removal              accept that separate removal confirmation headlessly (with --remove)
 
 delete flags:
   --yes                      accept the typed-target confirmation without a prompt

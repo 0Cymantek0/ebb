@@ -16,8 +16,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"ebb/internal/catalog"
 	"ebb/internal/platform"
@@ -27,7 +29,7 @@ import (
 // doctorCheck is one capability/configuration observation.
 type doctorCheck struct {
 	Name   string `json:"name"`
-	Status string `json:"status"` // pass | warn | fail
+	Status string `json:"status"` // pass | warn | fail | n/a
 	Detail string `json:"detail,omitempty"`
 }
 
@@ -242,6 +244,14 @@ func runDoctorChecks() []doctorCheck {
 		checks = append(checks, catalogCheck(cfgDir))
 	}
 
+	// ---- Wave 2 probes (D040) ------------------------------------------
+	// Windows Developer Mode (unprivileged symlink creation capability).
+	checks = append(checks, devModeProbeCheck(runtime.GOOS, readDevModeUnlock, doctorSymlinkLiveProbe))
+	// WSL2 docker-desktop sparse-disk status (best-effort, non-fatal).
+	checks = append(checks, wslVhdxProbeCheck(runtime.GOOS, dockerVhdxCandidates, doctorVhdxSizes, doctorWslDistros))
+	// Docker daemon connectivity (freeze/analyse prerequisite).
+	checks = append(checks, dockerProbeCheck(exec.LookPath, doctorDockerVersion))
+
 	return checks
 }
 
@@ -321,4 +331,253 @@ func containsPID(writers []platform.Writer, pid uint32) bool {
 		}
 	}
 	return false
+}
+
+// ---- Wave 2 probes (D040): Developer Mode, WSL2 VHDX, docker ----
+
+// devModeProbeCheck reports the Windows Developer Mode capability
+// (unprivileged symlink creation): the registry switch is read first,
+// and a LIVE probe (creating a temp symlink) settles what the registry
+// only promises — an elevated shell creates symlinks regardless of the
+// switch, and an over-claiming registry is exposed by the probe.
+// Outside Windows the probe is honestly n/a.
+//
+// regRead returns (value, found, error); trySymlink returns nil when a
+// symlink creation succeeded and a typed platform.LinkPrivilegeError
+// (detected structurally, without importing the type) when the
+// privilege is missing.
+func devModeProbeCheck(goos string, regRead func() (uint32, bool, error), trySymlink func() error) doctorCheck {
+	const name = "windows-devmode"
+	if goos != "windows" {
+		return doctorCheck{Name: name, Status: "n/a",
+			Detail: "not applicable on this platform (Windows Developer Mode probe)"}
+	}
+	value, found, rerr := regRead()
+	if rerr != nil {
+		return doctorCheck{Name: name, Status: "warn",
+			Detail: "registry unreadable: " + rerr.Error()}
+	}
+	enabled := found && value == 1
+	liveErr := trySymlink()
+	privBlocked := false
+	if liveErr != nil {
+		var blocked interface{ LinkPrivilegeBlocked() bool }
+		privBlocked = errors.As(liveErr, &blocked) && blocked.LinkPrivilegeBlocked()
+	}
+	switch {
+	case liveErr == nil && enabled:
+		return doctorCheck{Name: name, Status: "pass",
+			Detail: "Developer Mode enabled and a live probe created a symlink unprivileged (restic can materialize symlink nodes)"}
+	case liveErr == nil:
+		return doctorCheck{Name: name, Status: "pass",
+			Detail: "symlink creation available without Developer Mode (elevated shell or granted privilege); the live probe succeeded"}
+	case enabled && privBlocked:
+		return doctorCheck{Name: name, Status: "warn",
+			Detail: "Developer Mode registry switch is ON but the live probe was refused for privilege (" + liveErr.Error() + "); symlink materialization may fail"}
+	default:
+		return doctorCheck{Name: name, Status: "warn",
+			Detail: "Developer Mode is OFF and unprivileged symlink creation is refused (" + liveErr.Error() + "). Safe action: enable Windows Developer Mode (Settings > Privacy & security > For developers) so `ebb open`/restic can materialize symlink nodes, or run elevated"}
+	}
+}
+
+// doctorSymlinkLiveProbe creates one symlink in a private temp dir and
+// removes it — the live capability oracle behind the registry promise.
+func doctorSymlinkLiveProbe() error {
+	dir, err := os.MkdirTemp("", "ebb-doctor-link-")
+	if err != nil {
+		return fmt.Errorf("temp dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	link := filepath.Join(dir, "probe-link")
+	return platform.CreateSymlink(link, filepath.Join(dir, "target"))
+}
+
+// wslVhdxProbeCheck reports the WSL2 docker-desktop sparse-disk status:
+// size-on-disk (physical allocation) versus logical size of the dynamic
+// VHDX (Foundation §1.2: physical bytes, not logical). Everything here
+// is best-effort — a missing vhdx, an unobservable allocation or an
+// absent wsl.exe is an honest observation, never a failure.
+func wslVhdxProbeCheck(goos string, candidates func() []string,
+	sizes func(path string) (logical, allocated int64, allocatedKnown bool, err error),
+	wslDistros func() ([]string, error)) doctorCheck {
+	const name = "wsl-vhdx"
+	if goos != "windows" {
+		return doctorCheck{Name: name, Status: "n/a",
+			Detail: "not applicable on this platform (WSL2 docker-desktop virtual disk probe)"}
+	}
+	found := candidates()
+	if len(found) == 0 {
+		return doctorCheck{Name: name, Status: "warn",
+			Detail: "no docker-desktop virtual disk found under %LOCALAPPDATA%\\Docker\\wsl (Docker Desktop not installed, or a non-WSL2 backend); nothing to compact"}
+	}
+	vhdx := found[0]
+	logical, allocated, known, err := sizes(vhdx)
+	if err != nil {
+		return doctorCheck{Name: name, Status: "warn",
+			Detail: fmt.Sprintf("cannot probe %s: %v", vhdx, err)}
+	}
+	distroNote := ""
+	if distros, werr := wslDistros(); werr == nil && len(distros) > 0 {
+		hasDD := false
+		for _, d := range distros {
+			if strings.EqualFold(d, "docker-desktop") {
+				hasDD = true
+			}
+		}
+		if hasDD {
+			distroNote = "; the docker-desktop WSL distro is installed"
+		} else {
+			distroNote = "; no docker-desktop WSL distro listed (wsl --list)"
+		}
+	}
+	switch {
+	case !known:
+		return doctorCheck{Name: name, Status: "warn",
+			Detail: fmt.Sprintf("%s: logical %s but physical allocation is not observable on this filesystem%s", vhdx, HumanBytes(logical), distroNote)}
+	case allocated < logical-(64<<10):
+		return doctorCheck{Name: name, Status: "pass",
+			Detail: fmt.Sprintf("%s: %s on disk of %s logical (sparse — guest-freed blocks already returned to the host)%s",
+				filepath.Base(vhdx), HumanBytes(allocated), HumanBytes(logical), distroNote)}
+	case allocated >= 5<<30:
+		return doctorCheck{Name: name, Status: "warn",
+			Detail: fmt.Sprintf("%s: %s on disk of %s logical — a fully-allocated dynamic disk may hold host slack after daemon-side cleanup%s. Safe action (copy-paste): wsl --shutdown; wsl --manage docker-desktop --set-sparse true; wsl -d docker-desktop fstrim -v /",
+				filepath.Base(vhdx), HumanBytes(allocated), HumanBytes(logical), distroNote)}
+	default:
+		return doctorCheck{Name: name, Status: "pass",
+			Detail: fmt.Sprintf("%s: %s on disk of %s logical%s",
+				filepath.Base(vhdx), HumanBytes(allocated), HumanBytes(logical), distroNote)}
+	}
+}
+
+// dockerVhdxCandidates lists the known docker-desktop VHDX locations
+// that exist on this machine (the newer disk\docker_data.vhdx layout
+// first).
+func dockerVhdxCandidates() []string {
+	local := os.Getenv("LOCALAPPDATA")
+	if local == "" {
+		return nil
+	}
+	var out []string
+	for _, rel := range []string{
+		filepath.Join("Docker", "wsl", "disk", "docker_data.vhdx"),
+		filepath.Join("Docker", "wsl", "data", "ext4.vhdx"),
+	} {
+		p := filepath.Join(local, rel)
+		if _, err := os.Stat(p); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// doctorVhdxSizes measures one file's logical and physical sizes through
+// the platform allocation probe (GetCompressedFileSizeW on NTFS — the
+// same oracle the space accounting uses).
+func doctorVhdxSizes(path string) (logical, allocated int64, allocatedKnown bool, err error) {
+	probe := platform.New()
+	facts, perr := probe.ProbeFile(path)
+	if perr != nil {
+		return 0, 0, false, perr
+	}
+	if facts.AllocatedSize != nil {
+		allocated, allocatedKnown = *facts.AllocatedSize, true
+	}
+	return facts.LogicalSize, allocated, allocatedKnown, nil
+}
+
+// doctorWslDistros lists WSL distro names, timeout-guarded (5s) and
+// non-fatal: an absent wsl.exe, a timeout or undecodable output is
+// "cannot tell", never a failure.
+func doctorWslDistros() ([]string, error) {
+	path, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		return nil, fmt.Errorf("wsl.exe not found: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var out bytes.Buffer
+	cmd := exec.CommandContext(ctx, path, "--list", "--quiet")
+	cmd.Stdout = &out
+	if rerr := cmd.Run(); rerr != nil || ctx.Err() != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("wsl --list exceeded the 5s guard")
+		}
+		return nil, rerr
+	}
+	text := decodeWslOutput(out.Bytes())
+	var distros []string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			distros = append(distros, line)
+		}
+	}
+	return distros, nil
+}
+
+// decodeWslOutput renders wsl.exe output: UTF-16LE on most installs,
+// plain UTF-8/ASCII on others (decoding is heuristic and loss-tolerant
+// — callers only match distro names).
+func decodeWslOutput(b []byte) string {
+	if len(b) >= 2 {
+		utf16Likely := false
+		for i := 1; i < len(b) && i < 64; i += 2 {
+			if b[i] == 0 {
+				utf16Likely = true
+				break
+			}
+		}
+		if utf16Likely {
+			u16 := make([]uint16, 0, len(b)/2)
+			for i := 0; i+1 < len(b); i += 2 {
+				u16 = append(u16, uint16(b[i])|uint16(b[i+1])<<8)
+			}
+			return string(utf16.Decode(u16))
+		}
+	}
+	return string(b)
+}
+
+// dockerProbeCheck reports docker CLI presence and daemon connectivity
+// (the freeze pipeline's prerequisite). An absent CLI or unreachable
+// daemon is an honest warn — docker features degrade, the rest of Ebb
+// does not.
+func dockerProbeCheck(lookPath func(string) (string, error),
+	version func(ctx context.Context, bin string) (string, error)) doctorCheck {
+	const name = "docker"
+	path, err := lookPath("docker")
+	if err != nil {
+		return doctorCheck{Name: name, Status: "warn",
+			Detail: "not found on PATH; docker features (`ebb freeze`, docker analysis) are unavailable"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	first, verr := version(ctx, path)
+	if verr != nil {
+		return doctorCheck{Name: name, Status: "warn",
+			Detail: "client found but the daemon did not answer `docker version` within 5s: " + verr.Error() +
+				". Safe action: start Docker Desktop / dockerd and rerun `ebb doctor`"}
+	}
+	detail := "daemon reachable"
+	if first != "" {
+		detail += " (" + first + ")"
+	}
+	return doctorCheck{Name: name, Status: "pass", Detail: detail}
+}
+
+// doctorDockerVersion runs `docker version` and returns its first
+// output line (the version banner).
+func doctorDockerVersion(ctx context.Context, bin string) (string, error) {
+	var buf bytes.Buffer
+	cmd := exec.CommandContext(ctx, bin, "version")
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Run(); err != nil {
+		first := strings.SplitN(strings.TrimSpace(buf.String()), "\n", 2)[0]
+		if first == "" {
+			return "", err
+		}
+		return "", fmt.Errorf("%s (%v)", first, err)
+	}
+	return strings.SplitN(strings.TrimSpace(buf.String()), "\n", 2)[0], nil
 }
