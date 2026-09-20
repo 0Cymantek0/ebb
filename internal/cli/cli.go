@@ -211,6 +211,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdReclaim(args[1:], streams, deps)
 	case "open":
 		return cmdOpen(args[1:], streams, deps)
+	case "restore":
+		return cmdRestore(args[1:], streams, deps)
 	case "recover":
 		return cmdRecover(args[1:], streams, deps)
 	case "forget":

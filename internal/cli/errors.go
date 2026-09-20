@@ -210,6 +210,42 @@ func classifyExitCode(err error) int {
 	if errors.As(err, &rebuild) {
 		return ExitRebuildFailed
 	}
+	// Live restore (`ebb restore`, D033): the pre-flight gates are
+	// blocks (nothing ran); an execution/protected-gate failure is the
+	// exit-6 outcome. A cancellation keeps its 130 semantics via the
+	// context check above (ErrLiveRestoreFailed unwraps to it).
+	var liveFailed *restore.ErrLiveRestoreFailed
+	if errors.As(err, &liveFailed) {
+		return ExitRebuildFailed
+	}
+	var nothing *restore.ErrNothingToRestore
+	if errors.As(err, &nothing) {
+		return ExitBlocked
+	}
+	var gitConflict *restore.ErrGitConflict
+	if errors.As(err, &gitConflict) {
+		return ExitBlocked
+	}
+	var branchMM *restore.ErrBranchMismatch
+	if errors.As(err, &branchMM) {
+		return ExitBlocked
+	}
+	var switchAdvice *restore.ErrBranchSwitchAdvice
+	if errors.As(err, &switchAdvice) {
+		return ExitBlocked
+	}
+	var already *restore.ErrAlreadyRestored
+	if errors.As(err, &already) {
+		return ExitBlocked
+	}
+	var stratReq *restore.ErrStrategyRequired
+	if errors.As(err, &stratReq) {
+		return ExitBlocked
+	}
+	var declined *restore.ErrRestoreDeclined
+	if errors.As(err, &declined) {
+		return ExitBlocked
+	}
 	// Vault/unlock/provider unavailable.
 	var noSource *vault.NoSourceError
 	if errors.As(err, &noSource) {
@@ -343,6 +379,34 @@ func safeActionFor(err error) string {
 	if errors.As(err, &rebuild) {
 		return fmt.Sprintf(". Safe action: the recovered files are intact at the destination and the snapshot stays pinned; resolve the blocker (install the missing toolchain, fix the action), then `ebb open --resume %s`",
 			rebuild.OperationID)
+	}
+	var liveFailed *restore.ErrLiveRestoreFailed
+	if errors.As(err, &liveFailed) {
+		return ". Safe action: whatever the recipes produced stays in place (nothing is undone); resolve the blocker and rerun `ebb restore` — a failed restore is resumable and package managers tolerate partial output directories"
+	}
+	var nothing *restore.ErrNothingToRestore
+	if errors.As(err, &nothing) {
+		return ". Safe action: run `ebb reclaim` or `ebb trim` first; restore re-creates what they removed"
+	}
+	var branchMM *restore.ErrBranchMismatch
+	if errors.As(err, &branchMM) {
+		return ". Safe action: rerun `ebb restore` in a terminal to choose (switch back / rebuild for the current branch / cancel), or run `git switch <recorded-branch>` yourself and rerun"
+	}
+	var switchAdvice *restore.ErrBranchSwitchAdvice
+	if errors.As(err, &switchAdvice) {
+		return ". Safe action: run the printed git command, then rerun `ebb restore`"
+	}
+	var already *restore.ErrAlreadyRestored
+	if errors.As(err, &already) {
+		return ". Safe action: nothing is wrong — the recorded groups' outputs are present; to force a fresh install, remove the output directories first"
+	}
+	var stratReq *restore.ErrStrategyRequired
+	if errors.As(err, &stratReq) {
+		return ". Safe action: rerun with --strategy merge (union manifests, live wins), current (run the live files) or baseline (revert inputs to the trim baseline), or in a terminal to choose interactively"
+	}
+	var declined *restore.ErrRestoreDeclined
+	if errors.As(err, &declined) {
+		return ". Safe action: nothing ran; rerun `ebb restore` when you have decided"
 	}
 	var cver *capsule.ErrVerification
 	if errors.As(err, &cver) {
