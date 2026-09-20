@@ -38,7 +38,16 @@ type trimGroupPlan struct {
 	Outputs []string
 	Inputs  []string
 	Reclaim []string
-	Members []domain.Entry
+	// LiveRecreate is the non-lockfile recreate argv (D033/D034),
+	// frozen into the removal manifest's recreate_live field.
+	LiveRecreate []string
+	Members      []domain.Entry
+	// Carved are the group's carve-out entries (D034): cancelling
+	// file/link entries captured as overlay patches. They are also
+	// appended to Members — the removal walk and its Recover resume
+	// must cover them like any member — while writeOverlayCopies emits
+	// their overlayPatchRecords for the restore side.
+	Carved []domain.Entry
 }
 
 // Trim executes the trim sequence over the live root: validate approvals,
@@ -117,6 +126,14 @@ func (c *Coordinator) Trim(ctx context.Context, vault VaultRef, root string, opt
 	}
 	if reasons := trimScanBlockers(st, opts.DoTrim); len(reasons) > 0 {
 		return cancel(&ErrDestructiveBlocked{Reasons: reasons})
+	}
+	// F53 evidence parity (D034): the CLI resolves routes over
+	// git-annotated entries; re-annotate this trim's own scan with the
+	// caller's git observation and re-resolve, so the authoritative plan
+	// sees the same cancellers the approval surface offered (and a
+	// Git-tracked file inside the outputs cancels the group here too).
+	if err := applyGitEvidence(st); err != nil {
+		return cancel(err)
 	}
 
 	// ---- Build the removal plan --------------------------------------
@@ -205,12 +222,15 @@ func (c *Coordinator) Trim(ctx context.Context, vault VaultRef, root string, opt
 
 	groups := make([]string, 0, len(plan))
 	cmds := make([][]string, 0, len(plan))
+	carved := make([]int, 0, len(plan))
 	for _, gp := range plan {
 		groups = append(groups, gp.GroupID)
 		cmds = append(cmds, gp.Reclaim)
+		carved = append(carved, len(gp.Carved))
 	}
 	res := st.result()
-	return TrimResult{Snapshot: res, Groups: groups, EntriesRemoved: removed, ReclaimCommands: cmds}, nil
+	return TrimResult{Snapshot: res, Groups: groups, EntriesRemoved: removed,
+		ReclaimCommands: cmds, CarvedEntries: carved}, nil
 }
 
 // trimRemoval removes the frozen member set from the live root. Every
@@ -244,6 +264,10 @@ func (c *Coordinator) trimRemoval(ctx context.Context, st *captureState) (int, e
 	var outputs []string
 	for _, gp := range st.trimPlan {
 		for _, e := range gp.Members {
+			// D034: carved entries are members too, so they JOIN the
+			// permit's allowed set here — each is re-digested (or, for
+			// links, re-verified by target text) immediately before its
+			// removal, exactly like every other member.
 			allowed[e.Path] = e
 		}
 		outputs = append(outputs, gp.Outputs...)
@@ -273,6 +297,16 @@ func (c *Coordinator) trimRemoval(ctx context.Context, st *captureState) (int, e
 // inventory. A group with zero members is skipped (returned separately);
 // zero members across ALL requested groups fails the operation (nothing
 // would be removed — never a no-op trim masquerading as success).
+//
+// D034 carve-out: a requested group that policy cancelled (F53) may be
+// carved instead of refused, but ONLY when opts.CarveOut carries the
+// recorded consent. The cancelling file/link entries become overlay
+// patches (captured into the op dir and sealed with P) and join the
+// member set; the clean bulk under the outputs is removed normally.
+// Without consent — or when the carve is refused (un-carve-able entry,
+// budget or case collision) — the group is blocked exactly as before,
+// with text that names the missing --carve-out authorization or the
+// honest refusal reason.
 func buildTrimPlan(st *captureState, groupIDs []string) (plan []trimGroupPlan, skipped []string, err error) {
 	decisions := make(map[string]bool, len(st.resolved.Groups))
 	reasons := make(map[string]string, len(st.resolved.Groups))
@@ -288,7 +322,21 @@ func buildTrimPlan(st *captureState, groupIDs []string) (plan []trimGroupPlan, s
 	var blocked []string
 	for _, id := range groupIDs {
 		if applicable, ok := decisions[id]; ok && !applicable {
-			blocked = append(blocked, fmt.Sprintf("regenerate group %s is not applicable for removal: %s", id, reasons[id]))
+			cls := classifyCarveOut(st.entries, policyGroupByID(st.opts.Policy, id).Outputs)
+			switch {
+			case st.opts.CarveOut:
+				if r := carvePlanBlocker(id, cls); r != "" {
+					blocked = append(blocked, r)
+				}
+			case len(cls.Refusals) > 0:
+				blocked = append(blocked, fmt.Sprintf(
+					"regenerate group %s is not applicable for removal: %s; carve-out refused: %s",
+					id, reasons[id], strings.Join(cls.Refusals, "; ")))
+			default:
+				blocked = append(blocked, fmt.Sprintf(
+					"regenerate group %s is not applicable for removal: %s; carve-out consent was not given (D034): rerun with --carve-out (or answer the interactive carve confirmation) to capture the cancelling entries as an overlay patch and remove them after capture",
+					id, reasons[id]))
+			}
 		}
 	}
 	if len(blocked) > 0 {
@@ -300,11 +348,23 @@ func buildTrimPlan(st *captureState, groupIDs []string) (plan []trimGroupPlan, s
 		gp := trimGroupPlan{
 			GroupID: id, Adapter: string(g.Adapter), Root: g.Root,
 			Outputs: g.Outputs, Inputs: g.Inputs, Reclaim: reclaimCommand(g),
+			LiveRecreate: liveRecreateCommand(g),
 		}
-		for _, e := range st.entries {
-			if e.Route == domain.RouteReconstruct && groupOf(e) == id {
-				gp.Members = append(gp.Members, e)
+		if decisions[id] {
+			for _, e := range st.entries {
+				if e.Route == domain.RouteReconstruct && groupOf(e) == id {
+					gp.Members = append(gp.Members, e)
+				}
 			}
+		} else {
+			// Carve-out group (consent checked above): the clean bulk
+			// plus the carved cancellers are the removal members; the
+			// canceller entries additionally become overlay patches.
+			cls := classifyCarveOut(st.entries, g.Outputs)
+			gp.Members = append(gp.Members, cls.Bulk...)
+			gp.Members = append(gp.Members, cls.Carved...)
+			domain.SortEntries(gp.Members)
+			gp.Carved = cls.Carved
 		}
 		if len(gp.Members) == 0 {
 			skipped = append(skipped, id)
@@ -348,9 +408,11 @@ func trimScanBlockers(st *captureState, groupIDs []string) []string {
 }
 
 // writeTrimOpDir writes the trim op dir: manifest.json (scope
-// trim-removal-plan), removal-manifest.json (the frozen plan), policy.toml
-// and byte-copies of each group's recipe inputs. It contains ONLY these —
-// a trim does not capture the whole workspace (§17.3).
+// trim-removal-plan), removal-manifest.json (the frozen plan, including
+// any D034 overlay patches and the recreate_live argv), policy.toml and
+// byte-copies of each group's recipe inputs plus each group's carved
+// overlay entries. It contains ONLY these — a trim does not capture the
+// whole workspace (§17.3).
 func (c *Coordinator) writeTrimOpDir(st *captureState) error {
 	if err := os.MkdirAll(st.opDir, 0o700); err != nil {
 		return fmt.Errorf("lifecycle: op dir: %w", err)
@@ -370,6 +432,19 @@ func (c *Coordinator) writeTrimOpDir(st *captureState) error {
 		if err != nil {
 			return err
 		}
+		overlays, err := writeOverlayCopies(st, gp)
+		if err != nil {
+			return err
+		}
+		if len(overlays) > 0 {
+			var carvedBytes int64
+			for _, e := range gp.Carved {
+				carvedBytes += e.LogicalSize
+			}
+			st.warnings = append(st.warnings, fmt.Sprintf(
+				"carve-out (D034): %d entr(y/ies) (%d bytes) of group %s captured to the vault overlay and removed with the group; restore reapplies them after the recreate recipe",
+				len(overlays), carvedBytes, gp.GroupID))
+		}
 		members := make([]inventoryRecord, 0, len(gp.Members))
 		for _, e := range gp.Members {
 			members = append(members, inventoryRecord{Entry: e, Group: gp.GroupID})
@@ -378,6 +453,7 @@ func (c *Coordinator) writeTrimOpDir(st *captureState) error {
 			GroupID: gp.GroupID, Adapter: gp.Adapter, Root: gp.Root,
 			Outputs: gp.Outputs, ReclaimCommand: gp.Reclaim,
 			RecipeInputs: inputs, Members: members,
+			OverlayPatches: overlays, RecreateLive: gp.LiveRecreate,
 		})
 	}
 	doc := trimPlanDoc{

@@ -18,7 +18,8 @@
 //
 // Exit contract: 0 trimmed; 2 usage (missing --groups, groups not
 // declared by the policy, bad Ebbfile); 3 blocked (group not applicable
-// for removal, scan blockers inside outputs, declined confirmation); 4
+// for removal, scan blockers inside outputs, declined confirmation, a
+// declined or unauthorized carve-out (D034)); 4
 // plan verification failure; 5 removal blocked mid-walk (TRIM_SEALING;
 // reconcile with `ebb recover <op>`); 7 vault; 130 cancelled.
 
@@ -30,6 +31,7 @@ import (
 	"strings"
 
 	"ebb/internal/catalog"
+	"ebb/internal/domain"
 	"ebb/internal/lifecycle"
 	"ebb/internal/policy"
 )
@@ -44,6 +46,9 @@ type trimDetails struct {
 	ReclaimCommands  [][]string `json:"reclaim_commands"`
 	EntriesPreserved int64      `json:"entries_preserved"`
 	EntriesOmitted   int64      `json:"entries_omitted"`
+	// CarvedEntries counts D034 overlay-patch entries per group
+	// (aligned with Groups; omitted shapes report zero).
+	CarvedEntries []int `json:"carved_entries,omitempty"`
 }
 
 func cmdTrim(args []string, streams Streams, deps Deps) int {
@@ -52,6 +57,8 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
 	groupsFlag := fs.String("groups", "", "comma-separated regenerate group ids to remove (declared by the Ebbfile; required)")
 	yes := fs.Bool("yes", false, "accept the removal confirmation without a prompt (NEVER supplies the writer assertion)")
+	carveOutFlag := fs.Bool("carve-out", false,
+		"authorize granular carve-out (D034): capture preserved/tracked entries inside the trimmed groups as vault overlay patches, then remove them with the bulk (headless runs need this together with --yes; interactive runs confirm separately)")
 	assertStopped := fs.Bool("assert-writers-stopped", false,
 		"assert all writers of the trimmed groups are stopped (Foundation §17.3 via §17.2; recorded in the trim manifest's consistency source)")
 	if err := fs.Parse(reorderFlags(args, "groups")); err != nil {
@@ -127,6 +134,31 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 	}
 
 	opts.DoTrim = groups
+	// F53 evidence parity (D034): hand lifecycle the git-index
+	// observation this command already annotated, so its authoritative
+	// plan sees the same cancellers the offers below were derived from.
+	opts.GitTrackedPaths = gitTrackedPathsOf(disc.Entries)
+	// ---- D034 carve-out consent (no silent carve, ever) ----------------
+	// A carve means files that were preserved now get removed after
+	// capture; that material change needs its own explicit yes.
+	if *carveOutFlag {
+		opts.CarveOut = true
+	} else if offers := eligibleCarveOffers(disc.Resolved, groups); len(offers) > 0 {
+		ids := carveOfferIDs(offers)
+		if deps.StdinIsTerminal != nil && deps.StdinIsTerminal() {
+			fmt.Fprint(streams.Err, carveApprovalText(disc.Root, offers))
+			if !confirmYes(deps, streams.Err, "") {
+				return emitFailure(env, *jsonOut, streams, ExitBlocked, fmt.Sprintf(
+					"%s [trim]: the carve-out confirmation for group(s) %s was declined; nothing was removed. Safe action: rerun `ebb trim --groups %s` and answer the carve confirmation, or add --carve-out to pre-authorize it",
+					CodeApprovalDeclined, strings.Join(ids, ","), strings.Join(groups, ",")))
+			}
+			opts.CarveOut = true
+		} else {
+			return emitFailure(env, *jsonOut, streams, ExitBlocked, fmt.Sprintf(
+				"%s [trim]: group(s) %s are cancelled by preserved entries inside their outputs; a carve-out (capture to vault, then remove) needs explicit authorization that stdin cannot give. Safe action: rerun with --yes --carve-out after reviewing the entries, or run in a terminal and confirm the carve prompt",
+				CodeApprovalRequired, strings.Join(ids, ",")))
+		}
+	}
 	// §17.2/§17.3 writer-assertion passthrough: recorded truthfully in
 	// the trim manifest's consistency source when the explicit flag is
 	// supplied; never sourced from --yes (group approval is not a writer
@@ -168,12 +200,16 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 		ReclaimCommands:  res.ReclaimCommands,
 		EntriesPreserved: res.Snapshot.EntriesPreserved,
 		EntriesOmitted:   res.Snapshot.EntriesOmitted,
+		CarvedEntries:    res.CarvedEntries,
 	}
 	env.Outcome = "ok"
 	env.Phase = catalog.PhaseTrimDone
 	env.WorkspaceID = string(sess.resolveWorkspaceID(opts.WorkspaceName, disc.Root))
 	env.SnapshotID = details.SnapshotID
 	env.Conditions = []string{"trim-approval:" + strings.Join(groups, ",")}
+	if opts.CarveOut {
+		env.Conditions = append(env.Conditions, "carve-out-consent")
+	}
 	if opts.WriterAssertion != "" {
 		env.Conditions = append(env.Conditions, "writer-assertion:"+opts.WriterAssertion)
 	}
@@ -218,8 +254,141 @@ func declaredGroupList(p policy.Policy) string {
 	return strings.Join(ids, ", ")
 }
 
+// ---- D034 carve-out approval surface (shared by trim and reclaim) -----
+
+// carveOffer is one cancelled group's carve-out proposal for the
+// approval surface: the carve-able canceller entries plus the honest
+// blocker when the group cannot be carved at all.
+type carveOffer struct {
+	Group      string
+	Candidates []lifecycle.CarveCandidate
+	Refusals   []string
+	// Eligible: the group is cancelled and a carve would be accepted
+	// (carve-able entries within budgets — possibly zero of them when
+	// the only cancellers are directories).
+	Eligible bool
+	// Blocker names the refusal/budget reason when not eligible.
+	Blocker string
+}
+
+// carveOfferFor derives one group's offer from the resolved policy.
+// ok is false when the group is not cancelled (no carve question).
+func carveOfferFor(res policy.Resolved, groupID string) (carveOffer, bool) {
+	found := false
+	for _, d := range res.Groups {
+		if d.ID == groupID {
+			found = true
+			if d.Applicable || !d.Cancelled {
+				return carveOffer{}, false
+			}
+		}
+	}
+	if !found {
+		return carveOffer{}, false
+	}
+	cands, refusals := lifecycle.CarveOutCandidates(res, groupID)
+	o := carveOffer{Group: groupID, Candidates: cands, Refusals: refusals}
+	var total int64
+	for _, c := range cands {
+		total += c.Bytes
+	}
+	switch {
+	case len(refusals) > 0:
+		o.Blocker = "carve-out refused: " + strings.Join(refusals, "; ")
+	case len(cands) > lifecycle.CarveOutMaxEntries:
+		o.Blocker = fmt.Sprintf("carve-out exceeds the entry budget (%d > %d)", len(cands), lifecycle.CarveOutMaxEntries)
+	case total > lifecycle.CarveOutMaxBytes:
+		o.Blocker = fmt.Sprintf("carve-out exceeds the byte budget (%s > %s)", HumanBytes(total), HumanBytes(lifecycle.CarveOutMaxBytes))
+	default:
+		o.Eligible = true
+	}
+	return o, true
+}
+
+// eligibleCarveOffers returns the consent-worthy offers for the given
+// requested groups (cancelled AND carve-able). Budget/refusal blockers
+// are left to lifecycle's authoritative text.
+func eligibleCarveOffers(res policy.Resolved, groups []string) []carveOffer {
+	var out []carveOffer
+	for _, id := range groups {
+		if o, ok := carveOfferFor(res, id); ok && o.Eligible {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// eligibleCarveGroupIDs lists the resolved groups a carve-out offer
+// exists for (cancelled AND carve-able), regardless of what the caller
+// requested — reclaim uses this to add carve stages the planner's
+// whole-group semantics cannot propose.
+func eligibleCarveGroupIDs(res policy.Resolved) []string {
+	var ids []string
+	for _, d := range res.Groups {
+		if o, ok := carveOfferFor(res, d.ID); ok && o.Eligible {
+			ids = append(ids, o.Group)
+		}
+	}
+	return ids
+}
+
+func carveOfferIDs(offers []carveOffer) []string {
+	ids := make([]string, 0, len(offers))
+	for _, o := range offers {
+		ids = append(ids, o.Group)
+	}
+	return ids
+}
+
+// gitTrackedPathsOf extracts the git:tracked paths from the discovery
+// entries (the CLI annotated exactly these tokens before resolving);
+// lifecycle re-applies them to its own scan so both sides classify the
+// same F53 cancellers.
+func gitTrackedPathsOf(entries []domain.Entry) []string {
+	var out []string
+	for _, e := range entries {
+		for _, ev := range e.Evidence {
+			if ev == "git:tracked" {
+				out = append(out, e.Path)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// carveApprovalText renders the typed carve-out confirmation: every
+// carved path with its size and the honest "captured to vault, then
+// removed" treatment (a carve removes files that were preserved — the
+// material change being confirmed).
+func carveApprovalText(root string, offers []carveOffer) string {
+	var b strings.Builder
+	var totalN int
+	var totalBytes int64
+	for _, o := range offers {
+		totalN += len(o.Candidates)
+		for _, c := range o.Candidates {
+			totalBytes += c.Bytes
+		}
+	}
+	fmt.Fprintf(&b, "Carve-out (D034): the group(s) below are cancelled by preserved entries inside their outputs.\n")
+	fmt.Fprintf(&b, "Each listed entry is captured to the vault as an overlay patch, then REMOVED with the group's bulk:\n")
+	for _, o := range offers {
+		fmt.Fprintf(&b, "  group %s (%d file(s)/link(s)):\n", o.Group, len(o.Candidates))
+		for _, c := range o.Candidates {
+			fmt.Fprintf(&b, "    - %s (%s) [captured to vault, then removed]\n", c.Path, HumanBytes(c.Bytes))
+		}
+		if len(o.Candidates) == 0 {
+			fmt.Fprintf(&b, "    (no file content to carve; only the cancelling directories, which the recreate recipe rebuilds)\n")
+		}
+	}
+	fmt.Fprintf(&b, "carve out %d file(s) (%s) from group(s) %s under %s and remove them after capture? type 'yes': ",
+		totalN, HumanBytes(totalBytes), strings.Join(carveOfferIDs(offers), ","), root)
+	return b.String()
+}
+
 // renderTrimHuman renders the trim completion report (§17.3: groups
-// removed + commands required to recreate them).
+// removed + commands required to recreate them; D034 carve reporting).
 func renderTrimHuman(d trimDetails) string {
 	var b strings.Builder
 	line := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
@@ -230,6 +399,9 @@ func renderTrimHuman(d trimDetails) string {
 			cmdLine = strings.Join(d.ReclaimCommands[i], " ")
 		}
 		line("  removed group %s; recreate with: %s\n", g, cmdLine)
+		if i < len(d.CarvedEntries) && d.CarvedEntries[i] > 0 {
+			line("    carved %d preserved file(s)/link(s) to the vault overlay (D034); restore reapplies them after the recreate recipe\n", d.CarvedEntries[i])
+		}
 	}
 	line("  entries removed: %d\n", d.EntriesRemoved)
 	line("  removal plan retained: snapshot %s (pinned)\n", d.SnapshotID)

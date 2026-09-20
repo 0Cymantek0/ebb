@@ -78,6 +78,11 @@ func TestTrimRoundTrip(t *testing.T) {
 	if !equalStrings(g.ReclaimCommand, []string{"pnpm", "install", "--frozen-lockfile"}) {
 		t.Errorf("plan reclaim command = %v", g.ReclaimCommand)
 	}
+	// D034/D033: every new trim manifest records the live (drift-
+	// reconcilable) recreate argv for ecosystem adapters.
+	if !equalStrings(g.RecreateLive, []string{"pnpm", "install"}) {
+		t.Errorf("plan recreate_live = %v, want [pnpm install]", g.RecreateLive)
+	}
 	if len(g.Members) != 7 {
 		t.Errorf("plan members = %d, want 7", len(g.Members))
 	}
