@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"ebb/internal/adapters/ecosystem"
+	"ebb/internal/analyse"
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 	"ebb/internal/lifecycle"
@@ -116,6 +117,22 @@ type Deps struct {
 	// A cancellation maps to exit 130 with the journal keeping the last
 	// durable phase (Foundation §17.5).
 	NewSignalContext func() (context.Context, func())
+
+	// ---- analyse seams (Wave 2; nil = honest degrade with a warning) ----
+
+	// AnalyseGitSurvey is the workspace-topology surveyor behind `ebb
+	// analyse` (production: the gitadapter-backed SurveyRepo; Wave 2
+	// WB). nil degrades analyse to non-git facts with one warning.
+	AnalyseGitSurvey analyse.GitSurveyor
+	// AnalyseDocker is the workspace-correlated Docker tier engine
+	// behind `ebb analyse --docker` (production: Wave 2 WC). nil or an
+	// engine reporting Available=false degrades with a warning.
+	AnalyseDocker analyse.DockerEngine
+	// AnalyseLockProbe is the handle-listing lock probe used by
+	// analyse's per-project [LOCKED] evidence (production: an adapter
+	// over platform.WriterInspector / the Restart Manager). nil falls
+	// back to the open-probe; either way it is best-effort.
+	AnalyseLockProbe analyse.LockProbe
 }
 
 // ErrNotIntegrated marks seams that are not wired (a zero-value Deps);
@@ -229,6 +246,8 @@ func Main(args []string, streams Streams, deps Deps) int {
 		return cmdDelete(args[1:], streams, deps)
 	case "config":
 		return cmdConfig(args[1:], streams, deps)
+	case "analyse", "analyze":
+		return cmdAnalyse(args[1:], streams, deps)
 	case "verify":
 		return cmdVerify(args[1:], streams, deps)
 	case "export":
@@ -319,6 +338,8 @@ commands:
   import <file>               register a capsule's snapshot into a vault without opening it
                              (the snapshot stays pinned; imported approvals start empty)
   status [workspace]         show local recorded state (workspaces, snapshots, operations)
+  analyse [path]             scan parent roots (config projects_dir, or the given directory) and
+                             recommend reclamation per project (alias: analyze; read-only)
   doctor                     report supported capabilities and configuration problems
 
 common flags:
@@ -364,6 +385,14 @@ delete flags:
 config subcommands:
   list | get <key> | set <key> <value> | add <key> <value> | remove <key> <value>
                             v1 key: projects_dir (list-valued absolute scan roots for "ebb analyse")
+
+analyse flags:
+  --docker                   append the Docker tier analysis (read-only; workspace-correlated)
+  --reclaim-stale            act on stale unshielded projects via ebb reclaim (print-only without --yes
+                            or a per-item typed confirmation; the projects' own safety gates stay in charge)
+  --prune-worktrees          act on merged+clean unshielded worktrees via native git worktree remove
+                            (print-only without --yes or a per-item typed confirmation)
+  --yes                      accept batch execution prompts (never answers writer assertions or park escalations)
 
 
 recover flags:

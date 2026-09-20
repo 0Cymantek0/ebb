@@ -21,6 +21,7 @@ import (
 
 	"ebb/internal/adapters/ecosystem"
 	gitadapter "ebb/internal/adapters/git"
+	"ebb/internal/analyse"
 	"ebb/internal/catalog"
 	"ebb/internal/cli/tui"
 	"ebb/internal/domain"
@@ -40,8 +41,14 @@ import (
 // lifecycle/restore constructors, ecosystem detection) and the terminal
 // environment (stdin-tty detection, line reading, SIGINT/SIGTERM
 // context).
+//
+// Wave 2 analyse seams: the lock probe adapts the native
+// platform.WriterInspector (Restart Manager on Windows). The git
+// survey and docker engine seams stay nil until their Wave 2 adapters
+// land (WB/WC); `ebb analyse` degrades honestly with a warning in the
+// meantime and the orchestrator wires them at merge.
 func RealDeps() Deps {
-	return Deps{
+	deps := Deps{
 		NewProbe:   platform.New,
 		ObserveGit: gitadapter.Observe,
 		GitTracked: gitadapter.TrackedFiles,
@@ -99,6 +106,30 @@ func RealDeps() Deps {
 			return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		},
 	}
+	// Analyse lock probe: the native writer inspector when the platform
+	// offers one (Restart Manager); absent capabilities degrade to the
+	// engine's open probe (never a false [LOCKED]).
+	if insp, err := platform.NewWriterInspector(); err == nil {
+		deps.AnalyseLockProbe = writerInspectorAsLockProbe{insp}
+	}
+	return deps
+}
+
+// writerInspectorAsLockProbe adapts platform.WriterInspector to
+// analyse.LockProbe (the analyse package stays platform-neutral; the
+// CLI owns the injection).
+type writerInspectorAsLockProbe struct{ insp platform.WriterInspector }
+
+func (a writerInspectorAsLockProbe) InspectWriters(paths []string) ([]analyse.LockWriter, error) {
+	writers, err := a.insp.InspectWriters(paths)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]analyse.LockWriter, 0, len(writers))
+	for _, w := range writers {
+		out = append(out, analyse.LockWriter{Name: w.Name, PID: w.PID})
+	}
+	return out, nil
 }
 
 // cliError carries the process exit code for a pipeline failure so the
