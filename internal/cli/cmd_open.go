@@ -45,15 +45,85 @@ import (
 	"flag"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"ebb/internal/actions"
 	"ebb/internal/actions/approvalstore"
 	"ebb/internal/catalog"
+	"ebb/internal/cli/tui"
 	"ebb/internal/domain"
 	"ebb/internal/platform"
 	"ebb/internal/restore"
 )
+
+// WorkspaceChoice is one row of the bare-`ebb open` picker (D032).
+type WorkspaceChoice struct {
+	Name   string
+	Detail string
+	Right  string
+}
+
+// pickParkedWorkspace runs the D032 bare-invocation picker over the
+// catalog's parked workspaces. handled=false means no picker interaction
+// is possible (the caller reports its own failure); handled=true with an
+// empty name means an exit code was already emitted (cancel 130, blocked
+// 3); otherwise the returned name is the chosen open target.
+func pickParkedWorkspace(ctx context.Context, deps Deps, sess *session, streams Streams) (string, int, bool) {
+	wss, err := sess.cat.ListWorkspaces()
+	if err != nil {
+		fmt.Fprintf(streams.Err, "ebb open: listing workspaces: %v\n", err)
+		return "", ExitBlocked, true
+	}
+	var rows []WorkspaceChoice
+	for _, w := range wss {
+		if w.Status != catalog.WorkspaceParked {
+			continue
+		}
+		detail := w.RootPath
+		if detail == "" {
+			if orig := originalRootOf(sess.cat, w.ID); orig != "" {
+				detail = "original: " + orig
+			} else {
+				detail = "no recorded root (open with --to)"
+			}
+		}
+		rows = append(rows, WorkspaceChoice{Name: w.Name, Detail: detail, Right: "parked"})
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(streams.Err, "ebb open: no parked workspaces recorded; pass a workspace name or snapshot id (see `ebb status`)")
+		return "", ExitBlocked, true
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	idx, perr := deps.PickWorkspace(ctx, "Ebb: select parked workspace to open", rows, streams.Err)
+	if perr != nil {
+		if errors.Is(perr, tui.ErrCanceled) {
+			fmt.Fprintln(streams.Err, "ebb open: canceled")
+			return "", ExitCancelled, true
+		}
+		fmt.Fprintf(streams.Err, "ebb open: workspace picker unavailable (%v); pass a workspace name or snapshot id\n", perr)
+		return "", ExitBlocked, true
+	}
+	return rows[idx].Name, ExitOK, true
+}
+
+// originalRootOf returns the workspace's best-evidence original root for
+// an unbound (parked) workspace: the latest park operation's journaled
+// source root (ListOperations is updated_at-ascending, so the last match
+// is the newest). Empty when no park op recorded a root.
+func originalRootOf(cat *catalog.Catalog, wsID domain.WorkspaceID) string {
+	ops, err := cat.ListOperations(wsID)
+	if err != nil {
+		return ""
+	}
+	root := ""
+	for _, op := range ops {
+		if op.Kind == catalog.OpKindPark && op.SourceRoot != "" {
+			root = op.SourceRoot
+		}
+	}
+	return root
+}
 
 // openDetails is the --json payload of a completed open.
 type openDetails struct {
@@ -93,7 +163,16 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 	if err := fs.Parse(reorderFlags(args, "to")); err != nil {
 		return ExitUsage
 	}
-	if fs.NArg() != 1 {
+	if fs.NArg() > 1 {
+		fmt.Fprintln(streams.Err, "ebb open: takes exactly one argument: a workspace name, a snapshot id (32 hex chars), or with --resume/--cancel an operation id")
+		return ExitUsage
+	}
+	// D032 bare invocation: no target + interactive terminal + not machine
+	// mode → the parked-workspace picker. Everything else keeps the
+	// ordinary usage error below, exactly as before.
+	barePick := fs.NArg() == 0 && !*resume && !*cancel && !*jsonOut &&
+		deps.PickWorkspace != nil && deps.StdinIsTerminal != nil && deps.StdinIsTerminal()
+	if fs.NArg() == 0 && !barePick {
 		fmt.Fprintln(streams.Err, "ebb open: takes exactly one argument: a workspace name, a snapshot id (32 hex chars), or with --resume/--cancel an operation id")
 		return ExitUsage
 	}
@@ -101,7 +180,6 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 		fmt.Fprintln(streams.Err, "ebb open: --resume and --cancel are mutually exclusive")
 		return ExitUsage
 	}
-	target := fs.Arg(0)
 
 	env := newEnvelope("open", "error")
 	sess, err := openSession(deps)
@@ -111,6 +189,17 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 	defer sess.close()
 	ctx, stop := commandContext(deps)
 	defer stop()
+
+	var target string
+	if fs.NArg() == 1 {
+		target = fs.Arg(0)
+	} else {
+		picked, code, handled := pickParkedWorkspace(ctx, deps, sess, streams)
+		if !handled || picked == "" {
+			return code
+		}
+		target = picked
+	}
 
 	if *resume || *cancel {
 		return runOpenRecovery(env, *jsonOut, streams, deps, sess, ctx, target, *resume, *yes)
@@ -127,11 +216,18 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 	dest := strings.TrimSpace(*to)
 	if dest == "" {
 		if wsRow.RootPath == "" {
+			// Parked workspaces are unbound by design (§16.5), but the
+			// park operation's journal still records the original root —
+			// the D032 default destination ("original location").
+			dest = originalRootOf(sess.cat, wsRow.ID)
+		} else {
+			dest = wsRow.RootPath
+		}
+		if dest == "" {
 			return emitFailure(env, *jsonOut, streams, ExitUsage, fmt.Sprintf(
 				"%s: workspace %q has no recorded root path (parked or unbound) and --to was not given. Safe action: pass --to <dir> with the destination directory",
 				CodeOpenNoDestination, wsRow.Name))
 		}
-		dest = wsRow.RootPath
 	}
 	absDest, aerr := filepath.Abs(dest)
 	if aerr != nil {

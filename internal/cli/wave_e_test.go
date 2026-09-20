@@ -373,6 +373,10 @@ func newEHarness(t *testing.T) *eHarness {
 	// explicitly via cancelSig (a stop that canceled would poison
 	// later runs in the same harness).
 	deps.NewSignalContext = func() (context.Context, func()) { return h.ctx, func() {} }
+	// The real picker reads os.Stdin; a test that wants the D032 bare-open
+	// flow stubs this seam explicitly. Default: bare `open` degrades to
+	// the ordinary usage error, never a blocked terminal read.
+	deps.PickWorkspace = nil
 	h.deps = deps
 	return h
 }

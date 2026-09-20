@@ -523,16 +523,51 @@ func TestOpenUnknownTarget(t *testing.T) {
 	assertBlocker(t, stderr, CodeOpenUnknownTarget, "ebb status")
 }
 
-func TestOpenParkedWithoutToRequiresDestination(t *testing.T) {
+func TestOpenParkedWithoutToFallsBackToOriginalRoot(t *testing.T) {
 	h := newEHarness(t)
 	if code, _, _ := h.run("park", "--assert-writers-stopped", h.wsRoot); code != ExitOK {
 		t.Fatal("park failed")
 	}
-	code, _, stderr := h.run("open", "cliws")
-	if code != ExitUsage {
-		t.Fatalf("code = %d, want %d", code, ExitUsage)
+	// D032: no --to → the park operation's journaled source root is the
+	// default destination ("original location"); the workspace row itself
+	// is unbound after park (§16.5).
+	code, _, stderr := h.run("open", "cliws", "--files-only")
+	if code != ExitOK {
+		t.Fatalf("code = %d, stderr = %s", code, stderr)
 	}
-	assertBlocker(t, stderr, CodeOpenNoDestination, "--to")
+	if b, err := os.ReadFile(filepath.Join(h.wsRoot, "notes.md")); err != nil || !strings.Contains(string(b), "private notes") {
+		t.Fatalf("notes.md not restored at the original root: %v", err)
+	}
+}
+
+// The fallback needs durable evidence: no park operation root recorded →
+// no destination guess (pinned at the helper contract level).
+func TestOpenOriginalRootFallbackNeedsEvidence(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cat, err := catalog.Open(filepath.Join(state, "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	ws := domain.NewID()
+	if err := cat.EnsureWorkspace(domain.WorkspaceID(ws), "evidencews"); err != nil {
+		t.Fatal(err)
+	}
+	if got := originalRootOf(cat, domain.WorkspaceID(ws)); got != "" {
+		t.Fatalf("empty journal returned %q", got)
+	}
+	opID, err := cat.BeginOperation(domain.WorkspaceID(ws), catalog.OpKindPark,
+		filepath.Join(t.TempDir(), "orig-root"), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = opID
+	if got := originalRootOf(cat, domain.WorkspaceID(ws)); got == "" {
+		t.Fatal("park op source root not recovered")
+	}
 }
 
 // ---- recover + signal cancel ----------------------------------------------

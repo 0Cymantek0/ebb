@@ -22,6 +22,7 @@ import (
 	"ebb/internal/adapters/ecosystem"
 	gitadapter "ebb/internal/adapters/git"
 	"ebb/internal/catalog"
+	"ebb/internal/cli/tui"
 	"ebb/internal/domain"
 	"ebb/internal/inventory"
 	"ebb/internal/lifecycle"
@@ -68,6 +69,17 @@ func RealDeps() Deps {
 		NewRestoreOp: restore.New,
 		DetectEcosystem: func(root string) (ecosystem.Detection, error) {
 			return ecosystem.Detect(root)
+		},
+		PickWorkspace: func(ctx context.Context, title string, rows []WorkspaceChoice, out io.Writer) (int, error) {
+			trows := make([]tui.Row, len(rows))
+			for i, r := range rows {
+				trows[i] = tui.Row{Label: r.Name, Detail: r.Detail, Right: r.Right}
+			}
+			return tui.Select(ctx, tui.StdioTerminal(os.Stdin, out), tui.SelectModel{
+				Title:  title,
+				Rows:   trows,
+				Footer: []string{"↑/↓ navigate", "Enter open", "Esc cancel"},
+			})
 		},
 		StdinIsTerminal: statModelessTTY,
 		ReadLine: func() (string, error) {

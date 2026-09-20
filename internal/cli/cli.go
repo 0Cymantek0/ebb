@@ -97,6 +97,12 @@ type Deps struct {
 	// over a workspace root (production: ecosystem.Detect). Used by
 	// `ebb init` for SUGGESTIONS; never writes an Ebbfile.
 	DetectEcosystem func(root string) (ecosystem.Detection, error)
+	// PickWorkspace renders the D032 interactive workspace picker on a
+	// terminal for bare `ebb open` (production: internal/cli/tui Select).
+	// nil — or a caller that already verified stdin is not a terminal —
+	// degrades bare invocations to the ordinary usage error. Returns the
+	// selected row index; tui.ErrCanceled maps to exit 130.
+	PickWorkspace func(ctx context.Context, title string, rows []WorkspaceChoice, out io.Writer) (int, error)
 	// StdinIsTerminal reports whether stdin is an interactive terminal
 	// (production: os.Stdin.Stat() mode check). Interactive prompts are
 	// gated on it; a non-terminal stdin NEVER blocks on reading.
@@ -298,6 +304,12 @@ commands:
   reclaim [path] --target N  plan and execute the least disruptive sufficient release: trim, then park only if needed
   open <name-or-snapshot-id> [--to dir]
                              recover a parked/captured workspace (files-only in v1)
+                             (bare "ebb open" on a terminal offers an interactive picker)
+  restore [path]             recreate trimmed dependencies in place on a live workspace
+                             (the inverse of reclaim; git-gated, drift-reconciled)
+  delete <name-or-snapshot-id>
+                             end recovery obligations AND prune freed vault storage in one action
+  config <subcommand>        manage global settings (projects_dir scan roots for analyse)
   recover <operation-id>     reconcile an interrupted operation from durable evidence
   forget <snapshot-id>       deliberately end a snapshot's recovery obligation (explicit confirmation)
   gc <vault>                 reclaim vault storage no snapshot references anymore (backend prune; never removes snapshots)
@@ -336,6 +348,23 @@ open flags:
   --yes                      record approvals for not-yet-approved reconstruction actions without a prompt (never covers approval drift)
   --resume <op-or-workspace> resume the rebuild of an interrupted open (reruns only actions without a recorded success)
   --cancel <op-or-workspace> cancel a REBUILD_FAILED/REBUILDING open operation (files stay; snapshot stays pinned)
+
+restore flags:
+  --strategy merge|current|baseline
+                            resolve recipe-input drift non-interactively (merge: safety backup +
+                            top-level manifest union, native tool resolves; current: rebuild live
+                            manifests; baseline: revert to the frozen copies)
+  --dry-run                  report the selected trim, commands, drift table and overlays without effects
+
+delete flags:
+  --yes                      accept the typed-target confirmation without a prompt
+  --last-of-parked           acknowledge deleting the ONLY snapshot of a parked workspace
+  --dry-run                  show what would be unpinned/forgotten/pruned without mutating anything
+
+config subcommands:
+  list | get <key> | set <key> <value> | add <key> <value> | remove <key> <value>
+                            v1 key: projects_dir (list-valued absolute scan roots for "ebb analyse")
+
 
 recover flags:
   --resume-removal           explicitly resume a blocked/interrupted removal walk
