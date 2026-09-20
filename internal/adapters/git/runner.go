@@ -60,6 +60,23 @@ var allowedArgv = [][]string{
 	{"remote", "-v"},
 	{"worktree", "list", "--porcelain"},
 	{"ls-files", "--stage"}, // never `ls-files -m` (fires clean filters; lab/git-probe)
+	// Survey verbs (D037 repository survey; survey.go). Every shape is
+	// FULLY FIXED: no repository-controlled data (branch names, remote
+	// names, paths) ever enters argv, so hostile spellings cannot alter
+	// option parsing — verdicts over a variable ref use the fixed
+	// literals @{u}, main and master. All three verbs are plumbing that
+	// walk objects/refs only: no index refresh, no worktree file reads,
+	// no clean/smudge filters. `git show` was deliberately NOT added:
+	// the log-family porcelain honors log.showSignature, a
+	// config-execution knob outside the D004 neutralization set, and
+	// rev-list --format=%at yields the same fact without that surface.
+	{"rev-parse", "--symbolic-full-name", "@{u}"},
+	{"merge-base", "--is-ancestor", "HEAD", "@{u}"},
+	{"merge-base", "--is-ancestor", "HEAD", "main"},
+	{"merge-base", "--is-ancestor", "HEAD", "master"},
+	{"rev-list", "--count", "@{u}..HEAD"},
+	{"rev-list", "-1", "--format=%at", "HEAD"},
+	{"for-each-ref", "--merged=HEAD", "--format=%(refname)", "refs/heads/"},
 }
 
 // errNotAllowlisted reports an argv outside the D004 allowlist.
