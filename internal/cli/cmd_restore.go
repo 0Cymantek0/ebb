@@ -10,7 +10,8 @@
 // --yes: recipes carry no interactive re-approval (they were displayed
 // and approved at trim time and are sealed in the removal manifest),
 // and the only decisions are the branch-mismatch and drift menus —
-// terminal-only, NEVER auto-decided.
+// terminal-only, NEVER auto-decided, and opted out entirely by --json
+// (machine mode refuses with the typed error instead of prompting).
 //
 // Exit contract: 0 restored (or previewed, with --dry-run); 2 usage
 // (bad flags); 3 blocked (nothing to restore, in-flight Git conflict,
@@ -107,7 +108,7 @@ func cmdRestore(args []string, streams Streams, deps Deps) int {
 		CreateLink: platform.CreateLink,
 		Runner:     runner,
 		ObserveGit: deps.ObserveGit,
-		Prompt:     newRestorePrompter(deps, streams),
+		Prompt:     newRestorePrompter(deps, streams, *jsonOut),
 	})
 	if err != nil {
 		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
@@ -279,8 +280,15 @@ func driftLine(d restore.DriftEntry) string {
 // ---- the interactive decision seam (terminal-only, never auto-decided) ----
 
 // newRestorePrompter returns the terminal prompter, or nil when stdin is
-// not a terminal (non-interactive refusals then apply).
-func newRestorePrompter(deps Deps, streams Streams) restore.Prompter {
+// not a terminal (non-interactive refusals then apply). `--json` is
+// machine mode (Wave 1 restore review F6): it forces a nil prompter even
+// on a terminal, so branch mismatch and drift refuse with their typed
+// errors instead of dropping a scripted consumer into an interactive
+// menu it can never answer.
+func newRestorePrompter(deps Deps, streams Streams, jsonOut bool) restore.Prompter {
+	if jsonOut {
+		return nil
+	}
 	if deps.StdinIsTerminal == nil || !deps.StdinIsTerminal() || deps.ReadLine == nil {
 		return nil
 	}

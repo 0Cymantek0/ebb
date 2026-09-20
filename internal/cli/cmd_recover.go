@@ -22,10 +22,12 @@
 // performing its reconciliation — the escape hatch for a SEALED
 // operation whose live root is intact, which would otherwise block the
 // workspace. It also closes every crashed capsule transport
-// (EXPORT_*/IMPORT_* phases, Wave J review J1): the transports own no
-// removal authority, so cancel-after-crash is always safe — the export's
-// duration pins are released audit-only and anything the transport left
-// behind is reported, never deleted. Retained snapshots stay pinned
+// (EXPORT_*/IMPORT_* phases, Wave J review J1) and every dead restore
+// (RESTORE_RUNNING/RESTORE_FAILED, Wave 1 restore review F3): both own
+// no removal authority, so cancel-after-crash is always safe — the
+// export's duration pins are released audit-only and anything the
+// transport left behind is reported, never deleted; a canceled restore
+// keeps whatever its recipes produced. Retained snapshots stay pinned
 // (I07); deliberate release is `ebb forget`, never cancel.
 //
 // Exit contract: 0 reconciliation completed (report-only outcomes
@@ -67,7 +69,7 @@ func cmdRecover(args []string, streams Streams, deps Deps) int {
 	resume := fs.Bool("resume-removal", false,
 		"explicitly resume a blocked/interrupted removal walk (required for REMOVAL_BLOCKED after the blocker is resolved and writers are stopped again; QUARANTINED/REMOVING/TRIM_SEALING also complete under plain recover)")
 	cancel := fs.Bool("cancel", false,
-		"abandon an operation whose removal never started (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED) or any crashed capsule transport (EXPORT_*/IMPORT_*); retained snapshots stay pinned (I07)")
+		"abandon an operation whose removal never started (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED), any crashed capsule transport (EXPORT_*/IMPORT_*) or any dead restore (RESTORE_RUNNING/RESTORE_FAILED); retained snapshots stay pinned (I07)")
 	if err := fs.Parse(reorderFlags(args)); err != nil {
 		return ExitUsage
 	}

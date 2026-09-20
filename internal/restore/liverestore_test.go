@@ -347,12 +347,15 @@ cc = "1"
 }
 
 func TestUnionPyprojectTOML(t *testing.T) {
+	// F2: the array-key union only rewrites sections that are purely
+	// key-block lines (multi-line ARRAYS are entry blocks and survive);
+	// the fixtures therefore carry no blank lines or comments inside the
+	// rewritten sections — the decline cases live in their own test.
 	live := []byte(`[project]
 name = "app"
 dependencies = [
     "requests>=2",
 ]
-
 [tool.uv]
 dev-dependencies = [
     "pytest>=8",
@@ -364,7 +367,6 @@ dependencies = [
     "requests>=2",
     "httpx>=0.27",
 ]
-
 [tool.uv.sources]
 httpx = { workspace = true }
 `)

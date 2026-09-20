@@ -113,10 +113,20 @@ func (c *Coordinator) Recover(ctx context.Context, vault VaultRef, opID domain.O
 		// and names the verb that closes the operation.
 		return c.reportCapsuleTransport(op, rep)
 
+	case catalog.PhaseRestoreRunning, catalog.PhaseRestoreFailed:
+		// A dead restore (Wave 1 restore review F3): RESTORE_RUNNING is a
+		// crash leftover and RESTORE_FAILED a failed execution; both are
+		// deliberately NON-terminal because rerunning `ebb restore` IS the
+		// resume. Plain Recover stays REPORT-ONLY — the resume belongs to
+		// the restore command — and names both exits (rerun, or cancel the
+		// dead row so the workspace accepts destructive work again).
+		return c.reportDeadRestore(op, rep)
+
 	default:
-		// Terminal (CANCELED/DONE/TRIM_DONE) or phases owned by other
-		// commands (RESTORING/FILES_READY/REBUILDING/READY/
-		// REBUILD_FAILED): nothing lifecycle-side to reconcile.
+		// Terminal (CANCELED/DONE/TRIM_DONE/RESTORE_DONE) or phases owned
+		// by other commands (RESTORING/FILES_READY/REBUILDING/READY/
+		// REBUILD_FAILED/RESTORE_PLANNED): nothing lifecycle-side to
+		// reconcile.
 		rep.Actions = append(rep.Actions, "phase is terminal or owned by another command; nothing reconciled")
 		if op.LastError != "" {
 			rep.Remaining = append(rep.Remaining, "last recorded failure: "+op.LastError)
@@ -183,6 +193,19 @@ func (c *Coordinator) ResumeRemoval(ctx context.Context, vault VaultRef, opID do
 // .partial capsule file; an import's unregistered copies are not
 // journaled and are reported as unnameable rather than guessed).
 //
+// Dead restore operations (Wave 1 restore review F3) close the same way:
+// RESTORE_RUNNING (a crash leftover) and RESTORE_FAILED are deliberately
+// non-terminal because a rerun IS the resume — but a restore that can
+// never complete must not brick the workspace against every later
+// destructive operation. A restore owns NO removal authority (the
+// recipes only re-create what a trim already removed; the protected-file
+// gate watches everything they touch), so cancel-after-crash is always
+// safe by the same argument as the Wave J capsule transports: the op
+// closes idempotently to CANCELED, whatever the interrupted recipes
+// produced stays in place (never undone — it may be wanted work), and
+// the replayed trim's retained snapshots stay pinned (I07).
+// RESTORE_DONE is terminal-uncancelable like every DONE phase.
+//
 // Cancel never releases recovery obligations (I07): a sealed P/S pair
 // stays pinned — deliberate release is `ebb forget`, never cancel.
 func (c *Coordinator) CancelOperation(ctx context.Context, vault VaultRef, opID domain.OperationID) (RecoveryReport, error) {
@@ -203,6 +226,10 @@ func (c *Coordinator) CancelOperation(ctx context.Context, vault VaultRef, opID 
 		// The already-CANCELED arm keeps the close idempotent (rerunning
 		// --cancel after a crash mid-close must not refuse).
 		return c.cancelCapsuleTransport(op, rep)
+	case op.Kind == catalog.OpKindRestore && deadRestorePhase(op.Phase):
+		// The already-CANCELED arm keeps the close idempotent (same
+		// crash-mid-close shape as the capsule transports).
+		return c.cancelRestore(op, rep)
 	case op.Phase == catalog.PhasePlanned || op.Phase == catalog.PhaseCapturing ||
 		op.Phase == catalog.PhasePayloadCommitted || op.Phase == catalog.PhaseTrimPlanned:
 		// Pre-seal territory: the existing cancel path (records any
@@ -212,8 +239,20 @@ func (c *Coordinator) CancelOperation(ctx context.Context, vault VaultRef, opID 
 		return c.cancelSealed(op, rep)
 	default:
 		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
-			"operation %s is %s; cancel applies to phases before removal starts (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED) or to the capsule transports' EXPORT_*/IMPORT_* phases — mid-removal phases require reconciliation (Recover/ResumeRemoval)", opID, op.Phase)}
+			"operation %s is %s; cancel applies to phases before removal starts (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED), to the capsule transports' EXPORT_*/IMPORT_* phases, or to a dead restore (RESTORE_RUNNING/RESTORE_FAILED) — mid-removal phases require reconciliation (Recover/ResumeRemoval)", opID, op.Phase)}
 	}
+}
+
+// deadRestorePhase reports whether phase belongs to the restore kind's
+// cancel-after-crash set: the two non-terminal dead states plus CANCELED
+// (idempotent rerun). RESTORE_DONE is terminal and unclosable;
+// RESTORE_PLANNING belongs to a live planning pass, not a dead row.
+func deadRestorePhase(phase string) bool {
+	switch phase {
+	case catalog.PhaseRestoreRunning, catalog.PhaseRestoreFailed, catalog.PhaseCanceled:
+		return true
+	}
+	return false
 }
 
 // capsuleTransportPhase reports whether phase belongs to the given
@@ -379,6 +418,66 @@ func (c *Coordinator) cancelCapsuleTransport(op catalog.Operation, rep RecoveryR
 		"canceled the interrupted %s operation in %s (the capsule transport owns no removal authority: nothing in the source workspace or any vault was removed)", op.Kind, op.Phase))
 	rep.Remaining = append(rep.Remaining, capsuleTransportLeftovers(op)...)
 	rep.NextAction = "operation canceled; the workspace accepts new operations (rerun the export/import if the capsule transfer is still wanted)"
+	return rep, nil
+}
+
+// reportDeadRestore is plain Recover's report-only outcome for a dead
+// restore operation (RESTORE_RUNNING crash leftover or RESTORE_FAILED):
+// the state is described and BOTH exits are named — the rerun that
+// resumes it, and --cancel for the row that can never complete — but
+// nothing is reconciled (the resume belongs to the restore command, the
+// same discipline Recover applies to every kind whose phases another
+// command owns).
+func (c *Coordinator) reportDeadRestore(op catalog.Operation, rep RecoveryReport) (RecoveryReport, error) {
+	if op.Kind != catalog.OpKindRestore {
+		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+			"operation %s is kind %q but its phase %s belongs to the restore vocabulary; durable state diverged — inspect manually", op.ID, op.Kind, op.Phase)}
+	}
+	rep.Actions = append(rep.Actions, fmt.Sprintf(
+		"reported the dead %s operation in %s (report-only: a restore owns no removal authority, so the workspace and every retained snapshot are untouched)", op.Kind, op.Phase))
+	if op.LastError != "" {
+		rep.Remaining = append(rep.Remaining, "last recorded failure: "+op.LastError)
+	}
+	rep.Remaining = append(rep.Remaining,
+		"whatever the interrupted recipes produced stays in place (never undone — it may be wanted work)",
+		"the replayed trim's retained snapshots stay pinned (I07)")
+	rep.NextAction = fmt.Sprintf(
+		"rerun `ebb restore` to resume this operation (package managers tolerate partial output directories), or close it with `ebb recover %s --cancel` (always safe for a restore: cancel removes nothing) when no rerun can complete — until then the workspace refuses destructive operations", op.ID)
+	return rep, nil
+}
+
+// cancelRestore closes a dead restore operation (RESTORE_RUNNING crash
+// leftover or RESTORE_FAILED): idempotently to CANCELED. A restore owns
+// NO removal authority — the recipes only re-create what a trim already
+// removed, and the protected-file gate watches everything they touch —
+// so cancel-after-crash is always safe (the Wave J capsule-transport
+// argument): whatever the interrupted recipes produced stays in place
+// (never undone), the replayed trim's retained snapshots stay pinned
+// (I07 — deliberate release is `ebb forget`), and rerunning `ebb
+// restore` remains available for a fresh attempt. It performs no
+// backend calls and no removals.
+func (c *Coordinator) cancelRestore(op catalog.Operation, rep RecoveryReport) (RecoveryReport, error) {
+	if op.Phase == catalog.PhaseCanceled {
+		// Idempotent rerun (a crash between the CAS commit and the
+		// report): nothing left to do.
+		rep.Actions = append(rep.Actions, "the operation is already CANCELED; nothing to close")
+		rep.NextAction = "the workspace accepts new operations"
+		return rep, nil
+	}
+	if err := c.cat.FailOperation(op.ID, op.Phase, "canceled by user request while "+op.Phase+" (restore; no removal authority)"); err != nil {
+		// Best effort: the phase advance below is the authority.
+		_ = err
+	}
+	if aerr := c.cat.AdvanceOperation(op.ID, op.Phase, catalog.PhaseCanceled); aerr != nil {
+		return rep, fmt.Errorf("lifecycle: cancel %s: %w", op.ID, aerr)
+	}
+	rep.PhaseAfter = catalog.PhaseCanceled
+	rep.Actions = append(rep.Actions, fmt.Sprintf(
+		"canceled the dead %s operation in %s (a restore owns no removal authority: whatever the recipes produced stays in place, nothing was undone)", op.Kind, op.Phase))
+	rep.Remaining = append(rep.Remaining,
+		"whatever the interrupted recipes produced stays in place (inspect the workspace; rerun `ebb restore` for a fresh attempt if the outputs are still wanted)",
+		"the replayed trim's retained snapshots stay pinned (I07 — deliberate release is `ebb forget`, never cancel)")
+	rep.NextAction = "operation canceled; the workspace accepts new operations (rerun `ebb restore` if the recreation is still wanted)"
 	return rep, nil
 }
 
