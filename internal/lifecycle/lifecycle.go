@@ -109,6 +109,21 @@ type CaptureOptions struct {
 	// ApprovalReady is invoked per trim group; a non-nil error blocks
 	// that group's removal (lifecycle never runs actions).
 	ApprovalReady func(groupID string) error
+	// CarveOut (D034, Foundation §7.4/F10/F53 amendment) authorizes
+	// granular carve-out: when a requested trim group is cancelled by
+	// preserved/tracked entries INSIDE its outputs, those entries are
+	// captured into the op dir as vault overlay patches (byte copies +
+	// link-text sidecars, sealed as payload P) and then removed with the
+	// group's clean bulk. Consent is NEVER inferred — a carve happens
+	// only when this is true (defense in depth under the CLI's own
+	// typed confirmation / --carve-out, mirroring ApprovalReady).
+	CarveOut bool
+	// GitTrackedPaths carries the caller's hardened git-index
+	// observation (root-relative tracked paths, D004). Trim re-annotates
+	// git:tracked evidence onto its OWN scan before resolving, so the
+	// authoritative plan sees the same F53 cancellers the approval
+	// surface offered (the internal scan itself is evidence-blind).
+	GitTrackedPaths []string
 }
 
 // SnapshotResult reports a completed, sealed capture (§12.2 steps 1-5
@@ -145,6 +160,9 @@ type TrimResult struct {
 	// removed group (from the adapter recipe), one per group, aligned
 	// with Groups.
 	ReclaimCommands [][]string
+	// CarvedEntries counts the D034 overlay-patch entries captured per
+	// group (aligned with Groups; 0 for groups trimmed without a carve).
+	CarvedEntries []int
 }
 
 // Coordinator executes the lifecycle sequences. Safe for sequential use

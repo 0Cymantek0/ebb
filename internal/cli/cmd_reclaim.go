@@ -57,6 +57,9 @@ type reclaimTrimStep struct {
 	// EntriesRemoved / SnapshotID are set for executed steps.
 	EntriesRemoved int    `json:"entries_removed,omitempty"`
 	SnapshotID     string `json:"snapshot_id,omitempty"`
+	// Carved counts D034 overlay-patch entries captured for this group
+	// (set for executed steps).
+	Carved int `json:"carved,omitempty"`
 }
 
 // reclaimPark is the escalation stage's outcome.
@@ -107,6 +110,8 @@ func cmdReclaim(args []string, streams Streams, deps Deps) int {
 	targetStr := fs.String("target", "", "space goal, e.g. 25GiB (default: release as much as safely possible)")
 	dryRun := fs.Bool("dry-run", false, "print the staged plan without effects")
 	yes := fs.Bool("yes", false, "accept the trim removal confirmations (NEVER answers the park escalation)")
+	carveOutFlag := fs.Bool("carve-out", false,
+		"authorize granular carve-out (D034) of preserved entries inside trim groups: capture to vault, then remove (headless runs need this together with --yes; interactive runs confirm separately)")
 	assertStopped := fs.Bool("assert-writers-stopped", false,
 		"writer assertion for the park escalation (does NOT answer the escalation confirmation)")
 	if err := fs.Parse(reorderFlags(args, "target")); err != nil {
@@ -175,6 +180,14 @@ func cmdReclaim(args []string, streams Streams, deps Deps) int {
 			Trims:    previewTrims(plan, disc.Policy),
 			Blockers: planBlockers(plan),
 		}
+		// D034: surface the carve option the executed stages below offer
+		// (the planner itself keeps whole-group semantics and proposes
+		// nothing for a cancelled group). details.Blockers renders in
+		// BOTH the human and JSON surfaces.
+		for _, id := range eligibleCarveGroupIDs(disc.Resolved) {
+			details.Blockers = append(details.Blockers, fmt.Sprintf(
+				"carve-out available: group %s is cancelled by preserved entries inside its outputs; rerun without --dry-run and authorize --carve-out (or confirm interactively) to capture them as an overlay patch and reclaim the bulk", id))
+		}
 		if target != nil && plan.Result != planner.ResultSufficient {
 			details.Shortfall = *target - sumPlanAchieved(plan)
 		}
@@ -193,6 +206,9 @@ func cmdReclaim(args []string, streams Streams, deps Deps) int {
 	}
 
 	// ---- execution ------------------------------------------------------
+	// F53 evidence parity (D034): give lifecycle the git-index
+	// observation discovery already annotated (see cmd_trim.go).
+	opts.GitTrackedPaths = gitTrackedPathsOf(disc.Entries)
 	declared := map[string]policy.Regenerate{}
 	for _, g := range disc.Policy.Regenerate {
 		declared[g.ID] = g
@@ -208,11 +224,24 @@ func cmdReclaim(args []string, streams Streams, deps Deps) int {
 		Target: target, Plan: plan, Trims: []reclaimTrimStep{},
 		Blockers: planBlockers(plan),
 	}
+	// D034 carve stages: a group cancelled by in-output cancellers gets
+	// no planner step (whole-group semantics); run it as an explicit
+	// trim stage so the carve — when consented — reclaims the bulk the
+	// plan alone cannot. Without consent the stage is skipped and
+	// reported with a blocker naming --carve-out.
+	execSteps := plan.Steps
+	if carveIDs := eligibleCarveGroupIDs(disc.Resolved); len(carveIDs) > 0 {
+		extra := make([]planner.Step, 0, len(carveIDs))
+		for _, id := range carveIDs {
+			extra = append(extra, planner.Step{Kind: planner.StepTrim, Groups: []string{id}})
+		}
+		execSteps = append(append([]planner.Step(nil), plan.Steps...), extra...)
+	}
 	var conditions []string
 	var achieved int64
 	anyExecuted := false
 
-	for _, s := range plan.Steps {
+	for _, s := range execSteps {
 		switch s.Kind {
 		case planner.StepDiscard:
 			details.Blockers = append(details.Blockers,
@@ -220,7 +249,7 @@ func cmdReclaim(args []string, streams Streams, deps Deps) int {
 		case planner.StepDehydrate:
 			details.Blockers = append(details.Blockers, s.Blockers...)
 		case planner.StepTrim:
-			step, serr := runReclaimTrimStep(ctx, sess, coord, deps, streams, disc, opts, declared, s, *yes, &env.Warnings)
+			step, serr := runReclaimTrimStep(ctx, sess, coord, deps, streams, disc, opts, declared, s, *yes, *carveOutFlag, &env.Warnings)
 			if serr != nil {
 				return emitFailure(env, *jsonOut, streams, classifyExitCode(serr),
 					fmt.Sprintf("reclaim %s: trim group %s: %s", disc.Root, s.Groups[0], codedWithSafeAction(serr)))
@@ -347,10 +376,16 @@ func cmdReclaim(args []string, streams Streams, deps Deps) int {
 // skipped (§17.4 F10/F11); any other failure of an EXECUTING step
 // (vault, verification, removal-blocked, source-changed, cancellation)
 // is returned as an error and fails the whole command.
+//
+// D034 carve-out: a group cancelled by in-output cancellers is offered
+// a separate typed carve confirmation on a terminal (declined → the
+// step is skipped); headless runs need --carve-out together with --yes,
+// otherwise the step is skipped with a blocker naming the flag. The
+// lifecycle re-checks consent and performs the carve only then.
 func runReclaimTrimStep(
 	ctx context.Context, sess *session, coord *lifecycle.Coordinator,
 	deps Deps, streams Streams, disc discovery, opts lifecycle.CaptureOptions,
-	declared map[string]policy.Regenerate, s planner.Step, yes bool,
+	declared map[string]policy.Regenerate, s planner.Step, yes, carveOut bool,
 	warnings *[]string,
 ) (reclaimTrimStep, error) {
 	groupID := s.Groups[0]
@@ -385,6 +420,27 @@ func runReclaimTrimStep(
 	// The recorded decision is the confirmation above (defense in depth:
 	// lifecycle re-validates policy and applicability itself).
 	trimOpts.ApprovalReady = func(string) error { return nil }
+	// ---- D034 carve consent (no silent carve, ever) --------------------
+	if offer, isCancelled := carveOfferFor(disc.Resolved, groupID); isCancelled {
+		switch {
+		case !offer.Eligible:
+			// Un-carve-able canceller(s): fall through and let lifecycle
+			// refuse with its authoritative blocker text.
+		case carveOut:
+			trimOpts.CarveOut = true
+		case deps.StdinIsTerminal != nil && deps.StdinIsTerminal():
+			fmt.Fprint(streams.Err, carveApprovalText(disc.Root, []carveOffer{offer}))
+			if !confirmYes(deps, streams.Err, "") {
+				step.Reason = "the carve-out confirmation was declined (preserved entries inside the outputs stay; nothing was removed)"
+				return step, nil
+			}
+			trimOpts.CarveOut = true
+		default:
+			step.Reason = fmt.Sprintf(
+				"carve-out consent missing: the group is cancelled by preserved entries inside its outputs; rerun with --carve-out (together with --yes) or answer the interactive carve confirmation to capture them as an overlay patch and remove them after capture")
+			return step, nil
+		}
+	}
 	var res lifecycle.TrimResult
 	err := sess.withVaultPassfile(ctx, func(repoDir, passfile string) error {
 		var rErr error
@@ -408,6 +464,9 @@ func runReclaimTrimStep(
 	for i, g := range res.Groups {
 		if g == groupID && i < len(res.ReclaimCommands) {
 			step.Recreate = res.ReclaimCommands[i]
+		}
+		if g == groupID && i < len(res.CarvedEntries) {
+			step.Carved = res.CarvedEntries[i]
 		}
 	}
 	*warnings = append(*warnings, res.Snapshot.Warnings...)
@@ -582,6 +641,9 @@ func renderReclaimHuman(d reclaimDetails) string {
 		case "removed":
 			line("  removed group %s; recreate with: %s (%d entries; plan retained as snapshot %s)\n",
 				s.Group, cmdLine, s.EntriesRemoved, s.SnapshotID)
+			if s.Carved > 0 {
+				line("    carved %d preserved file(s)/link(s) to the vault overlay (D034); restore reapplies them after the recreate recipe\n", s.Carved)
+			}
 		default:
 			line("  skipped group %s: %s\n", s.Group, s.Reason)
 		}

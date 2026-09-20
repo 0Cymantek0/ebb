@@ -30,6 +30,8 @@ const (
 	receiptName          = "receipt.json"
 	removalManifestName  = "removal-manifest.json"
 	inputsDirName        = "inputs"
+	overlayDirName       = "overlay"
+	linkSidecarSuffix    = ".ebb-link"
 	schemaVersionCurrent = 1
 )
 
@@ -235,6 +237,51 @@ type removalManifestDoc struct {
 	ReclaimCommand []string          `json:"reclaim_command"`
 	RecipeInputs   []recipeInput     `json:"recipe_inputs"`
 	Members        []inventoryRecord `json:"members"`
+	// OverlayPatches (D034) records the carve-out entries of this group:
+	// preserved/tracked entries inside the outputs whose bytes were
+	// captured into the op dir as vault overlay patches before the group
+	// was removed. Carved entries ALSO appear in Members — the removal
+	// walk (and its Recover resume) must cover them like any member —
+	// while this array is the restore-side reapplication contract.
+	OverlayPatches []overlayPatchRecord `json:"overlay_patches,omitempty"`
+	// RecreateLive (D033/D034) is the non-lockfile "live" recreate argv
+	// the restore driver uses for drift reconciliation (it never wipes
+	// additions the way a frozen lockfile replay would). Absent (nil)
+	// for custom-command groups and pip: no drift-reconcilable live
+	// variant exists and restore falls back to the frozen recipe.
+	RecreateLive []string `json:"recreate_live,omitempty"`
+}
+
+// overlayPatchRecord is one D034 carve-out entry (FROZEN SCHEMA — the
+// restore-side worker re-declares this shape from the trim-side spec;
+// do not change field names or semantics without freezing a new schema
+// version). It names one preserved/tracked entry that lived inside a
+// cancelled regenerate group's outputs, was byte-captured into the op
+// dir (and therefore into the sealed payload P), and was removed with
+// the group. On restore, the base recipe recreates the tree first and
+// the overlay is reapplied on top.
+//
+// Encoding contract (everything the restore driver needs is in THESE
+// records; it re-derives semantics from the JSON alone):
+//
+//   - Path is the root-relative slash path of the ORIGINAL entry.
+//   - Copy is the op-dir-relative copy location:
+//     "overlay/<groupID>/<path>" for kind "file". For kind "link" the
+//     copy is a sidecar REGULAR FILE at "overlay/<groupID>/<path>.ebb-link"
+//     whose entire byte content is the link's TARGET TEXT (never the
+//     target's content — links are never followed); the restore driver
+//     re-creates the link from that text.
+//   - Digest is the sha256 hex of the ORIGINAL file bytes for kind
+//     "file" (identical to the sealed member entry's digest, verified
+//     again immediately before removal); "" for kind "link".
+//   - Kind is "file" for regular files and "link" for symlinks,
+//     junctions and mount points alike (any kind whose identity is link
+//     text).
+type overlayPatchRecord struct {
+	Path   string `json:"path"`   // root-relative slash path of the original
+	Copy   string `json:"copy"`   // op-dir-relative copy: "overlay/<groupID>/<path>" (links: "....ebb-link")
+	Digest string `json:"digest"` // sha256 hex of the file bytes ("" for links)
+	Kind   string `json:"kind"`   // "file" | "link"
 }
 
 type recipeInput struct {
@@ -609,6 +656,31 @@ func firstInput(g policy.Regenerate) string {
 		return g.Inputs[0]
 	}
 	return "requirements.txt"
+}
+
+// liveRecreateCommand derives the NON-lockfile recreate argv for one
+// group (D033 drift reconciliation / D034 overlay reapplication): the
+// command the restore driver runs to rebuild the output tree before
+// reapplying carve-out overlays. Unlike reclaimCommand it must tolerate
+// manifest drift (a frozen `ci`/`--frozen-lockfile` replay would refuse
+// or wipe the developer's newer additions), so it carries the plain
+// ecosystem install form. Custom-command groups have NO derivable live
+// variant (an arbitrary command cannot be weakened safely) and pip has
+// none either (pip cannot reconcile a drifted requirements pair); both
+// return nil and the field is omitted from the manifest.
+func liveRecreateCommand(g policy.Regenerate) []string {
+	if len(g.Command) > 0 {
+		return nil // custom command: no known drift-reconcilable live variant
+	}
+	switch g.Adapter {
+	case policy.AdapterPNPM:
+		return []string{"pnpm", "install"}
+	case policy.AdapterNPM:
+		return []string{"npm", "install"}
+	case policy.AdapterUV:
+		return []string{"uv", "sync"}
+	}
+	return nil
 }
 
 // sortedEntryPaths returns the sorted keys of an entry map (canonical
