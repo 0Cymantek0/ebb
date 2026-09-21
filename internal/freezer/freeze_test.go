@@ -10,11 +10,13 @@ package freezer
 // conformance.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,6 +83,7 @@ type fakeEnv struct {
 	logPath      string
 	repoDir      string
 	resticCtlDir string
+	stateDB      string // catalog db path (tests reopen it after fault injection)
 	cat          *catalog.Catalog
 	freezer      *Freezer
 	store        *resticstore.Store
@@ -123,7 +126,8 @@ func newFakeEnv(t *testing.T) *fakeEnv {
 	}
 
 	// Catalog with the registered vault row (FK discipline).
-	cat, err := catalog.Open(filepath.Join(base, "state", "catalog.db"))
+	e.stateDB = filepath.Join(base, "state", "catalog.db")
+	cat, err := catalog.Open(e.stateDB)
 	if err != nil {
 		t.Fatalf("catalog: %v", err)
 	}
@@ -523,6 +527,298 @@ func TestRemovalConfirmationDiscipline(t *testing.T) {
 	}
 	if err := e.freezer.RemoveFromDaemon(ctx, got, e.cat); err == nil {
 		t.Fatal("double removal must be refused")
+	}
+}
+
+// ---- adversarial-review fixes (wave 2) --------------------------------------
+
+// TestFreezeRefusesHostileDaemonEchoedID pins W2-2: the daemon's echoed
+// inspect Id is attacker-influenceable data that becomes `docker save`
+// argv and the durable entry.ImageID (later `rmi` argv) — anything that
+// is not a content-addressed docker id is refused with a typed error
+// before a single byte is streamed.
+func TestFreezeRefusesHostileDaemonEchoedID(t *testing.T) {
+	e := newFakeEnv(t)
+	e.setPayload(8 * 1024)
+	hostile := []string{
+		"-oC:\\evil.tar",                     // flag injection through a leading dash
+		";rm -rf /",                          // shell-metacharacter spelling
+		"sha256:" + strings.Repeat("zz", 32), // 64 non-hex characters
+		"sha256:deadbeef",                    // right prefix, wrong length
+	}
+	for _, id := range hostile {
+		e.ctl("inspect-id", id)
+		_, err := e.freeze()
+		var h *ErrHostileImageID
+		if !errors.As(err, &h) {
+			t.Fatalf("echoed id %q: err = %v, want ErrHostileImageID", id, err)
+		}
+		if h.ImageID != id {
+			t.Fatalf("typed error names %q, want the echoed %q", h.ImageID, id)
+		}
+	}
+	// The refusal happens at inspect: nothing was ever streamed to a save
+	// and no durable row exists.
+	if log := e.dockerLog(); strings.Contains(log, "start save") {
+		t.Fatalf("a hostile echoed id reached docker save:\n%s", log)
+	}
+	if rows, _ := e.cat.FindDockerImages(e.imageID); len(rows) != 0 {
+		t.Fatalf("rows recorded for refused freezes: %+v", rows)
+	}
+	// The honest daemon shape still freezes (control reset to canonical).
+	e.ctl("inspect-id", "")
+	res, err := e.freeze()
+	if err != nil || !res.Verified {
+		t.Fatalf("canonical echo must still freeze: %+v, %v", res, err)
+	}
+}
+
+// TestRemoveFromDaemonRefusesHostileStoredID pins W2-2's removal half: a
+// corrupted catalog row whose image id would hijack `docker rmi` argv is
+// refused before any subprocess runs.
+func TestRemoveFromDaemonRefusesHostileStoredID(t *testing.T) {
+	e := newFakeEnv(t)
+	e.setPayload(8 * 1024)
+	res, err := e.freeze()
+	if err != nil {
+		t.Fatalf("freeze: %v", err)
+	}
+	ctx, cancel := e.ctx()
+	defer cancel()
+
+	for _, hostile := range []string{"-something", ";rm", "bad image\n"} {
+		corrupt := res.Entry
+		corrupt.ImageID = hostile // simulated corrupted row (kept VerifiedAt)
+		var h *ErrHostileImageID
+		if rerr := e.freezer.RemoveFromDaemon(ctx, corrupt, e.cat); !errors.As(rerr, &h) {
+			t.Fatalf("stored id %q: err = %v, want ErrHostileImageID", hostile, rerr)
+		}
+	}
+	if log := e.dockerLog(); strings.Contains(log, "rmi") {
+		t.Fatalf("a hostile stored id reached docker rmi:\n%s", log)
+	}
+}
+
+// scriptedDumpStore is a VaultStore whose DumpBlob answers successive
+// dumps of the same blob from a script of payloads (a repo rewritten
+// between the verify pass and the load pass); BackupStdin is a stub.
+type scriptedDumpStore struct {
+	mu    sync.Mutex
+	dumps [][]byte // nth dump gets dumps[min(n, len-1)]
+	calls int
+}
+
+func (s *scriptedDumpStore) BackupStdin(ctx context.Context, repoDir, passfile, filename string, src io.Reader, tags map[string]string) (domain.SnapshotRef, error) {
+	return domain.SnapshotRef{}, nil // not exercised by Restore
+}
+
+func (s *scriptedDumpStore) DumpBlob(ctx context.Context, repoDir, passfile, snapID, filename string) (io.ReadCloser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := s.dumps[len(s.dumps)-1]
+	if s.calls < len(s.dumps) {
+		b = s.dumps[s.calls]
+	}
+	s.calls++
+	return io.NopCloser(bytes.NewReader(b)), nil
+}
+
+// TestRestoreSecondDumpDivergenceFails pins W2-3: the bytes actually
+// streamed into docker load are hashed as they load; when the second
+// dump diverges from the first the restore FAILS naming the divergence,
+// and the digest reported is the ACTUAL pass-2 digest — never pass-1's.
+func TestRestoreSecondDumpDivergenceFails(t *testing.T) {
+	binDir := buildFakes(t)
+	base := t.TempDir()
+	ctlDir := filepath.Join(base, "ctl")
+	if err := os.MkdirAll(ctlDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first := []byte("the bytes the verify pass proves")
+	second := []byte("DIFFERENT bytes the load pass actually receives")
+	sum := sha256.Sum256(first)
+	entry := catalog.DockerImage{
+		ImageID:    "sha256:" + strings.Repeat("ab", 32),
+		SnapshotID: "fakesnap",
+		Filename:   "docker-image-fake.tar",
+		SHA256:     hex.EncodeToString(sum[:]),
+		Bytes:      int64(len(first)),
+	}
+
+	t.Setenv(EnvDockerBin, filepath.Join(binDir, "fakedocker"+exeSuffix()))
+	t.Setenv(envFakeBinDir, ctlDir)
+	f, err := New("", &scriptedDumpStore{dumps: [][]byte{first, second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	_, rerr := f.Restore(ctx, entry, "repo", "pw")
+	if rerr == nil {
+		t.Fatal("a diverging second dump must fail the restore")
+	}
+	var se *domain.StoreError
+	if !errors.As(rerr, &se) || se.Class != domain.StoreErrIntegrity {
+		t.Fatalf("divergence class = %v want StoreErrIntegrity (%v)", se, rerr)
+	}
+	var dv *ErrRestoreDivergence
+	if !errors.As(rerr, &dv) {
+		t.Fatalf("error should carry the divergence detail: %v", rerr)
+	}
+	// The reported digest describes what was ACTUALLY loaded (pass 2),
+	// and the target is the frozen entry's contract.
+	want2 := sha256.Sum256(second)
+	if dv.GotDigest != hex.EncodeToString(want2[:]) || dv.GotBytes != int64(len(second)) {
+		t.Fatalf("divergence reports %s/%d, want the ACTUAL pass-2 digest %s/%d",
+			dv.GotDigest, dv.GotBytes, hex.EncodeToString(want2[:]), len(second))
+	}
+	if dv.WantDigest != entry.SHA256 || dv.WantBytes != entry.Bytes {
+		t.Fatalf("divergence lost the frozen target: %+v", dv)
+	}
+	if !strings.Contains(rerr.Error(), "diverged") {
+		t.Fatalf("error must name the divergence: %v", rerr)
+	}
+	// The fake daemon drank exactly the pass-2 bytes — the load-time
+	// hashing describes reality, not the earlier pass.
+	log, _ := os.ReadFile(filepath.Join(ctlDir, "docker.log"))
+	if !strings.Contains(string(log),
+		fmt.Sprintf("load bytes=%d digest=%s", len(second), hex.EncodeToString(want2[:]))) {
+		t.Fatalf("docker log lacks the actual pass-2 load record:\n%s", log)
+	}
+
+	// Identical successive dumps still succeed with the same reporting.
+	f2, err := New("", &scriptedDumpStore{dumps: [][]byte{first, first}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr, rerr2 := f2.Restore(ctx, entry, "repo", "pw")
+	if rerr2 != nil {
+		t.Fatalf("agreeing dumps must restore: %v", rerr2)
+	}
+	if rr.Bytes != int64(len(first)) || rr.SHA256 != entry.SHA256 {
+		t.Fatalf("restore result = %+v, want %d bytes at the frozen digest", rr, len(first))
+	}
+}
+
+// TestRemoveFromDaemonReconcilesNoSuchImage pins W2-5: rmi-then-mark is
+// idempotently reconcilable. After a successful rmi whose durable mark
+// failed, the retry's "No such image" daemon response is treated as
+// already-removed and the audit row finally gets marked; any OTHER rmi
+// failure stays a real failure with the row unmarked.
+func TestRemoveFromDaemonReconcilesNoSuchImage(t *testing.T) {
+	e := newFakeEnv(t)
+	e.setPayload(16 * 1024)
+	res, err := e.freeze()
+	if err != nil {
+		t.Fatalf("freeze: %v", err)
+	}
+	ctx, cancel := e.ctx()
+	defer cancel()
+
+	// First attempt: rmi succeeds, the durable mark fails (fault
+	// injected by closing the catalog under the freezer).
+	e.cat.Close()
+	if rerr := e.freezer.RemoveFromDaemon(ctx, res.Entry, e.cat); rerr == nil {
+		t.Fatal("a failed removal mark must surface an error")
+	}
+	if !strings.Contains(e.dockerLog(), "rmi-done "+e.imageID) {
+		t.Fatalf("the first attempt did not reach docker rmi:\n%s", e.dockerLog())
+	}
+
+	// Retry against a reopened catalog: the daemon answers "No such
+	// image" (the rmi already happened) — reconciled, the row is marked.
+	reopened, oerr := catalog.Open(e.stateDB)
+	if oerr != nil {
+		t.Fatalf("reopen catalog: %v", oerr)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	e.cat = reopened // the harness freezes through the live handle
+	fresh, gerr := reopened.GetDockerImage(res.Entry.ID)
+	if gerr != nil || fresh.DaemonRemovedAt != "" {
+		t.Fatalf("row after the failed mark = %+v, %v (want unmarked)", fresh, gerr)
+	}
+	e.ctl("rmi-fail", "nosuch")
+	if rerr := e.freezer.RemoveFromDaemon(ctx, fresh, reopened); rerr != nil {
+		t.Fatalf("the no-such-image retry must reconcile: %v", rerr)
+	}
+	reconciled, _ := reopened.GetDockerImage(res.Entry.ID)
+	if reconciled.DaemonRemovedAt == "" {
+		t.Fatal("the reconciled retry did not record the removal mark")
+	}
+	if !strings.Contains(e.dockerLog(), "rmi-nosuch "+e.imageID) {
+		t.Fatalf("docker log lacks the already-gone response:\n%s", e.dockerLog())
+	}
+
+	// A DIFFERENT rmi failure is still a real failure: a second freeze's
+	// removal against unrelated daemon text errors and stays unmarked.
+	e.ctl("rmi-fail", "other")
+	res2, err := e.freeze()
+	if err != nil {
+		t.Fatalf("second freeze: %v", err)
+	}
+	if rerr := e.freezer.RemoveFromDaemon(ctx, res2.Entry, reopened); rerr == nil {
+		t.Fatal("an unrelated rmi failure must not be reconciled away")
+	}
+	row2, _ := reopened.GetDockerImage(res2.Entry.ID)
+	if row2.DaemonRemovedAt != "" {
+		t.Fatalf("an unrelated rmi failure was marked removed: %+v", row2)
+	}
+	if !strings.Contains(e.dockerLog(), "rmi-fail-other "+e.imageID) {
+		t.Fatalf("docker log lacks the unrelated failure:\n%s", e.dockerLog())
+	}
+}
+
+// TestDockerEnvMatrix pins W2-6: the DOCKER_* passthrough family matches
+// the docker adapter's prefix rule (cert/TLS configuration reaches the
+// client like DOCKER_HOST does), unrelated variables are dropped, and
+// the FAKE_BIN_DIR test seam rides the child env ONLY while the
+// EBB_TEST_DOCKER_BIN seam is active — never in production mode.
+func TestDockerEnvMatrix(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://127.0.0.1:2376")
+	t.Setenv("DOCKER_CERT_PATH", "/tmp/docker-certs")
+	t.Setenv("DOCKER_TLS_VERIFY", "1")
+	t.Setenv("EBB_ENV_MATRIX_UNRELATED", "must-be-dropped")
+	t.Setenv(envFakeBinDir, "/tmp/fake-ctl")
+
+	has := func(env []string, name string) (string, bool) {
+		for _, kv := range env {
+			if k, v, ok := strings.Cut(kv, "="); ok && strings.EqualFold(k, name) {
+				return v, true
+			}
+		}
+		return "", false
+	}
+
+	// Production mode: the docker-bin seam is inactive, so the fake-bin
+	// control variable must not reach the child even though it is set.
+	t.Setenv(EnvDockerBin, "")
+	f, err := New("docker", &scriptedDumpStore{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := f.dockerEnv()
+	if _, ok := has(env, envFakeBinDir); ok {
+		t.Fatalf("FAKE_BIN_DIR leaked into a production child env: %v", env)
+	}
+	for _, want := range []string{"DOCKER_HOST", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY"} {
+		if _, ok := has(env, want); !ok {
+			t.Fatalf("production child env lacks %s: %v", want, env)
+		}
+	}
+	if _, ok := has(env, "EBB_ENV_MATRIX_UNRELATED"); ok {
+		t.Fatalf("unrelated variable passed through: %v", env)
+	}
+
+	// Seam mode: the fake control variable rides along for the fake CLI.
+	t.Setenv(EnvDockerBin, "/tmp/fakedocker")
+	f2, err := New("", &scriptedDumpStore{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env2 := f2.dockerEnv()
+	if v, ok := has(env2, envFakeBinDir); !ok || v != "/tmp/fake-ctl" {
+		t.Fatalf("FAKE_BIN_DIR must ride the child env in seam mode: %v", env2)
 	}
 }
 

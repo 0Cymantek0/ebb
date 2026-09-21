@@ -74,6 +74,11 @@ type VaultStore interface {
 type Freezer struct {
 	dockerBin string
 	store     VaultStore
+	// testSeam records that New resolved the docker binary through the
+	// EBB_TEST_DOCKER_BIN seam. Only then does dockerEnv forward the
+	// fake-binary control variable (FAKE_BIN_DIR): a test seam must never
+	// ride the production env surface.
+	testSeam bool
 }
 
 // New resolves the docker binary ("" means PATH "docker"; the
@@ -87,8 +92,9 @@ func New(dockerBin string, store VaultStore) (*Freezer, error) {
 	if store == nil {
 		return nil, errors.New("freezer: vault store is required")
 	}
-	if env := os.Getenv(EnvDockerBin); env != "" {
-		dockerBin = env
+	seam := os.Getenv(EnvDockerBin)
+	if seam != "" {
+		dockerBin = seam
 	}
 	if dockerBin == "" {
 		dockerBin = "docker"
@@ -100,7 +106,7 @@ func New(dockerBin string, store VaultStore) (*Freezer, error) {
 	} else if resolved, err := exec.LookPath(dockerBin); err == nil {
 		dockerBin = resolved
 	}
-	return &Freezer{dockerBin: dockerBin, store: store}, nil
+	return &Freezer{dockerBin: dockerBin, store: store, testSeam: seam != ""}, nil
 }
 
 // ImageInfo is what `docker image inspect` truthfully told us about one
@@ -195,17 +201,65 @@ func (e *ErrHashMismatch) Error() string {
 		e.SnapshotID, e.Filename, e.GotDigest, e.GotBytes, e.WantDigest, e.WantBytes)
 }
 
+// ErrHostileImageID reports an image id of untrusted origin — the
+// daemon's own inspect echo, or a stored catalog row — that failed its
+// validation contract. Daemon-returned data is attacker-influenceable
+// and the id later reaches `docker save`/`rmi` argv (flag injection
+// through a leading "-" is real even without a shell), so anything
+// outside the contract is refused before a single subprocess runs.
+type ErrHostileImageID struct {
+	ImageID string
+	Detail  string
+}
+
+func (e *ErrHostileImageID) Error() string {
+	return fmt.Sprintf(
+		"freezer: refusing image id %q: %s — daemon-returned data is untrusted; nothing was streamed, loaded, or removed",
+		e.ImageID, e.Detail)
+}
+
+// ErrRestoreDivergence reports that the bytes actually streamed into
+// `docker load` (hashed as they loaded) diverged from the frozen
+// entry's recorded digest/byte count that the verify pass had just
+// proven — the vault answered the two dumps differently. The load
+// already ran, so the daemon may hold unverified bytes: the divergence
+// is named and the restore fails, never reports "verified".
+type ErrRestoreDivergence struct {
+	SnapshotID string
+	Filename   string
+	WantDigest string
+	GotDigest  string
+	WantBytes  int64
+	GotBytes   int64
+}
+
+func (e *ErrRestoreDivergence) Error() string {
+	diverged := "digest and byte count"
+	if e.GotDigest == e.WantDigest {
+		diverged = "byte count"
+	} else if e.GotBytes == e.WantBytes {
+		diverged = "digest"
+	}
+	return fmt.Sprintf(
+		"freezer: restore of %s/%s FAILED the load-time check: the %s of the bytes streamed into docker load diverged from the verified readback (the load pass received digest %s over %d bytes; the freeze recorded %s over %d bytes) — treat the loaded image as UNVERIFIED and rerun the restore",
+		e.SnapshotID, e.Filename, diverged, e.GotDigest, e.GotBytes, e.WantDigest, e.WantBytes)
+}
+
 // ---- docker subprocess plumbing ------------------------------------------
 
 // dockerEnv builds the child environment for every docker subprocess: a
-// minimal OS substrate (the restic adapter's discipline) plus the
-// docker endpoint variables, so a user's DOCKER_HOST/DOCKER_CONTEXT
-// configuration still reaches the client while hostile inherited values
-// of anything else cannot. EnvDockerBin's FAKE_BIN_DIR companion is the
-// fake-binary test seam (a real docker CLI ignores it).
+// minimal OS substrate (the restic adapter's discipline) plus EVERY
+// inherited DOCKER_* variable — the same sanctioned routing family the
+// analyse engine's docker adapter forwards (host/context AND
+// cert/TLS configuration, so a DOCKER_CERT_PATH endpoint gets analyse
+// and freeze agreeing), while hostile inherited values of anything else
+// cannot reach the child. The FAKE_BIN_DIR fake-binary control variable
+// rides along ONLY when New resolved the binary through the
+// EBB_TEST_DOCKER_BIN seam (f.testSeam): a test seam must never ride
+// the production env surface.
 const envFakeBinDir = "FAKE_BIN_DIR"
 
-func dockerEnv() []string {
+func (f *Freezer) dockerEnv() []string {
 	var substrate []string
 	if runtime.GOOS == "windows" {
 		substrate = []string{"PATH", "SYSTEMROOT", "COMSPEC", "WINDIR", "TEMP", "TMP", "PATHEXT",
@@ -213,27 +267,69 @@ func dockerEnv() []string {
 	} else {
 		substrate = []string{"PATH", "TMPDIR", "HOME", "LANG", "LC_ALL", "TZ"}
 	}
-	pass := append(substrate, "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", envFakeBinDir)
 	inherited := os.Environ()
-	out := make([]string, 0, len(pass))
-	for _, want := range pass {
+	out := make([]string, 0, len(substrate)+8)
+	for _, want := range substrate {
 		for _, kv := range inherited {
 			eq := strings.IndexByte(kv, '=')
 			if eq <= 0 {
 				continue
 			}
-			name := kv[:eq]
-			match := name == want
-			if runtime.GOOS == "windows" {
-				match = strings.EqualFold(name, want)
-			}
-			if match {
+			if envKeyEqual(kv[:eq], want) {
 				out = append(out, kv)
 				break // first spelling wins
 			}
 		}
 	}
+	// The DOCKER_* routing family passes through wholesale (prefix rule),
+	// exactly like the docker adapter: host/context AND cert/TLS
+	// configuration must reach the client.
+	for _, kv := range inherited {
+		eq := strings.IndexByte(kv, '=')
+		if eq <= 0 {
+			continue
+		}
+		if envKeyHasPrefix(kv[:eq], dockerEnvPrefix) {
+			out = append(out, kv)
+		}
+	}
+	// The fake-binary control variable rides along only in seam mode.
+	if f.testSeam {
+		for _, kv := range inherited {
+			eq := strings.IndexByte(kv, '=')
+			if eq > 0 && envKeyEqual(kv[:eq], envFakeBinDir) {
+				out = append(out, kv)
+				break
+			}
+		}
+	}
 	return out
+}
+
+// dockerEnvPrefix is the passthrough family every inherited variable of
+// which reaches the docker child (host/context/cert/TLS routing).
+const dockerEnvPrefix = "DOCKER_"
+
+// envKeyEqual compares an inherited variable name. Windows environment
+// lookup is case-insensitive, so the comparison is too.
+func envKeyEqual(name, want string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(name, want)
+	}
+	return name == want
+}
+
+// envKeyHasPrefix is the prefix form for the DOCKER_* passthrough
+// family, case-insensitive on Windows like the exact form. The docker
+// adapter's rule, reimplemented locally — the packages stay decoupled.
+func envKeyHasPrefix(name, prefix string) bool {
+	if len(name) < len(prefix) {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(name[:len(prefix)], prefix)
+	}
+	return name[:len(prefix)] == prefix
 }
 
 // runDocker executes one bounded docker command and captures both
@@ -246,7 +342,7 @@ func (f *Freezer) runDocker(ctx context.Context, timeout time.Duration, argv ...
 		defer cancel()
 	}
 	cmd := exec.CommandContext(ctx, f.dockerBin, argv...)
-	cmd.Env = dockerEnv()
+	cmd.Env = f.dockerEnv()
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -310,7 +406,19 @@ func (f *Freezer) Inspect(ctx context.Context, imageID string) (ImageInfo, error
 	}
 	info := ImageInfo{ID: docs[0].ID, Size: docs[0].Size, RepoTags: docs[0].RepoTags}
 	if info.ID == "" {
-		info.ID = imageID // daemon records may omit Id for short ids; the argument spelling is the truth then
+		// Daemon records may omit Id for short ids; the argument spelling
+		// is the truth then — still gated by the argv-safety re-check,
+		// because it too reaches `docker save` argv.
+		if verr := validateStoredImageID(imageID); verr != nil {
+			return ImageInfo{}, &ErrHostileImageID{ImageID: imageID, Detail: verr.Error()}
+		}
+		info.ID = imageID
+	} else if verr := validateDaemonImageID(info.ID); verr != nil {
+		// The daemon's echo is attacker-influenceable data that becomes
+		// `docker save` argv and the durable entry.ImageID (later `rmi`
+		// argv): it must be a content-addressed docker id, nothing looser.
+		return ImageInfo{}, &ErrHostileImageID{ImageID: info.ID,
+			Detail: "the daemon's inspect record echoed an id that is not a content-addressed docker image id (" + verr.Error() + ")"}
 	}
 	return info, nil
 }
@@ -333,6 +441,42 @@ func ValidateImageID(imageID string) error {
 		default:
 			return fmt.Errorf("freezer: image id %q contains a character outside [A-Za-z0-9:._/-]", imageID)
 		}
+	}
+	return nil
+}
+
+// validateDaemonImageID enforces the STRICT contract for a daemon-echoed
+// image id (docker image inspect's Id field): an optional "sha256:"
+// prefix followed by exactly 64 hex characters. Real daemons always
+// answer in this form; anything else is hostile or broken daemon data
+// that must never reach `docker save`/`rmi` argv (a leading "-" hijacks
+// flag parsing even without a shell, and any looser charset would let
+// the daemon choose what the freezer executes).
+func validateDaemonImageID(id string) error {
+	hexPart := strings.TrimPrefix(id, "sha256:")
+	if len(hexPart) != 64 {
+		return fmt.Errorf("want an optional sha256: prefix plus 64 hex characters, got %d after the prefix", len(hexPart))
+	}
+	for _, c := range hexPart {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return fmt.Errorf("character %q is outside hex", string(c))
+		}
+	}
+	return nil
+}
+
+// validateStoredImageID re-checks an image id that arrived from durable
+// storage (entry.ImageID) before it reaches `docker rmi` argv: the
+// client-side spelling contract plus the leading-dash refusal (a
+// corrupted or hostile row must never execute).
+func validateStoredImageID(id string) error {
+	if err := ValidateImageID(id); err != nil {
+		return err
+	}
+	if strings.HasPrefix(id, "-") {
+		return errors.New("freezer: a leading '-' can hijack docker flag parsing")
 	}
 	return nil
 }
@@ -387,7 +531,7 @@ func (f *Freezer) Freeze(ctx context.Context, req FreezeRequest) (FreezeResult, 
 	// kill), which keeps the producer's exit observable even on
 	// cancellation.
 	saveCmd := exec.Command(f.dockerBin, "save", info.ID)
-	saveCmd.Env = dockerEnv()
+	saveCmd.Env = f.dockerEnv()
 	pr, pw, perr := os.Pipe()
 	if perr != nil {
 		return FreezeResult{}, fmt.Errorf("freezer: save pipe: %w", perr)
@@ -511,19 +655,23 @@ func (f *Freezer) VerifyEntry(ctx context.Context, entry catalog.DockerImage, re
 // ---- restore ---------------------------------------------------------------
 
 // Restore loads one freeze entry back into the docker daemon in TWO
-// passes: the vault's bytes are first read back and proven against the
-// recorded digest (docker load has not even started), and only then is
-// a second dump streamed into `docker load`. A digest mismatch
-// therefore aborts before a single byte reaches the daemon, and no
-// temp file is ever created (low-headroom discipline; §14.1).
+// passes, both proven: the vault's bytes are first read back and
+// verified against the recorded digest (docker load has not even
+// started — a mismatch aborts before a single byte reaches the daemon),
+// and the second dump streamed into `docker load` is hashed AS it loads
+// (io.MultiWriter into the digest and a byte counter) and compared with
+// the frozen entry's digest and byte count before success is reported —
+// a vault that answers the two dumps differently fails with the
+// divergence named, never a "verified" restore. No temp file is ever
+// created (low-headroom discipline; §14.1).
 func (f *Freezer) Restore(ctx context.Context, entry catalog.DockerImage, repoDir, passfile string) (RestoreResult, error) {
-	digest, _, verr := f.VerifyEntry(ctx, entry, repoDir, passfile)
+	pass1Digest, pass1Bytes, verr := f.VerifyEntry(ctx, entry, repoDir, passfile)
 	if verr != nil {
 		return RestoreResult{}, verr
 	}
 
 	loadCmd := exec.Command(f.dockerBin, "load")
-	loadCmd.Env = dockerEnv()
+	loadCmd.Env = f.dockerEnv()
 	stdin, lerr := loadCmd.StdinPipe()
 	if lerr != nil {
 		return RestoreResult{}, fmt.Errorf("freezer: docker load stdin pipe: %w", lerr)
@@ -541,7 +689,14 @@ func (f *Freezer) Restore(ctx context.Context, entry catalog.DockerImage, repoDi
 		_ = loadCmd.Wait()
 		return RestoreResult{}, derr
 	}
-	n, copyErr := io.Copy(stdin, stream)
+	// Pass 2 is NOT trusted: every byte docker load drinks is hashed and
+	// counted in flight (the same §11.4 discipline as the capture side),
+	// and the digest is compared with the frozen entry BEFORE success is
+	// reported — RestoreResult.SHA256 always describes the bytes that
+	// were actually loaded, never pass-1's.
+	loadHash := sha256.New()
+	loadCount := &countingWriter{}
+	n, copyErr := io.Copy(io.MultiWriter(stdin, loadHash, loadCount), stream)
 	closeErr := stdin.Close()
 	dumpErr := stream.Close() // producer gates: exit 0 AND fully consumed
 	waitErr := loadCmd.Wait()
@@ -559,7 +714,19 @@ func (f *Freezer) Restore(ctx context.Context, entry catalog.DockerImage, repoDi
 	case waitErr != nil:
 		return RestoreResult{}, fmt.Errorf("freezer: docker load failed: %w\noutput:\n%s", waitErr, excerpt(loadOut.Bytes()))
 	}
-	return RestoreResult{Bytes: n, SHA256: digest, LoadOutput: firstLine(loadOut.Bytes())}, nil
+	loadedDigest := hex.EncodeToString(loadHash.Sum(nil))
+	if loadedDigest != entry.SHA256 || loadCount.n != entry.Bytes ||
+		loadedDigest != pass1Digest || loadCount.n != pass1Bytes {
+		// Pass 1 proved digest (== entry.SHA256) moments ago; the load
+		// pass received something else. The daemon already drank the
+		// divergent bytes, so name them and fail — never "verified".
+		return RestoreResult{}, &domain.StoreError{Class: domain.StoreErrIntegrity, Err: &ErrRestoreDivergence{
+			SnapshotID: entry.SnapshotID, Filename: entry.Filename,
+			WantDigest: entry.SHA256, GotDigest: loadedDigest,
+			WantBytes: entry.Bytes, GotBytes: loadCount.n,
+		}}
+	}
+	return RestoreResult{Bytes: loadCount.n, SHA256: loadedDigest, LoadOutput: firstLine(loadOut.Bytes())}, nil
 }
 
 // ---- daemon-side removal ----------------------------------------------------
@@ -568,7 +735,14 @@ func (f *Freezer) Restore(ctx context.Context, entry catalog.DockerImage, repoDi
 // mutating docker operation in the package, reachable exclusively from
 // the CLI's separate post-verification confirmation. It refuses
 // unverified entries (defense in depth beside the catalog's own
-// refusal) and records the audited removal timestamp on success.
+// refusal), re-validates the stored image id before it reaches argv,
+// and records the audited removal timestamp on success. The
+// rmi-then-mark order is IDEMPOTENTLY RECONCILABLE: when the daemon
+// answers "No such image" (typically a previous rmi succeeded but the
+// durable mark failed), the removal is treated as already done and the
+// audit row is brought in line with daemon reality — every other rmi
+// failure stays a real failure. The mark is never written before a
+// successful (or already-gone) rmi: that would create the inverse lie.
 func (f *Freezer) RemoveFromDaemon(ctx context.Context, entry catalog.DockerImage, cat *catalog.Catalog) error {
 	if cat == nil {
 		return errors.New("freezer: catalog is required to audit the removal")
@@ -579,10 +753,31 @@ func (f *Freezer) RemoveFromDaemon(ctx context.Context, entry catalog.DockerImag
 	if entry.DaemonRemovedAt != "" {
 		return fmt.Errorf("freezer: daemon image %s was already removed at %s", entry.ImageID, entry.DaemonRemovedAt)
 	}
-	if _, _, err := f.runDocker(ctx, time.Minute, "rmi", entry.ImageID); err != nil {
+	// The stored id reaches `docker rmi` argv: re-validate it (a
+	// corrupted or hostile row must never execute).
+	if verr := validateStoredImageID(entry.ImageID); verr != nil {
+		return &ErrHostileImageID{ImageID: entry.ImageID,
+			Detail: "the stored entry's image id failed the argv-safety re-check: " + verr.Error()}
+	}
+	_, _, err := f.runDocker(ctx, time.Minute, "rmi", entry.ImageID)
+	if err != nil && isNoSuchImageError(err) {
+		// The daemon already does not hold the image — the only out-of-
+		// sync thing is the audit row. Reconcile: record the mark so the
+		// catalog agrees with daemon reality instead of failing forever.
+		err = nil
+	}
+	if err != nil {
 		return fmt.Errorf("freezer: docker rmi %s failed (the freeze stays verified and pinned): %w", entry.ImageID, err)
 	}
 	return cat.MarkDockerImageRemoved(entry.ID, domain.FormatTime(time.Now().UTC()))
+}
+
+// isNoSuchImageError recognizes the daemon's "No such image" response
+// (case-insensitive: the real client text and test/fake spellings) —
+// the one rmi failure that means "already gone", which makes the
+// mark-after-rmi order reconcilable instead of a permanent audit lie.
+func isNoSuchImageError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "no such image")
 }
 
 // ---- small helpers ----------------------------------------------------------
