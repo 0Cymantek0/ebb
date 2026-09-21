@@ -331,10 +331,22 @@ veteran's merge conflict round-trips park/open unresolved (via
 `git ls-files -u` as an independent oracle), and requires the torture
 bar to degrade without panics or data loss.
 
+Methodology note: the first scale-1.0 run
+(lab/gauntlet/results/20260921T195832Z) caught a fixture
+inconsistency — the polyglot Preserve set listed
+`services/api/.venv/pyvenv.cfg`, a file inside the same archetype's
+declared `.venv` regenerable output, which ebb (correctly) trimmed with
+the whole group — after which the corpus dropped the entry and gained a
+regression test (`TestPreserveDisjointFromDeclaredOutputs`,
+lab/gauntlet/corpus_test.go) asserting no Preserve path ever lies inside
+a declared output; the tables below are the post-fix green run.
+
 Reproduce: `go run ./lab/gauntlet` (defaults; see lab/gauntlet/README.md
 for flags). Raw evidence for this section:
-`lab/gauntlet/results/20260921T195832Z/` (results.json, report.md,
-plus every flow's verbatim --json envelope under flows/).
+`lab/gauntlet/results/20260921T201637Z/` (results.json, report.md,
+plus every flow's verbatim --json envelope under flows/). The earlier
+runs stay committed as history (20260921T194516Z first run, also the
+park-cwd evidence; 20260921T195832Z the fixture-inconsistency run).
 
 ### Environment
 
@@ -346,114 +358,74 @@ plus every flow's verbatim --json envelope under flows/).
 | Backend | restic 0.19.1 (windows/amd64, go1.26.4), local repo in the scratch |
 | Go | go1.27.1 windows/amd64 |
 | Corpus | 6 archetypes, scale 1.0, seed 20260921: 16,680 files / 5.2 GiB |
-| Total harness runtime | 299.5 s (~5 min), single run |
-| Volume free-space noise | drift 3.8 MiB over 8 pre-run samples (deltas within this are noise) |
+| Total harness runtime | 336.3 s (~5 min 36 s), single run |
+| Volume free-space noise | drift 1.2 MiB over 8 pre-run samples (deltas within this are noise) |
 | Peak memory method | Windows Job Object `PeakJobMemoryUsed` — the commit peak of the WHOLE flow tree (ebb + restic + cmd.exe recipes), not ebb alone |
 
 Flows run headless with `--json`; argv is pinned by test
 (`reclaim --dry-run --yes`, `reclaim --yes`, `restore --json` — restore
 takes no `--yes` by its own contract — `park <root> --yes
 --assert-writers-stopped`, `open <name> --yes` from outside the
-workspace; see the park finding below).
+workspace; see the open finding below).
 
-### Results: RESULTS PENDING FIX
+### Results: all six archetypes pass
 
-Five of six archetypes fully passed their contracts (flows exited as
-designed, every Preserve byte identical after every flow). Two findings
-block a clean bill — both are recorded verbatim in the raw evidence, not
-massaged:
-
-**Finding 1 (ebb bug, reproduced minimally both ways): `ebb park` run
-from inside the workspace cannot complete on Windows.** With its cwd
-inside the workspace — the CLI's own default shape, `ebb park [path]`
-with path "." — park fails at the quarantine rename with errno 32 every
-time: the invoking process's own cwd handle blocks renaming the root
-directory. Exit 5 (`reconciliation-required`):
-
-```text
-lifecycle: removal blocked at C:\ebb-gauntlet\run-...\corpus\heavy-asset
-(EBB_E_SHARING_VIOLATION): rename to quarantine blocked by an open handle
-(errno 32); close writers and retry: rename ...\heavy-asset ...\.ebb-quarantine-...:
-The process cannot access the file because it is being used by another process.
-```
-
-An identical fixture parked from OUTSIDE with an explicit path succeeds
-(exit 0, DONE). The first scale-1.0 run
-(lab/gauntlet/results/20260921T194516Z) captured both park archetypes
-failing this way; the tables below therefore run park from outside —
-a documented deviation, not a massage. Two follow-on inconsistencies in
-the same path: the park error tells the user to run `ebb recover <op>
---resume-removal`, but recover REFUSES for a SEALED park operation
-("ResumeRemoval applies to QUARANTINED/REMOVING/REMOVAL_BLOCKED"), and
-plain `ebb recover <op>` then exits 0 "ok" WITHOUT removing the
-workspace — the park silently never completes while the report says ok.
-Likely fix direction: before the quarantine rename, if the target root
-is the process cwd, `os.Chdir` to the parent first.
-
-**Finding 2 (corpus-contract violation; ebb semantics question):
-reclaim deletes a Preserve-listed file inside a declared output.**
-polyglot-monorepo's corpus contract lists `services/api/.venv/pyvenv.cfg`
-as must-survive, but the archetype's own Ebbfile declares the whole
-`.venv` a regenerable output with no preserve pattern inside it — so
-reclaim's whole-group trim removed all three groups (api-venv included,
-500 MiB; trim detail in the raw envelope) and `pyvenv.cfg` was gone
-after the very first flow. ebb behaved exactly as its Ebbfile told it
-to; the frozen corpus (corpus.go) is internally inconsistent. The
-product question it surfaces is real: whole-group trim semantics swallow
-non-regenerable files living inside an output unless the Ebbfile author
-remembers a `[[preserve]]` pattern (which would then route through the
-D034 carve-out path).
+Every archetype met its expectation contract (flows exited as designed)
+with every Preserve byte identical after every flow and at the end —
+6/6 PASS, runner verdict "ALL EXPECTATIONS PASSED".
 
 ### clean-starter — pass (600 MiB, 2,456 files)
 
-| flow | exit | wall | peak RSS | free Δ (vs 3.8 MiB noise) | ebb bytes | expectation | preserve intact |
+| flow | exit | wall | peak RSS | free Δ (vs 1.2 MiB noise) | ebb bytes | expectation | preserve intact |
 |---|---:|---:|---:|---|---|---|---|
-| reclaim-dry | 0 | 0.8 s | 91.5 MiB | −136 KiB (noise) | — | pass | YES |
-| reclaim | 0 | 10.3 s | 221.3 MiB | +615.3 MiB | freed-est 600.0 MiB, freed-obs 615.4 MiB | pass | YES |
-| restore | 0 | 1.6 s | 162.8 MiB | −5.5 MiB | — | pass | YES |
+| reclaim-dry | 0 | 2.3 s | 90.5 MiB | +1.1 MiB (noise) | — | pass | YES |
+| reclaim | 0 | 17.1 s | 231.4 MiB | +602.3 MiB | freed-est 600.0 MiB, freed-obs 605.6 MiB | pass | YES |
+| restore | 0 | 2.6 s | 160.8 MiB | −5.7 MiB | — | pass | YES |
 
 ### real-world-dev — pass (600 MiB, 2,067 files)
 
 | flow | exit | wall | peak RSS | free Δ | ebb bytes | expectation | preserve intact |
 |---|---:|---:|---:|---|---|---|---|
-| reclaim | 0 | 10.9 s | 200.3 MiB | +500.9 MiB | freed-est 500.0 MiB, freed-obs 500.9 MiB | pass | YES |
-| restore | 0 | 5.0 s | 160.0 MiB | −6.3 MiB | — | pass | YES |
+| reclaim | 0 | 16.0 s | 211.9 MiB | +504.2 MiB | freed-est 500.0 MiB, freed-obs 504.1 MiB | pass | YES |
+| restore | 0 | 4.0 s | 159.9 MiB | +3.4 MiB | — | pass | YES |
 
 The dirty git state (unmerged spike branch, staged+unstaged edits,
 untracked .env/notes/recordings) survived both flows byte-for-byte.
 
-### polyglot-monorepo — flows passed, PRESERVE VIOLATION (Finding 2)
+### polyglot-monorepo — pass (1.5 GiB, 4,641 files)
 
 | flow | exit | wall | peak RSS | free Δ | ebb bytes | expectation | preserve intact |
 |---|---:|---:|---:|---|---|---|---|
-| reclaim | 0 | 42.1 s | 223.8 MiB | +1.5 GiB | freed-est 1.5 GiB, freed-obs 1.5 GiB | pass | **NO** |
-| restore | 0 | 2.4 s | 162.0 MiB | −6.8 MiB | — | pass | **NO** |
+| reclaim | 0 | 45.2 s | 229.3 MiB | +1.5 GiB | freed-est 1.5 GiB, freed-obs 1.5 GiB | pass | YES |
+| restore | 0 | 2.0 s | 161.2 MiB | −5.9 MiB | — | pass | YES |
 
-`services/api/.venv/pyvenv.cfg` (Preserve-listed) was deleted with the
-api-venv group's whole-output trim; every other Preserve byte identical.
+All three ecosystem groups (npm web, uv api, cargo engine) were
+trimmed whole as their Ebbfiles declare, all three offline recipes ran
+on restore, and all 36 Preserve files (manifests, locks, sources — all
+outside declared outputs) were byte-identical after both flows.
 
 ### heavy-asset — pass (1.7 GiB, 4,818 files)
 
 | flow | exit | wall | peak RSS | free Δ | ebb bytes | expectation | preserve intact |
 |---|---:|---:|---:|---|---|---|---|
-| reclaim | 0 | 23.0 s | 217.4 MiB | +158.6 MiB | freed-est 144.0 MiB, freed-obs 158.5 MiB | pass | YES |
-| park | 0 | 31.3 s | 583.3 MiB | +584 KiB (noise) | preserved 1.6 GiB, freed-est 1.6 GiB, freed-obs 424 KiB | pass | YES |
-| open | 0 | 22.6 s | 292.5 MiB | −1.68 GiB | restored 1.6 GiB | pass | YES |
+| reclaim | 0 | 22.9 s | 225.4 MiB | +159.6 MiB | freed-est 144.0 MiB, freed-obs 159.5 MiB | pass | YES |
+| park | 0 | 41.3 s | 577.1 MiB | +9.3 MiB | preserved 1.6 GiB, freed-est 1.6 GiB, freed-obs 9.5 MiB | pass | YES |
+| open | 0 | 23.2 s | 285.9 MiB | −1.68 GiB | restored 1.6 GiB | pass | YES |
 
-park's freed-obs is within the noise floor because the park SNAPSHOT
-grows the vault on the same volume by roughly what the removal frees —
-the honest attribution number is the estimate (1.6 GiB), with the
-runner-observed open delta writing it all back. Peak park RSS 583 MiB
-is the flow tree's commit peak while streaming 2 × 700 MiB safetensors
-through restic.
+park's freed-obs stays far below the estimate because the park
+SNAPSHOT grows the vault on the same volume by roughly what the removal
+frees — the honest attribution number is the estimate (1.6 GiB), with
+the runner-observed open delta writing it all back. Peak park RSS
+577 MiB is the flow tree's commit peak while streaming 2 × 700 MiB
+safetensors through restic.
 
 ### neglected-veteran — pass (600 MiB, 2,460 files)
 
 | flow | exit | wall | peak RSS | free Δ | ebb bytes | expectation | preserve intact |
 |---|---:|---:|---:|---|---|---|---|
-| reclaim | 0 | 9.8 s | 214.3 MiB | +603.0 MiB | freed-est 600.0 MiB, freed-obs 602.9 MiB | pass | YES |
-| park | 0 | 6.8 s | 272.0 MiB | −988 KiB (noise) | preserved 53.0 KiB | pass | YES |
-| open | 0 | 3.9 s | 158.6 MiB | −676 KiB (noise) | restored 53.0 KiB | pass | YES |
+| reclaim | 0 | 13.3 s | 214.2 MiB | +601.8 MiB | freed-est 600.0 MiB, freed-obs 601.7 MiB | pass | YES |
+| park | 0 | 7.0 s | 257.8 MiB | +15.1 MiB | preserved 53.0 KiB, freed-est 53.0 KiB, freed-obs 16.1 MiB | pass | YES |
+| open | 0 | 4.2 s | 156.5 MiB | +2.9 MiB | restored 53.0 KiB | pass | YES |
 
 The unresolved merge conflict round-tripped park/open UNRESOLVED, as
 Foundation §9.2 demands: after open, `.git/MERGE_HEAD` exists and
@@ -465,8 +437,8 @@ as an independent oracle). The registry-impossible lockfile and the
 
 | flow | exit | wall | peak RSS | free Δ | ebb bytes | expectation | preserve intact |
 |---|---:|---:|---:|---|---|---|---|
-| reclaim-dry | 0 | 0.4 s | 89.2 MiB | 0 B (noise) | — | pass (0 with warnings) | YES |
-| reclaim | 0 | 22.3 s | 195.1 MiB | +322.6 MiB | freed-est 330.0 MiB, freed-obs 322.4 MiB | pass (0 with warnings) | YES |
+| reclaim-dry | 0 | 0.6 s | 89.2 MiB | 0 B (noise) | — | pass (0 with warnings) | YES |
+| reclaim | 0 | 24.4 s | 194.2 MiB | +332.5 MiB | freed-est 330.0 MiB, freed-obs 332.7 MiB | pass (0 with warnings) | YES |
 
 The designed-to-fail zoo did not make ebb fail: the junction cycle
 (absolute-target junctions a→b→a), the 412-char deep path, the corrupt
@@ -479,6 +451,34 @@ did not block anything because it lives OUTSIDE every declared output —
 the scenario pins that ebb's removal authority stays inside declared
 outputs rather than sweeping parents.
 
+### Open finding (ebb bug; does not gate these tables): park from inside the workspace
+
+`ebb park` run with its cwd INSIDE the workspace — the CLI's own
+default shape, `ebb park [path]` with path "." — fails on Windows at
+the quarantine rename with errno 32 every time: the invoking process's
+own cwd handle blocks renaming the root directory. Exit 5
+(`reconciliation-required`):
+
+```text
+lifecycle: removal blocked at C:\ebb-gauntlet\run-...\corpus\heavy-asset
+(EBB_E_SHARING_VIOLATION): rename to quarantine blocked by an open handle
+(errno 32); close writers and retry: rename ...\heavy-asset ...\.ebb-quarantine-...:
+The process cannot access the file because it is being used by another process.
+```
+
+An identical fixture parked from OUTSIDE with an explicit path succeeds
+(exit 0, DONE). Reproduced minimally both ways (evidence:
+lab/gauntlet/results/20260921T194516Z); the tables above therefore run
+park/open from outside — a documented deviation, not a massage. Two
+follow-on inconsistencies in the same path: the park error tells the
+user to run `ebb recover <op> --resume-removal`, but recover REFUSES
+for a SEALED park operation ("ResumeRemoval applies to
+QUARANTINED/REMOVING/REMOVAL_BLOCKED"), and plain `ebb recover <op>`
+then exits 0 "ok" WITHOUT removing the workspace. Likely fix direction:
+before the quarantine rename, if the target root is the process cwd,
+`os.Chdir` to the parent first. Until the fix lands and the gauntlet is
+re-run, the park/open numbers here describe the from-outside shape.
+
 ### Limitations (honest)
 
 - Restore recipes recreate 5 MiB marker trees, NOT full dependency
@@ -489,10 +489,9 @@ outputs rather than sweeping parents.
   restic + cmd.exe recipes) — ebb-alone RSS is strictly lower; no
   per-process split is claimed.
 - Volume free-space deltas are observations on a live OS volume against
-  a 3.8 MiB measured noise floor; park's freed-obs is further confounded
+  a 1.2 MiB measured noise floor; park's freed-obs is further confounded
   by vault growth on the same volume (noted above).
 - Single wall-clock runs, not medians; the machine is a live laptop.
-- The two findings above mean this section is RESULTS PENDING FIX, not
-  a clean baseline: re-run the gauntlet after the park-cwd fix (and the
-  polyglot corpus/Ebbfile reconciliation) before quoting these tables
-  as the reference numbers.
+- park/open are measured via the from-outside shape because of the open
+  park-cwd finding above; re-run the gauntlet after that fix to cover
+  the CLI's default from-inside shape too.
