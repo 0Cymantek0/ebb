@@ -30,13 +30,26 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 func main() {
+	// Fixture portability: the `save` producer observes the freezer's
+	// teardown as a broken pipe on stdout and must log its `save-exit`
+	// evidence line before exiting 1. On Windows a write into a closed
+	// pipe is a plain error the switch below already handles; on Linux
+	// the Go runtime KILLS fd-1/2 writers with SIGPIPE before user code
+	// runs, so the producer would die a signal death with no log line
+	// and the test would see an orphan-lookalike instead. Ignoring
+	// SIGPIPE makes the write return EPIPE on every platform, exactly as
+	// the tardump fixture already does (Wave J). No-op on Windows.
+	signal.Ignore(syscall.SIGPIPE)
+
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "fakedocker: missing subcommand")
 		os.Exit(2)
