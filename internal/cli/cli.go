@@ -344,6 +344,7 @@ commands:
   reclaim [path] --target N  plan and execute the least disruptive sufficient release: trim, then park only if needed
   open <name-or-snapshot-id> [--to dir]
                              recover a parked/captured workspace (files-only in v1)
+                             (with --resume/--cancel the target is an operation id or workspace name)
                              (bare "ebb open" on a terminal offers an interactive picker)
   restore [path]             recreate trimmed dependencies in place on a live workspace
                              (the inverse of reclaim; git-gated, drift-reconciled)
@@ -370,6 +371,12 @@ commands:
 
 common flags:
   --json                     emit the machine result envelope on stdout
+
+stats flags:
+  --web                      serve the read-only local control center on 127.0.0.1 (stop with Ctrl+C;
+                             mutually exclusive with --share and --json)
+  --share                    export the dashboard as a shareable PNG card (combinable with --json)
+  --out <file>               destination for --share (default: ebb-stats-YYYYMMDD.png in the current directory)
 
 plan flags:
   --from-inventory <file>    load a saved inventory JSON instead of scanning
