@@ -393,8 +393,8 @@ open flags:
   --to <dir>                 destination directory (default: the workspace's recorded root)
   --files-only               stop after publishing the preserved files (no reconstruction)
   --yes                      record approvals for not-yet-approved reconstruction actions without a prompt (never covers approval drift)
-  --resume <op-or-workspace> resume the rebuild of an interrupted open (reruns only actions without a recorded success)
-  --cancel <op-or-workspace> cancel a REBUILD_FAILED/REBUILDING open operation (files stay; snapshot stays pinned)
+  --resume                   resume the rebuild of the interrupted open named by the positional argument (reruns only actions without a recorded success)
+  --cancel                   cancel the REBUILD_FAILED/REBUILDING open operation of the positional workspace (files stay; snapshot stays pinned)
 
 restore flags:
   --strategy merge|current|baseline

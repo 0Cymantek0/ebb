@@ -309,3 +309,20 @@ func TestMainNilStreams(t *testing.T) {
 		t.Fatalf("code = %d", code)
 	}
 }
+
+// TestUsageOpenResumeCancelAreBooleans pins the usage text against value-flag
+// misrendering: --resume/--cancel are boolean flags with the target as the
+// positional argument (cmd_open.go), and the usage once claimed otherwise.
+func TestUsageOpenResumeCancelAreBooleans(t *testing.T) {
+	_, _, stderr := run("help")
+	for _, bad := range []string{"--resume <", "--cancel <"} {
+		if strings.Contains(stderr, bad) {
+			t.Fatalf("usage renders %q as a value flag; it is boolean (got usage text containing it)", bad)
+		}
+	}
+	for _, want := range []string{"--resume ", "--cancel "} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("usage text lost %q", want)
+		}
+	}
+}

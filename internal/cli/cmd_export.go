@@ -5,7 +5,7 @@
 // entries, fully verified before a no-clobber publication. Export NEVER
 // implies forget: the source snapshot stays pinned by its original
 // reasons; the export's own pin (reason `export:<opID>`) is released on
-// completion. Import (`ebb import`) is future work.
+// completion. Import (`ebb import`) is the counterpart command.
 //
 // Wiring: vault resolution + catalog duties (pin, operation journal,
 // replicas receipt) live here; the transport itself is internal/capsule
