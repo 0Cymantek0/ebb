@@ -300,15 +300,18 @@ func TestAnalyseBatchPrintModeHasNoEffects(t *testing.T) {
 	})
 	h.deps.AnalyseGitSurvey = survey
 
-	// Non-tty, no --yes: print-only.
+	// Non-tty, no --yes: print-only (commands render POSIX-quoted; the
+	// quoting rules themselves are pinned by TestAnalyseShellQuote).
 	code, _, stderr := h.run("analyse", "--reclaim-stale", "--prune-worktrees", root)
 	if code != ExitOK {
 		t.Fatalf("code = %d, stderr = %s", code, stderr)
 	}
-	if !strings.Contains(stderr, "ebb reclaim "+stale+" --yes") {
+	wantReclaim, _ := renderCommand([]string{"ebb", "reclaim", stale, "--yes"})
+	wantPrune, _ := renderCommand([]string{"git", "worktree", "remove", wt})
+	if !strings.Contains(stderr, wantReclaim) {
 		t.Errorf("reclaim command not printed:\n%s", stderr)
 	}
-	if !strings.Contains(stderr, "git worktree remove "+wt) {
+	if !strings.Contains(stderr, wantPrune) {
 		t.Errorf("worktree command not printed:\n%s", stderr)
 	}
 	// No effects: the stale project's node_modules and the worktree
@@ -494,6 +497,11 @@ func TestAnalysePruneWorktreesRealGit(t *testing.T) {
 	}
 	runGit(t, main, "init", "-q")
 	runGit(t, main, "checkout", "-q", "-b", "main")
+	// Byte-deterministic fixture regardless of the machine's system
+	// config (this host's system core.autocrlf=true makes LF-committed
+	// files look phantom-dirty under ebb's constructed env — the same
+	// neutralization gitadapter's fixtures apply; see fixtures_test.go).
+	runGit(t, main, "config", "core.autocrlf", "false")
 	runGit(t, main, "add", ".")
 	runGit(t, main, "commit", "-q", "-m", "initial")
 
@@ -600,5 +608,206 @@ func TestAnalysePruneInteractiveDecline(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "execute? type 'yes'") {
 		t.Errorf("typed confirmation not offered:\n%s", stderr)
+	}
+}
+
+// TestAnalyseNestedReclaimNeverConsumesRealStdin (F2): the batch spawns
+// `ebb reclaim` IN-PROCESS while the outer analyse runs on a real
+// terminal (tty seam true). The inner park-escalation gate must take
+// its headless refusal path: StdinIsTerminal and ReadLine are
+// process-global seams, and before the fix the inner gate printed its
+// question into a discarded stream and then BLOCKED on real stdin —
+// the user's next typed line (muscle-memory "yes") invisibly authorized
+// park-and-REMOVE. Here ReadLine is poisoned to fail the test if ever
+// called; the item must visibly decline and name the gate.
+func TestAnalyseNestedReclaimNeverConsumesRealStdin(t *testing.T) {
+	h := newEHarness(t)
+	h.tty = true // outer analyse on a terminal; --yes gives batch consent
+	poisoned := false
+	h.deps.StdinIsTerminal = func() bool { return true }
+	h.deps.ReadLine = func() (string, error) {
+		poisoned = true
+		return "", fmt.Errorf("poisoned ReadLine consumed by a nested gate")
+	}
+
+	root := t.TempDir()
+	proj := filepath.Join(root, "gate-proj")
+	// No Ebbfile → the inner reclaim has no trim groups, so its plan
+	// reaches the park escalation gate (the exact gate that used to
+	// block on real stdin).
+	writeAnalyseFixture(t, proj, "package.json", 0)
+	if err := os.MkdirAll(filepath.Join(proj, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	survey := &cliFakeSurvey{}
+	survey.set(proj, analyse.RepoSummary{IsRepo: true, LastActivityAt: time.Now().Add(-45 * 24 * time.Hour)})
+	h.deps.AnalyseGitSurvey = survey
+
+	code, stdout, stderr := h.run("analyse", "--json", "--reclaim-stale", "--yes", root)
+	if code != ExitOK {
+		t.Fatalf("code = %d, stdout=%s stderr = %s", code, stdout, stderr)
+	}
+	if poisoned {
+		t.Fatal("a nested gate consumed the (real) stdin ReadLine seam — interactivity leaked into the batch child")
+	}
+	// The project was NOT parked/removed: it still exists, files intact.
+	if _, err := os.Stat(filepath.Join(proj, "package.json")); err != nil {
+		t.Fatalf("project content removed by the nested reclaim: %v", err)
+	}
+	env := envelopeOf(t, stdout)
+	det := env["details"].(map[string]any)
+	batches, _ := det["batches"].([]any)
+	if len(batches) != 1 {
+		t.Fatalf("batches = %v", batches)
+	}
+	item := batches[0].(map[string]any)
+	detail := item["detail"].(string)
+	if !strings.Contains(detail, "escalation") {
+		t.Errorf("item detail must name the refused gate: %q", detail)
+	}
+	if !strings.Contains(detail, "`ebb reclaim "+proj+"` interactively") {
+		t.Errorf("item detail must suggest the interactive rerun: %q", detail)
+	}
+	// The refusal is visible in the human stream too (digest surfaced).
+	if !strings.Contains(stderr, "") && stdout == "" {
+		t.Error("no report emitted")
+	}
+}
+
+// flipSurvey returns clean facts on every odd SurveyRepo call for a
+// root (the scans) and dirty+unpushed facts on every even call (the
+// F5 re-probe right before execution must see the fresh shields).
+type flipSurvey struct {
+	inner analyse.GitSurveyor
+	calls map[string]int
+}
+
+func (f *flipSurvey) SurveyRepo(ctx context.Context, root string) (analyse.RepoSummary, error) {
+	sum, err := f.inner.SurveyRepo(ctx, root)
+	if err != nil {
+		return sum, err
+	}
+	f.calls[root]++
+	if f.calls[root]%2 == 0 {
+		sum.DirtyWorktree = true
+		sum.UnpushedCommits = 7
+	}
+	return sum, nil
+}
+
+// TestAnalyseRecheckShieldsBeforeExecution (F5): a project that was
+// clean at scan time but dirty by execution time is skipped with a
+// clear newly-shielded status instead of a doomed reclaim attempt.
+func TestAnalyseRecheckShieldsBeforeExecution(t *testing.T) {
+	h := newEHarness(t)
+	root := t.TempDir()
+	proj := filepath.Join(root, "flipped")
+	writeAnalyseFixture(t, proj, "package.json", 128)
+	if err := os.MkdirAll(filepath.Join(proj, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	survey := &cliFakeSurvey{}
+	survey.set(proj, analyse.RepoSummary{IsRepo: true, LastActivityAt: time.Now().Add(-45 * 24 * time.Hour)})
+	h.deps.AnalyseGitSurvey = &flipSurvey{inner: survey, calls: map[string]int{}}
+
+	code, stdout, stderr := h.run("analyse", "--json", "--reclaim-stale", "--yes", root)
+	if code != ExitOK {
+		t.Fatalf("code = %d, stdout=%s stderr = %s", code, stdout, stderr)
+	}
+	// Nothing was trimmed: the node_modules fixture survives.
+	if _, err := os.Stat(filepath.Join(proj, "node_modules")); err != nil {
+		t.Fatalf("newly shielded project was still acted on: %v", err)
+	}
+	env := envelopeOf(t, stdout)
+	det := env["details"].(map[string]any)
+	batches, _ := det["batches"].([]any)
+	if len(batches) != 1 {
+		t.Fatalf("batches = %v", batches)
+	}
+	item := batches[0].(map[string]any)
+	if item["status"] != "skipped-shielded" {
+		t.Errorf("status = %v, want skipped-shielded (item %v)", item["status"], item)
+	}
+	detail := item["detail"].(string)
+	if !strings.Contains(detail, "newly shielded") || !strings.Contains(detail, "[DIRTY]") {
+		t.Errorf("detail must name the fresh shields: %q", detail)
+	}
+	// The skip is visible in the human stream too (second, human-mode run).
+	_, _, stderr = h.run("analyse", "--reclaim-stale", "--yes", root)
+	if !strings.Contains(stderr, "newly shielded") {
+		t.Errorf("human stream must carry the skip reason:\n%s", stderr)
+	}
+}
+
+// TestAnalyseShellQuote (F4b): copyable command lines quote every
+// element POSIX-safely, and unquotable elements (control characters)
+// withhold the line.
+func TestAnalyseShellQuote(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"ebb", "ebb", true},
+		{"--yes", "--yes", true},
+		{"/home/u/proj", "/home/u/proj", true},
+		{`C:\Users\u\proj`, `'C:\Users\u\proj'`, true}, // backslash → quoted
+		{"/home/u/my proj", `'/home/u/my proj'`, true}, // space → quoted
+		{"/home/u/it's", `'/home/u/it'\''s'`, true},    // single quote → escaped
+		{"", "''", true},                               // empty → explicit empty
+		{"evil\nname", "", false},                      // newline → unquotable
+		{"\x1b[31mred\x1b[0m", "", false},              // ANSI → unquotable
+	}
+	for _, c := range cases {
+		got, ok := shellQuote(c.in)
+		if ok != c.ok || got != c.want {
+			t.Errorf("shellQuote(%q) = (%q, %v), want (%q, %v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
+	line, ok := renderCommand([]string{"ebb", "reclaim", "/home/u/my proj", "--yes"})
+	if !ok || line != `ebb reclaim '/home/u/my proj' --yes` {
+		t.Errorf("renderCommand = (%q, %v)", line, ok)
+	}
+	if _, ok := renderCommand([]string{"ebb", "reclaim", "evil\nname", "--yes"}); ok {
+		t.Error("renderCommand accepted a control-character path")
+	}
+	// stripControlChars: the digest/detail sanitizer (the ESC bytes go;
+	// the inert [31m text they carried stays, harmlessly unexecutable).
+	if got := stripControlChars("fatal: \x1b[31mbad\x1b[0m repo\nnext"); got != "fatal:  [31mbad [0m repo next" {
+		t.Errorf("stripControlChars = %q", got)
+	}
+}
+
+// TestAnalyseRenderSanitizesHostileProject (F4): a project name with
+// newline/ANSI (surfaced by the engine shielded, never as a copyable
+// command) renders sanitized: no raw control characters anywhere in the
+// human report, no command line for it.
+func TestAnalyseRenderSanitizesHostileProject(t *testing.T) {
+	hostile := "evil\x1b[31m\nname"
+	details := analyseDetails{Report: analyse.Report{
+		Scanned:    1,
+		Categories: map[string]int{string(analyse.CategoryStale): 1},
+		Projects: []analyse.Project{{
+			Name: hostile, Root: "/scan/root/" + hostile,
+			Category: analyse.CategoryStale,
+			Shields:  []string{analyse.ShieldUnsafeName},
+			Recommendation: analyse.Recommendation{
+				Kind:   "reclaim",
+				Reason: "untouched for 45 days (stale); shielded [UNSAFE NAME]: skipped in batch operations",
+			},
+		}},
+		Warnings: []string{"skipped link child /scan/root/" + hostile + " (opaque)"},
+	}}
+	out := renderAnalyseHuman(details, false)
+	for _, line := range strings.Split(out, "\n") {
+		if analyse.HasControlChars(strings.TrimRight(line, "\r")) {
+			t.Errorf("rendered line carries raw control characters: %q", line)
+		}
+	}
+	if !strings.Contains(out, "[UNSAFE NAME]") {
+		t.Errorf("unsafe-name shield not rendered:\n%s", out)
+	}
+	if strings.Contains(out, "-> ebb") || strings.Contains(out, "-> git") {
+		t.Errorf("copyable command rendered for an unsafe-name project:\n%s", out)
 	}
 }

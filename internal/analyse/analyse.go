@@ -147,9 +147,30 @@ const (
 	ShieldConflict = "[CONFLICT]"         // in-flight merge/rebase; skipped in batches
 	ShieldDirty    = "[DIRTY]"            // uncommitted changes; no worktree removal
 	ShieldLocked   = "[LOCKED]"           // active file locks; skipped in batches
+	// ShieldUnsafeName marks a project whose name or root path carries
+	// control characters: such text cannot be rendered safely into
+	// copyable command lines (a newline would make the pasted line
+	// execute a second line), so the copyable command is withheld and
+	// every batch skips the project.
+	ShieldUnsafeName = "[UNSAFE NAME]"
 	// NoteOffline prefixes the per-project offline note.
 	NoteOffline = "[OFFLINE]"
 )
+
+// HasControlChars reports whether s carries terminal-control bytes:
+// anything below 0x20 or DEL (0x7f). Path separators and all printable
+// text are fine. UTF-8 continuation bytes are always >= 0x80, so the
+// byte-level test cannot false-positive on multi-byte runes. Strings
+// that fail this test must never be embedded into copyable command
+// lines or prompts.
+func HasControlChars(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f {
+			return true
+		}
+	}
+	return false
+}
 
 // OutputRoot is one known regenerable output folder found in (or under)
 // a project, with its shallow logical size estimate.

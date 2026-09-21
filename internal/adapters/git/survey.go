@@ -189,7 +189,7 @@ func SurveyRepo(ctx context.Context, rootPath string) (RepoSummary, error) {
 	if !hasUpstream {
 		sum.UnpushedCommits = -1
 		sum.Warnings = append(sum.Warnings,
-			"no usable upstream for HEAD (rev-parse @{u} exited "+strconv.Itoa(upRc)+": "+firstLine(upErr)+
+			"no usable upstream for HEAD (rev-parse @{u} exited "+strconv.Itoa(upRc)+": "+firstLineClean(upErr)+
 				"); unpushed commit count unknown (reported -1)")
 	} else {
 		out, errStr, rc, err := r.run(ctx, absRoot, commandTimeout,
@@ -199,18 +199,18 @@ func SurveyRepo(ctx context.Context, rootPath string) (RepoSummary, error) {
 		}
 		switch {
 		case rc == 0:
-			if n, perr := strconv.ParseInt(firstLine(out), 10, 64); perr == nil {
+			if n, perr := strconv.ParseInt(firstLineClean(out), 10, 64); perr == nil {
 				sum.UnpushedCommits = n
 			} else {
 				sum.UnpushedCommits = -1
 				sum.Warnings = append(sum.Warnings,
-					fmt.Sprintf("unparseable rev-list count %q; unpushed commit count unknown (reported -1)", firstLine(out)))
+					fmt.Sprintf("unparseable rev-list count %q; unpushed commit count unknown (reported -1)", firstLineClean(out)))
 			}
 		default:
 			sum.UnpushedCommits = -1
 			sum.Warnings = append(sum.Warnings,
 				fmt.Sprintf("rev-list --count @{u}..HEAD exited %d: %s; unpushed commit count unknown (reported -1)",
-					rc, firstLine(errStr)))
+					rc, firstLineClean(errStr)))
 		}
 	}
 
@@ -257,7 +257,7 @@ func SurveyRepo(ctx context.Context, rootPath string) (RepoSummary, error) {
 	switch {
 	case rc != 0:
 		sum.Warnings = append(sum.Warnings,
-			fmt.Sprintf("HEAD author time unavailable: rev-list --format=%%at exited %d: %s", rc, firstLine(errStr)))
+			fmt.Sprintf("HEAD author time unavailable: rev-list --format=%%at exited %d: %s", rc, firstLineClean(errStr)))
 	case len(lines) == 0:
 		sum.Warnings = append(sum.Warnings, "HEAD author time unavailable: rev-list --format=%at produced no output")
 	default:
@@ -279,7 +279,7 @@ func SurveyRepo(ctx context.Context, rootPath string) (RepoSummary, error) {
 	}
 	if rc != 0 {
 		sum.Warnings = append(sum.Warnings,
-			fmt.Sprintf("for-each-ref --merged=HEAD exited %d: %s; stale merged branches unknown", rc, firstLine(errStr)))
+			fmt.Sprintf("for-each-ref --merged=HEAD exited %d: %s; stale merged branches unknown", rc, firstLineClean(errStr)))
 	} else {
 		var stale []string
 		truncated := false
@@ -323,7 +323,7 @@ func headAncestorOf(ctx context.Context, r *runner, dir, ref string) (merged, kn
 	case 1:
 		return false, true, "", nil
 	default:
-		return false, false, fmt.Sprintf("exited %d: %s", rc, firstLine(errStr)), nil
+		return false, false, fmt.Sprintf("exited %d: %s", rc, firstLineClean(errStr)), nil
 	}
 }
 
@@ -392,10 +392,13 @@ func lfsObjectsSize(gitDir, commonDir string) (int64, []string) {
 }
 
 // walkLFSObjects walks the LFS objects directory under the file-count
-// and wall-clock budgets, summing regular file sizes. Symlinks are
-// opaque leaves; directory entries carrying a symlink bit (Windows
-// junctions) are not descended so the walk stays inside .git. Exceeding
-// either budget stops the walk with a partial sum and a warning.
+// and wall-clock budgets, summing regular file sizes. Links are opaque
+// leaves: the link test follows the project rule (ModeSymlink OR
+// ModeIrregular — Go reports NTFS junctions as ModeIrregular, with or
+// without ModeDir depending on the Go version), so a junction inside
+// .git/lfs/objects is never descended into even when it carries the
+// directory bit. Exceeding either budget stops the walk with a partial
+// sum and a warning.
 func walkLFSObjects(dir string) (bytes int64, warning string) {
 	deadline := time.Now().Add(lfsWalkTimeBudget)
 	files := 0
@@ -407,10 +410,16 @@ func walkLFSObjects(dir string) (bytes int64, warning string) {
 			warning = "lfs objects walk exceeded wall-clock budget; byte sum is partial"
 			return fs.SkipAll
 		}
-		if !d.Type().IsRegular() {
-			if d.IsDir() && d.Type()&fs.ModeSymlink != 0 {
+		if mode := d.Type(); mode&(fs.ModeSymlink|fs.ModeIrregular) != 0 {
+			// Opaque link (symlink or junction): a directory-shaped one
+			// is skipped whole; SkipDir on a file-shaped one would skip
+			// the remaining siblings, so a leaf is simply not counted.
+			if d.IsDir() {
 				return fs.SkipDir
 			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
 			return nil
 		}
 		if files >= lfsWalkFileLimit {
@@ -433,6 +442,39 @@ func walkLFSObjects(dir string) (bytes int64, warning string) {
 	}
 	return bytes, warning
 }
+
+// stripControlChars removes terminal-control bytes (anything below 0x20
+// and DEL 0x7f) from git-provided text before it is embedded into
+// warnings: git stderr is external text and ANSI escapes must not echo
+// into ebb's human stream (terminal-injection hardening). Each control
+// byte becomes a space; UTF-8 continuation bytes are always >= 0x80 so
+// the byte-level pass cannot damage multi-byte runes.
+func stripControlChars(s string) string {
+	clean := true
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f {
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// firstLineClean is firstLine with control characters stripped: the
+// form used whenever git output is embedded into summary warnings.
+func firstLineClean(s string) string { return stripControlChars(firstLine(s)) }
 
 // displayBranch strips the refs/heads/ prefix for summary display.
 func displayBranch(ref string) string {

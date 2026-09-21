@@ -243,15 +243,24 @@ func probeOutputRoots(root string, entries []fs.DirEntry, isMonorepo bool) ([]Ou
 			return
 		}
 		fi, err := os.Lstat(abs)
-		if err != nil || !fi.IsDir() {
+		if err != nil {
 			return
 		}
-		seenPaths[rel] = true
-		// A link-shaped output root is opaque (size 0, never followed).
+		// The opaque-link test comes BEFORE the IsDir gate: junctions
+		// carry ModeIrregular and (Go 1.27/Windows) no ModeDir, so an
+		// IsDir-first order silently dropped the documented "noted
+		// present with a zero estimate" opaque-leaf branch. A
+		// link-shaped output root is an opaque leaf: size 0, never
+		// followed (§11.5E) — whichever mode bits it carries.
 		if isOpaqueLink(fi.Mode()) {
+			seenPaths[rel] = true
 			out = append(out, OutputRoot{Name: name, Path: rel, Bytes: 0})
 			return
 		}
+		if !fi.IsDir() {
+			return
+		}
+		seenPaths[rel] = true
 		out = append(out, OutputRoot{Name: name, Path: rel, Bytes: shallowLogicalSize(abs)})
 	}
 	for _, name := range heavyFolders {

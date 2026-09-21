@@ -42,13 +42,22 @@ var defaultThresholds = classifyThresholds{
 }
 
 // classify sets p.Category, p.Shields and p.Recommendation. Order:
-// offline placeholder first, then shields from the git survey, then the
-// merged-worktree rule (native git delegation wins over age buckets),
-// then the age/footprint buckets.
+// offline placeholder first, the unsafe-name shield next (terminal
+// injection), then shields from the git survey, then the merged-worktree
+// rule (native git delegation wins over age buckets), then the
+// age/footprint buckets.
 func classify(p *Project, now time.Time, t classifyThresholds) {
 	if p.Offline {
 		p.Category = CategoryOffline
 		return
+	}
+
+	// ---- unsafe-name shield (terminal-injection hardening) --------------
+	// A name or path carrying control characters cannot be rendered
+	// safely into copyable command lines: the project is shielded out of
+	// every batch and its copyable command is withheld (commandFor).
+	if HasControlChars(p.Name) || HasControlChars(p.Root) {
+		p.Shields = append(p.Shields, ShieldUnsafeName)
 	}
 
 	// ---- shields ------------------------------------------------------
@@ -71,7 +80,7 @@ func classify(p *Project, now time.Time, t classifyThresholds) {
 		p.Category = CategoryMergedWorktree
 		p.Recommendation = Recommendation{
 			Kind:    "worktree-remove",
-			Command: []string{"git", "worktree", "remove", p.Root},
+			Command: p.commandFor("git", "worktree", "remove", p.Root),
 			Reason:  "linked worktree whose HEAD is merged upstream with a clean tree",
 		}
 		appendShieldReasons(p)
@@ -93,7 +102,7 @@ func classify(p *Project, now time.Time, t classifyThresholds) {
 			p.Category = CategoryBloatedActive
 			p.Recommendation = Recommendation{
 				Kind:    "reclaim",
-				Command: []string{"ebb", "reclaim", p.Root},
+				Command: p.commandFor("ebb", "reclaim", p.Root),
 				Reason:  "active project whose estimated regenerable footprint exceeds the bloated threshold; reclaim trims it without parking",
 			}
 		} else {
@@ -106,14 +115,14 @@ func classify(p *Project, now time.Time, t classifyThresholds) {
 		p.Category = CategoryStale
 		p.Recommendation = Recommendation{
 			Kind:    "reclaim",
-			Command: []string{"ebb", "reclaim", p.Root},
+			Command: p.commandFor("ebb", "reclaim", p.Root),
 			Reason:  fmt.Sprintf("untouched for %d days (stale)", int(age.Hours()/24)),
 		}
 	default:
 		p.Category = CategoryAbandoned
 		p.Recommendation = Recommendation{
 			Kind:    "park",
-			Command: []string{"ebb", "park", p.Root},
+			Command: p.commandFor("ebb", "park", p.Root),
 			Reason: fmt.Sprintf("untouched for %d days (abandoned); parking captures and verifies, then removes the workspace",
 				int(age.Hours()/24)),
 		}
@@ -124,12 +133,24 @@ func classify(p *Project, now time.Time, t classifyThresholds) {
 	if r.UnpushedCommits > 0 {
 		p.Recommendation = Recommendation{
 			Kind:    "push-or-park",
-			Command: []string{"ebb", "park", p.Root},
+			Command: p.commandFor("ebb", "park", p.Root),
 			Reason: fmt.Sprintf("%d unpushed commit(s): park them into the vault or push to the remote; analyse never recommends deleting unpushed work",
 				r.UnpushedCommits),
 		}
 	}
 	appendShieldReasons(p)
+}
+
+// commandFor builds the copyable recommendation argv. The command is
+// WITHHELD (nil) when the project's own name or root path carries
+// control characters: a hostile name must never reach a paste-able
+// command line (the [UNSAFE NAME] shield keeps batches away and the
+// shield reason explains the omission).
+func (p Project) commandFor(argv ...string) []string {
+	if HasControlChars(p.Name) || HasControlChars(p.Root) {
+		return nil
+	}
+	return argv
 }
 
 // appendShieldReasons records the batch-skip consequences of active

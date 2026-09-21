@@ -414,18 +414,27 @@ func TestOpaqueSymlinksNotFollowed(t *testing.T) {
 		t.Errorf("link skip must be noted in warnings: %v", rep.Warnings)
 	}
 
-	// A symlinked output root inside a project: opaque, size 0, never
-	// followed.
+	// A link-shaped output root inside a project: opaque, noted present
+	// with a ZERO estimate, never followed (§11.5E). The entry itself is
+	// asserted — a junction (no ModeDir on Go 1.27/Windows) must not be
+	// dropped by an IsDir-first order.
 	dir := filepath.Join(root, "real")
 	if err := makeLink(t, filepath.Join(dir, "node_modules"), filepath.Join(outside, "node_modules")); err != nil {
 		t.Skipf("link creation unprivileged on this machine (%v); opaque-output test skipped", err)
 	}
 	rep = newTestEngine(nil).Scan(context.Background(), []string{root})
 	p := projectByName(t, rep, "real")
+	found := false
 	for _, o := range p.OutputRoots {
-		if o.Name == "node_modules" && o.Bytes != 0 {
-			t.Errorf("symlinked output root was followed or mis-sized: %+v", o)
+		if o.Path == "node_modules" {
+			found = true
+			if o.Bytes != 0 {
+				t.Errorf("link-shaped output root was followed or mis-sized: %+v", o)
+			}
 		}
+	}
+	if !found {
+		t.Errorf("link-shaped output root must be noted present with a zero estimate: %+v", p.OutputRoots)
 	}
 }
 
