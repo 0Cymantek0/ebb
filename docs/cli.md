@@ -161,16 +161,17 @@ ebb doctor [--json]
 Alias: `status`. The local dashboard over your own catalog: lifetime reclaimed and restored bytes, hoarding score (parked projects you are not touching), clean desk streak, and offline size comparisons. Everything is computed locally from `catalog.db`. There is no telemetry and no network access, in any mode.
 
 ```
-ebb stats [--json]
+ebb stats [--json] [--web | --share [--out <file>]]
 ```
 
 | Option | Description |
 |---|---|
-| `--json` | Machine envelope on stdout |
+| `--json` | Machine envelope on stdout (works with `--share`; refused with `--web`) |
+| `--web` | Serve the read-only local control center on `127.0.0.1` until Ctrl+C; opens the browser only when stdin is a terminal |
+| `--share` | Render the dashboard as a shareable PNG card (1600x900, deterministic for the same day's data) |
+| `--out <file>` | Destination for `--share` (default: `ebb-stats-YYYYMMDD.png` in the current directory) |
 
-`--web` (local read-only control center) and `--share` (PNG card export) ship in the next release; the sections below describe them as they will work.
-
-Exit codes: 0 report produced (an empty catalog is a valid report); 2 usage; 3 blocked (catalog read failure).
+Exit codes: 0 report produced (an empty catalog is a valid report); 2 usage (positional arguments, `--web` combined with `--share` or `--json`, `--out` without `--share`); 3 blocked (catalog read failure, card write failure, server failure); 130 cancelled (Ctrl+C during `--web`).
 
 #### `ebb stats --web`: read-only by construction
 
