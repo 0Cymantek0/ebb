@@ -158,7 +158,7 @@ func TestAllTablesPresent(t *testing.T) {
 	}
 	want := []string{
 		"action_runs", "approvals", "docker_images", "operations", "replicas",
-		"retention_intents", "schema_migrations", "snapshots", "vaults", "workspaces",
+		"retention_intents", "schema_migrations", "snapshots", "stats_events", "vaults", "workspaces",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("tables: got %v, want exactly %v", got, want)
