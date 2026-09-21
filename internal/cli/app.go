@@ -62,10 +62,10 @@ func RealDeps() Deps {
 		StateDir:    vault.EnsureConfigDir,
 		OpenCatalog: catalog.Open,
 		NewStore: func() (domain.SnapshotStore, func(), error) {
-			// Resolve the backend through PATH ourselves: resticstore.New
-			// absolutizes whatever string it receives, so passing the
-			// bare name would point at <cwd>\restic instead of the PATH
-			// binary. A missing binary is a provider-unavailable block.
+			// Resolve the backend through PATH ourselves and hand New an
+			// absolute path; a missing binary is a provider-unavailable
+			// block. (resticstore.New PATH-resolves bare names itself
+			// since the W2-7 fix; this keeps the failure typed here.)
 			bin, lerr := exec.LookPath("restic")
 			if lerr != nil {
 				return nil, nil, vaultError(fmt.Errorf("restic binary not found on PATH (capture backend prerequisite; `ebb doctor` reports tool details)"))
