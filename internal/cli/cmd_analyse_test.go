@@ -173,6 +173,10 @@ func TestAnalyseJSONEnvelopeShape(t *testing.T) {
 	}
 	writeAnalyseFixture(t, proj, "package.json", 10)
 
+	// RealDeps wires the git survey when a git binary exists; this test
+	// pins the UNWIRED degradation contract, so the seam goes off
+	// explicitly.
+	h.deps.AnalyseGitSurvey = nil
 	code, stdout, stderr := h.run("analyse", "--json", root)
 	if code != ExitOK {
 		t.Fatalf("code = %d, stderr = %s", code, stderr)
@@ -225,7 +229,10 @@ func TestAnalyseDockerFlagDegradationAndReport(t *testing.T) {
 	root := t.TempDir()
 	writeAnalyseFixture(t, filepath.Join(root, "plain"), "go.mod", 0)
 
-	// Unwired engine: honest warning, exit 0.
+	// Unwired engine (RealDeps wires one when a docker binary exists, so
+	// the degradation case pins the seam off explicitly): honest warning,
+	// exit 0.
+	h.deps.AnalyseDocker = nil
 	code, _, stderr := h.run("analyse", "--docker", root)
 	if code != ExitOK {
 		t.Fatalf("code = %d, stderr = %s", code, stderr)

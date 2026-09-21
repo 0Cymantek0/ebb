@@ -19,6 +19,7 @@ import (
 	"strings"
 	"syscall"
 
+	"ebb/internal/adapters/docker"
 	"ebb/internal/adapters/ecosystem"
 	gitadapter "ebb/internal/adapters/git"
 	"ebb/internal/analyse"
@@ -112,7 +113,59 @@ func RealDeps() Deps {
 	if insp, err := platform.NewWriterInspector(); err == nil {
 		deps.AnalyseLockProbe = writerInspectorAsLockProbe{insp}
 	}
+	// Git survey: the hardened adapter's SurveyRepo (D037), converted
+	// field-for-field into the analyse-side frozen shape.
+	deps.AnalyseGitSurvey = gitSurveyorAdapter{}
+	// Docker engine: wired only when a docker binary is on PATH; absence
+	// keeps the seam nil and `ebb analyse --docker` degrades honestly.
+	if bin, lerr := exec.LookPath("docker"); lerr == nil {
+		deps.AnalyseDocker = dockerEngineAdapter{eng: dockeradapter.New(bin)}
+	}
 	return deps
+}
+
+// gitSurveyorAdapter converts gitadapter.RepoSummary into the
+// analyse-side frozen interface type (field-for-field; the two packages
+// must never import each other).
+type gitSurveyorAdapter struct{}
+
+func (gitSurveyorAdapter) SurveyRepo(ctx context.Context, root string) (analyse.RepoSummary, error) {
+	rs, err := gitadapter.SurveyRepo(ctx, root)
+	if err != nil {
+		return analyse.RepoSummary{}, err
+	}
+	return analyse.RepoSummary{
+		IsRepo: rs.IsRepo, Branch: rs.Branch, HeadCommit: rs.HeadCommit,
+		Detached: rs.Detached, DirtyWorktree: rs.DirtyWorktree,
+		UnmergedEntries: rs.UnmergedEntries, IsWorktree: rs.IsWorktree,
+		WorktreeMain: rs.WorktreeMain, MergedUpstream: rs.MergedUpstream,
+		UnpushedCommits: rs.UnpushedCommits, LastActivityAt: rs.LastActivityAt,
+		StaleMergedBranches: rs.StaleMergedBranches, LFSObjectsBytes: rs.LFSObjectsBytes,
+		Warnings: rs.Warnings,
+	}, nil
+}
+
+// dockerEngineAdapter converts the docker adapter's report into the
+// analyse-side frozen interface type.
+type dockerEngineAdapter struct{ eng *dockeradapter.Engine }
+
+func (a dockerEngineAdapter) Report(ctx context.Context, workspaceRoots []string) (analyse.DockerReport, error) {
+	dr, err := a.eng.Report(ctx, workspaceRoots)
+	if err != nil {
+		return analyse.DockerReport{}, err
+	}
+	tiers := make([]analyse.DockerTier, len(dr.Tiers))
+	for i, t := range dr.Tiers {
+		items := make([]analyse.DockerItem, len(t.Items))
+		for j, it := range t.Items {
+			items[j] = analyse.DockerItem{ID: it.ID, Detail: it.Detail, Shield: it.Shield}
+		}
+		tiers[i] = analyse.DockerTier{Tier: t.Tier, Title: t.Title, Items: items, CopyCommand: t.CopyCommand}
+	}
+	return analyse.DockerReport{
+		Available: dr.Available, Tiers: tiers,
+		HostSlack: dr.HostSlack, SlackCommand: dr.SlackCommand, Warnings: dr.Warnings,
+	}, nil
 }
 
 // writerInspectorAsLockProbe adapts platform.WriterInspector to

@@ -59,7 +59,7 @@ const (
 	cmdHostSlack    = "wsl --shutdown; wsl --manage docker-desktop --set-sparse true; wsl -d docker-desktop fstrim -v /"
 	// freezePlaceholder is the tier 3 stand-in until the freeze worker
 	// lands the real vault pipeline; the orchestrator reconciles it.
-	freezePlaceholder = "ebb analyse --freeze"
+	freezePlaceholder = "ebb freeze"
 
 	tierDetailFreeze = "freeze-to-vault candidate: streamed docker save into the vault (SHA-256 verified in flight), 1-command restore via restic dump | docker load — then docker rmi"
 )
