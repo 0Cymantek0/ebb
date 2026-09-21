@@ -1,25 +1,32 @@
 // fakedocker is the fake docker CLI for the freezer tests (D040 tier 3).
 // It is compiled on demand by freeze_test.go (`go build`) and driven by
-// control files in $FAKE_BIN_DIR — the ONE test-seam variable the
-// freezer's docker environment passes through (a real docker CLI ignores
-// it). Every invocation appends events to $FAKE_BIN_DIR/docker.log so
-// tests assert the exact subprocess discipline: what started, what a
-// consumer actually drank, and how each producer exited.
+// control files in $FAKE_BIN_DIR — a test-seam variable the freezer's
+// docker environment forwards ONLY when the EBB_TEST_DOCKER_BIN seam is
+// active (a real docker CLI ignores it either way). Every invocation
+// appends events to $FAKE_BIN_DIR/docker.log so tests assert the exact
+// subprocess discipline: what started, what a consumer actually drank,
+// and how each producer exited.
 //
 // Control files (presence = on; numeric files carry a value):
 //
 //	version-fail      `docker version` exits 1 (daemon unreachable)
 //	inspect-missing   `image inspect` exits 1 (unknown image)
+//	inspect-id        overrides the inspect record's echoed Id verbatim
+//	                  (hostile-daemon simulation; empty = canonical form)
 //	size              inspect Size field (bytes; default 65536)
 //	save-bytes        total deterministic payload for `save` (default 1 MiB)
 //	slow-ms           per-chunk write delay in `save` (cancellation window)
 //	save-fail-after   `save` exits 1 after N written bytes (mid-stream death)
 //	load-fail         `load` consumes stdin then exits 1
+//	rmi-fail          `rmi` exits 1: value "nosuch" answers with the
+//	                  daemon's "No such image" text; any other value is an
+//	                  unrelated failure
 package main
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -90,11 +97,30 @@ func main() {
 			os.Exit(1)
 		}
 		size := ctlInt("size", 65536)
-		full := strings.TrimPrefix(id, "sha256:")
-		for len(full) < 64 {
-			full += "0"
+		echo := id
+		if v, ok := ctl("inspect-id"); ok && v != "" {
+			// Hostile-daemon simulation: echo the raw value verbatim
+			// (properly JSON-escaped so arbitrary hostile spellings still
+			// parse — the point is testing the FREEZER's validation, not
+			// JSON trivia).
+			echo = v
+		} else {
+			full := strings.TrimPrefix(id, "sha256:")
+			for len(full) < 64 {
+				full += "0"
+			}
+			echo = "sha256:" + full
 		}
-		fmt.Printf("[%s]\n", fmt.Sprintf(`{"Id":"sha256:%s","Size":%d,"RepoTags":["%s"]}`, full, size, id))
+		doc, merr := json.Marshal(struct {
+			Id       string   `json:"Id"`
+			Size     int64    `json:"Size"`
+			RepoTags []string `json:"RepoTags"`
+		}{Id: echo, Size: size, RepoTags: []string{id}})
+		if merr != nil {
+			fmt.Fprintln(os.Stderr, "fakedocker inspect:", merr)
+			os.Exit(1)
+		}
+		fmt.Printf("[%s]\n", doc)
 		logf("exit inspect 0")
 
 	case "save":
@@ -149,8 +175,20 @@ func main() {
 		fmt.Printf("Loaded image: sha256:%s\n", digest)
 
 	case "rmi":
-		fmt.Printf("Untagged: %s\n", strings.Join(os.Args[2:], " "))
-		logf("rmi-done %s", strings.Join(os.Args[2:], " "))
+		target := strings.Join(os.Args[2:], " ")
+		if mode, ok := ctl("rmi-fail"); ok {
+			if mode == "nosuch" {
+				// The real daemon's already-gone response, verbatim shape.
+				fmt.Fprintf(os.Stderr, "Error response from daemon: No such image: %s\n", target)
+				logf("rmi-nosuch %s", target)
+				os.Exit(1)
+			}
+			fmt.Fprintln(os.Stderr, "fakedocker rmi: simulated unrelated failure")
+			logf("rmi-fail-other %s", target)
+			os.Exit(1)
+		}
+		fmt.Printf("Untagged: %s\n", target)
+		logf("rmi-done %s", target)
 
 	default:
 		fmt.Fprintf(os.Stderr, "fakedocker: unknown subcommand %q\n", os.Args[1])
