@@ -20,6 +20,7 @@ package dockeradapter
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -125,6 +126,152 @@ func upstreamShaped(repo string) bool {
 	return false
 }
 
+// ---- daemon-identifier validation (W2-1) ------------------------------
+//
+// Everything the daemon reports is attacker-influenceable — a hostile or
+// compromised DOCKER_HOST endpoint is a sanctioned steering control — so
+// daemon-sourced identifiers may never flow unvalidated into the
+// CopyCommand strings rendered as "copy & run:" (the user pastes those
+// into an authenticated shell). The executed-argv side is already gated
+// (allowlistCheck + volumeNameRe in docker.go); these helpers gate the
+// rendered side. An identifier that fails validation never reaches a
+// command: its item carries badIdentifierShield, and the existing
+// exclusion mechanism (collectIDs/hasRecommendable skip shielded items)
+// keeps it out. When every candidate fails, the tier recommends nothing.
+
+// badIdentifierShield marks an item whose daemon-reported identifier
+// failed validation: the item stays visible for manual inspection but is
+// never woven into copyable command text.
+const badIdentifierShield = "daemon returned an unparseable identifier for this item; reported for manual inspection only"
+
+// daemonIDRe bounds container/image/BuildKit identifiers: an optional
+// sha256: digest prefix plus 12-64 lowercase hex characters (docker
+// emits lowercase; the rendered short form is the first 12). Always
+// validate the FULL id BEFORE shortID slicing — slicing first would let
+// a hostile payload hide past the 12-char window.
+var daemonIDRe = regexp.MustCompile(`^(?:sha256:)?[0-9a-f]{12,64}$`)
+
+// Image-reference bounds: one component (path segment or tag) may not
+// exceed maxRefComponent characters, the whole reference maxImageRefLen.
+const (
+	maxRefComponent = 128
+	maxImageRefLen  = 512
+)
+
+// validDaemonID reports whether a full daemon-reported id may be sliced
+// and embedded in copyable command text.
+func validDaemonID(id string) bool {
+	return daemonIDRe.MatchString(id)
+}
+
+// validImageRef reports whether a daemon-reported image reference
+// (repository[:tag], optionally registry-host-prefixed, the host
+// possibly carrying a :port) is safe to embed verbatim in copyable
+// command text. This is a safety allowlist, not docker's full reference
+// grammar: metacharacter-free charset, no whitespace, no control
+// characters, no dash-leading token (the CLI would read a flag), and
+// bounded component lengths.
+func validImageRef(ref string) bool {
+	if ref == "" || len(ref) > maxImageRefLen {
+		return false
+	}
+	repo := ref
+	// The tag is the final ':'-suffix carrying no '/'; a registry port
+	// always precedes a '/' inside the repository path.
+	if i := strings.LastIndexByte(ref, ':'); i > 0 && !strings.Contains(ref[i:], "/") {
+		if !validRefToken(ref[i+1:], maxRefComponent) {
+			return false
+		}
+		repo = ref[:i]
+	}
+	for _, seg := range strings.Split(repo, "/") {
+		host, port, hasPort := strings.Cut(seg, ":")
+		if !validRefToken(host, maxRefComponent) {
+			return false
+		}
+		if hasPort && !isDigits(port) {
+			return false
+		}
+	}
+	return true
+}
+
+// validRefToken is one repository path/tag component: non-empty, bounded
+// in length, starting with an alphanumeric (never a dash the CLI would
+// read as a flag) and drawn from a charset with no shell metacharacter.
+func validRefToken(tok string, max int) bool {
+	if tok == "" || len(tok) > max || !isAlnum(tok[0]) {
+		return false
+	}
+	for i := 0; i < len(tok); i++ {
+		if c := tok[i]; !isAlnum(c) && c != '.' && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func isAlnum(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// shieldBadID folds the unparseable-identifier notice into an item's
+// shield when its daemon-reported identifier failed validation. ok=false
+// shields the item even when it was otherwise recommendable; an existing
+// shield keeps its reason, appended after a semicolon.
+func shieldBadID(shield string, ok bool) string {
+	if ok {
+		return shield
+	}
+	if shield == "" {
+		return badIdentifierShield
+	}
+	return shield + "; " + badIdentifierShield
+}
+
+// sanitizeDisplay strips control characters (newline, CR, tab, ESC, DEL)
+// from daemon-sourced strings rendered for humans but never pasted into
+// a shell, so hostile daemon data cannot visually spoof report lines.
+// Values may otherwise stay raw: they are informational only.
+func sanitizeDisplay(s string) string {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f {
+			return strings.Map(func(r rune) rune {
+				if r < 0x20 || r == 0x7f {
+					return -1
+				}
+				return r
+			}, s)
+		}
+	}
+	return s
+}
+
+// sanitizeTierDisplay runs sanitizeDisplay over every rendered
+// daemon-sourced item string of every tier.
+func sanitizeTierDisplay(tiers []DockerTier) {
+	for i := range tiers {
+		for j := range tiers[i].Items {
+			it := &tiers[i].Items[j]
+			it.ID = sanitizeDisplay(it.ID)
+			it.Detail = sanitizeDisplay(it.Detail)
+			it.Shield = sanitizeDisplay(it.Shield)
+		}
+	}
+}
+
 // classify runs the whole taxonomy. Tier 5 (host VHDX slack) is
 // platform-gated and assembled by the Engine; this returns tiers
 // 0,1,2,3,4,6 in order.
@@ -142,6 +289,7 @@ func classify(s *snapshot, ix *workspaceIndex, now time.Time) ([]DockerTier, []s
 	for i := range tiers {
 		truncateItems(&tiers[i], &warnings)
 	}
+	sanitizeTierDisplay(tiers)
 	return tiers, warnings
 }
 
@@ -354,6 +502,10 @@ func classifyZombies(s *snapshot, ix *workspaceIndex, warnings *[]string) Docker
 		if name == "" {
 			name = shortID(c.ID)
 		}
+		// W2-1: the container id reaches CopyCommand; validate the FULL
+		// daemon id before the shortID slice so unparseable ids are
+		// shielded out of the command instead of embedded in it.
+		idOK := validDaemonID(c.ID)
 		entry, matched, exists := ix.correlateDockerPath(wd)
 		switch {
 		case !exists:
@@ -361,24 +513,25 @@ func classifyZombies(s *snapshot, ix *workspaceIndex, warnings *[]string) Docker
 				ID: shortID(c.ID),
 				Detail: fmt.Sprintf("exited container %q (image %s) — compose working dir no longer exists: %s",
 					name, c.Image, displayPath(wd)),
+				Shield: shieldBadID("", idOK),
 			})
 		case matched && entry.Active:
 			t.Items = append(t.Items, DockerItem{
 				ID:     shortID(c.ID),
 				Detail: fmt.Sprintf("exited container %q — working dir belongs to a live workspace", name),
-				Shield: "active workspace: " + entry.Root,
+				Shield: shieldBadID("active workspace: "+entry.Root, idOK),
 			})
 		case matched:
 			t.Items = append(t.Items, DockerItem{
 				ID:     shortID(c.ID),
 				Detail: fmt.Sprintf("exited container %q — working dir exists in a scanned (dormant) workspace", name),
-				Shield: "workspace exists: " + entry.Root,
+				Shield: shieldBadID("workspace exists: "+entry.Root, idOK),
 			})
 		default:
 			t.Items = append(t.Items, DockerItem{
 				ID:     shortID(c.ID),
 				Detail: fmt.Sprintf("exited container %q — working dir exists but was not among the scanned workspace roots", name),
-				Shield: "working dir outside scanned roots: " + displayPath(wd),
+				Shield: shieldBadID("working dir outside scanned roots: "+displayPath(wd), idOK),
 			})
 		}
 	}
@@ -409,13 +562,16 @@ func classifyColdImages(s *snapshot, ix *workspaceIndex, usage *imageUsage, now 
 		if !correlated {
 			continue // tier 4 decides upstream shaping / unclassified
 		}
+		// W2-1: the image id reaches the freeze CopyCommand; validate the
+		// FULL daemon id before the shortID slice.
+		idOK := validDaemonID(img.ID)
 		created, ok := imageCreatedAt(img, now)
 		if !ok {
 			// Correlated but unknown age: shield, never recommend.
 			t.Items = append(t.Items, DockerItem{
 				ID:     shortID(img.ID),
 				Detail: fmt.Sprintf("image %s (%s) — creation date unknown", imageRef(img), formatBytes(int64(img.Size))),
-				Shield: "unknown image age: " + entry.Root,
+				Shield: shieldBadID("unknown image age: "+entry.Root, idOK),
 			})
 			continue
 		}
@@ -425,13 +581,13 @@ func classifyColdImages(s *snapshot, ix *workspaceIndex, usage *imageUsage, now 
 			t.Items = append(t.Items, DockerItem{
 				ID:     shortID(img.ID),
 				Detail: fmt.Sprintf("image %s (%s, created %s) — in use", imageRef(img), formatBytes(int64(img.Size)), daysAgo(now.Sub(created))),
-				Shield: "in use by running container: " + strings.Join(running, ", "),
+				Shield: shieldBadID("in use by running container: "+strings.Join(running, ", "), idOK),
 			})
 		case entry.Active:
 			t.Items = append(t.Items, DockerItem{
 				ID:     shortID(img.ID),
 				Detail: fmt.Sprintf("image %s (%s, created %s) — workspace active within 14d", imageRef(img), formatBytes(int64(img.Size)), daysAgo(now.Sub(created))),
-				Shield: "active workspace: " + entry.Root,
+				Shield: shieldBadID("active workspace: "+entry.Root, idOK),
 			})
 		case now.Sub(created) > dormantImageAge:
 			t.Items = append(t.Items, DockerItem{
@@ -439,6 +595,7 @@ func classifyColdImages(s *snapshot, ix *workspaceIndex, usage *imageUsage, now 
 				Detail: fmt.Sprintf("image %s (%s, created %s; workspace %s last touched %s) — %s",
 					imageRef(img), formatBytes(int64(img.Size)), daysAgo(now.Sub(created)),
 					entry.Base, daysAgo(now.Sub(entry.LastUse)), tierDetailFreeze),
+				Shield: shieldBadID("", idOK),
 			})
 		default:
 			// Correlated to a dormant workspace but recently built: not
@@ -492,12 +649,17 @@ func classifyDormantUpstream(s *snapshot, ix *workspaceIndex, usage *imageUsage,
 				Shield: "blocked by stopped container: " + strings.Join(stopped, ", "),
 			})
 		default:
+			// W2-1: the rendered ref (repository:tag) is daemon-sourced;
+			// validate it before it joins the copyable rmi command.
+			ref := imageRef(img)
+			refOK := validImageRef(ref)
 			t.Items = append(t.Items, DockerItem{
 				ID: shortID(img.ID),
 				Detail: fmt.Sprintf("upstream image %s (%s, created %s) — re-pullable from its registry",
-					imageRef(img), formatBytes(int64(img.Size)), daysAgo(now.Sub(created))),
+					ref, formatBytes(int64(img.Size)), daysAgo(now.Sub(created))),
+				Shield: shieldBadID("", refOK),
 			})
-			if ref := imageRef(img); !seenRef[ref] {
+			if refOK && !seenRef[ref] {
 				seenRef[ref] = true
 				refs = append(refs, ref)
 			}
@@ -536,30 +698,35 @@ func classifyOrphanVolumes(s *snapshot, ix *workspaceIndex, usage *imageUsage, w
 			continue
 		}
 		entry, matched, exists := ix.correlateDockerPath(wd)
+		// W2-1: the volume name reaches CopyCommand; it must pass the
+		// same charset gate as the executed `volume inspect` argv, or the
+		// item is shielded out of the command.
+		nameOK := volumeNameRe.MatchString(v.Name)
 		switch {
 		case !exists:
 			t.Items = append(t.Items, DockerItem{
 				ID: v.Name,
 				Detail: fmt.Sprintf("compose volume of project %q — project dir no longer exists: %s — back up before removal (vault volume snapshot), then remove",
 					project, displayPath(wd)),
+				Shield: shieldBadID("", nameOK),
 			})
 		case matched && entry.Active:
 			t.Items = append(t.Items, DockerItem{
 				ID:     v.Name,
 				Detail: fmt.Sprintf("compose volume of project %q — workspace still live", project),
-				Shield: "active workspace: " + entry.Root,
+				Shield: shieldBadID("active workspace: "+entry.Root, nameOK),
 			})
 		case matched:
 			t.Items = append(t.Items, DockerItem{
 				ID:     v.Name,
 				Detail: fmt.Sprintf("compose volume of project %q — workspace exists (dormant)", project),
-				Shield: "workspace exists: " + entry.Root,
+				Shield: shieldBadID("workspace exists: "+entry.Root, nameOK),
 			})
 		default:
 			t.Items = append(t.Items, DockerItem{
 				ID:     v.Name,
 				Detail: fmt.Sprintf("compose volume of project %q — project dir exists outside the scanned workspace roots", project),
-				Shield: "outside scanned roots: " + displayPath(wd),
+				Shield: shieldBadID("outside scanned roots: "+displayPath(wd), nameOK),
 			})
 		}
 	}
