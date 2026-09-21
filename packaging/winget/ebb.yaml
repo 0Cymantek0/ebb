@@ -1,0 +1,23 @@
+# winget-pkgs VERSION manifest for Ebb (multi-file manifest set, root file).
+#
+# Schema: manifest.version.1.12.0 — verified against
+#   https://learn.microsoft.com/en-us/windows/package-manager/package/manifest
+#   https://github.com/microsoft/winget-pkgs/tree/master/doc/manifest/schema
+#
+# MAINTAINER PUBLISH CHECKLIST (see packaging/README.md for the full runbook):
+#   1. This file is submitted only as a template reference; winget-pkgs
+#      submissions are generated per-version. Update PackageVersion for the
+#      release being submitted.
+#   2. PackageIdentifier is Publisher.Package. "Ebb.Ebb" assumes the
+#      publisher name equals the product name; if the public repo is
+#      published under an organization, change the publisher part to match
+#      (e.g. "Acme.Ebb") and use the SAME identifier in all three files.
+#   3. `Ebb.Ebb` is unique in winget-pkgs as of authoring; verify with
+#      `winget search --id Ebb.Ebb` before submitting.
+#
+# File name in the winget-pkgs PR: manifests/e/Ebb/Ebb/0.1.0/Ebb.Ebb.yaml
+PackageIdentifier: Ebb.Ebb
+PackageVersion: 0.1.0
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.12.0

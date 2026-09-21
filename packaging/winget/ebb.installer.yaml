@@ -1,0 +1,52 @@
+# winget-pkgs INSTALLER manifest for Ebb — portable .exe delivered inside a ZIP.
+#
+# Schema: manifest.installer.1.12.0 — verified against
+#   https://learn.microsoft.com/en-us/windows/package-manager/package/manifest
+#   installer spec: winget-pkgs/doc/manifest/schema/1.12.0/installer.md
+#
+# How the artifact is shaped (defined by scripts/release.sh, do not guess):
+#   - release asset: ebb-<version>-windows-amd64.zip
+#     (dist/<version>/ebb-<version>-windows-amd64.zip)
+#   - archive MEMBER name: ebb-windows-amd64.exe (binary at archive root,
+#     NO version in the member name)
+#   - SHA256 of the ZIP equals the matching line of the release SHA256SUMS.txt
+#
+# Schema notes (verified):
+#   - InstallerType: zip requires NestedInstallerType + NestedInstallerFiles
+#     (required for archive installers).
+#   - PortableCommandAlias is valid ONLY inside a NestedInstallerFiles entry
+#     and only when NestedInstallerType is portable. It gives users the `ebb`
+#     command even though the archive member is ebb-windows-amd64.exe.
+#
+# Single x64 installer on purpose: scripts/release.sh publishes exactly
+# windows/amd64 and linux/amd64 today. Do not add more architectures here
+# until release.sh actually publishes them.
+#
+# MAINTAINER PUBLISH CHECKLIST:
+#   1. Fill InstallerUrl: replace OWNER with the real GitHub owner/org
+#      (the repo had no git remote configured when this template was written).
+#   2. Fill InstallerSha256: the SHA256 of the ZIP asset — take it from the
+#      release SHA256SUMS.txt line for ebb-<version>-windows-amd64.zip.
+#      The 64-zero value below is a PLACEHOLDER and will be rejected by
+#      winget-pkgs validation; it must never be submitted as-is.
+#   3. PackageVersion and PackageIdentifier must match ebb.yaml exactly.
+#
+# File name in the winget-pkgs PR: manifests/e/Ebb/Ebb/0.1.0/Ebb.Ebb.installer.yaml
+PackageIdentifier: Ebb.Ebb
+PackageVersion: 0.1.0
+InstallerLocale: en-US
+Platform:
+  - Windows.Desktop
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: ebb-windows-amd64.exe
+        PortableCommandAlias: ebb
+    InstallerUrl: https://github.com/OWNER/ebb/releases/download/v0.1.0/ebb-0.1.0-windows-amd64.zip
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    Commands:
+      - ebb
+ManifestType: installer
+ManifestVersion: 1.12.0
