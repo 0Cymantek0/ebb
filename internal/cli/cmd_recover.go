@@ -16,6 +16,12 @@
 // user resolves the blocker, re-establishes the stopped-writers
 // condition, and asks for the destructive resume explicitly (the flag
 // also accepts the interrupted phases plain Recover completes anyway).
+// It additionally accepts a SEALED park whose removal tail was
+// attempted and blocked before the quarantine rename succeeded (Wave 4
+// gauntlet bug B — the park-time error's safe action names this flag):
+// the door revalidates the live source against the sealed inventory
+// before removing anything, honoring §12.4's "revalidate, do not
+// assume deletion remains authorized".
 //
 // --cancel abandons an operation whose removal never started
 // (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED) without
@@ -67,7 +73,7 @@ func cmdRecover(args []string, streams Streams, deps Deps) int {
 	fs.SetOutput(streams.Err)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
 	resume := fs.Bool("resume-removal", false,
-		"explicitly resume a blocked/interrupted removal walk (required for REMOVAL_BLOCKED after the blocker is resolved and writers are stopped again; QUARANTINED/REMOVING/TRIM_SEALING also complete under plain recover)")
+		"explicitly resume a blocked/interrupted removal walk (required for REMOVAL_BLOCKED after the blocker is resolved and writers are stopped again; QUARANTINED/REMOVING/TRIM_SEALING also complete under plain recover; a SEALED park whose removal tail was blocked is accepted too — it revalidates the source against the sealed inventory first)")
 	cancel := fs.Bool("cancel", false,
 		"abandon an operation whose removal never started (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED), any crashed capsule transport (EXPORT_*/IMPORT_*) or any dead restore (RESTORE_RUNNING/RESTORE_FAILED); retained snapshots stay pinned (I07)")
 	if err := fs.Parse(reorderFlags(args)); err != nil {

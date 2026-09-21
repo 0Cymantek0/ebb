@@ -365,7 +365,14 @@ func safeActionFor(err error) string {
 	}
 	var removal *lifecycle.ErrRemovalBlocked
 	if errors.As(err, &removal) {
-		return ". Safe action: resolve the blocker (close handles, fix permissions), then `ebb recover <operation-id> --resume-removal`"
+		// The blocker carries its operation id when the constructing
+		// site knows it, so the advice is literally runnable; the
+		// placeholder covers the sites that do not.
+		id := string(removal.OperationID)
+		if id == "" {
+			id = "<operation-id>"
+		}
+		return fmt.Sprintf(". Safe action: resolve the blocker (close open handles — a shell still cd'd into the workspace pins the removal until it cd's out — fix permissions), then `ebb recover %s --resume-removal`", id)
 	}
 	var inProgress *lifecycle.ErrOpInProgress
 	if errors.As(err, &inProgress) {

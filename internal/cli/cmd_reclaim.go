@@ -286,6 +286,12 @@ func cmdReclaim(args []string, streams Streams, deps Deps) int {
 			parkOpts := opts
 			parkOpts.Park = true
 			parkOpts.WriterAssertion = assertion
+			// Same cwd release as cmdPark's (bug A): the escalation
+			// renames/removes the workspace root, so the process cwd must
+			// not sit inside it. The trim stages above are deliberately
+			// untouched — removing children under the live root does not
+			// need the root handle released (removal.go).
+			releaseWorkspaceCwd(deps, streams, disc.Root, &env, *jsonOut)
 			var res lifecycle.ParkResult
 			pErr := sess.withVaultPassfile(ctx, func(repoDir, passfile string) error {
 				var rErr error
