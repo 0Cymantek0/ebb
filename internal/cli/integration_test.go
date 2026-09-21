@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -517,7 +518,28 @@ func TestDoctor(t *testing.T) {
 	if len(env.Details.Checks) < 6 {
 		t.Fatalf("checks = %+v, want at least 6", env.Details.Checks)
 	}
+	// Status contract (doctorCheck): pass | warn | fail | n/a. With
+	// restic present nothing may be fail on ANY platform. The two probes
+	// whose contract declares them Windows-only (windows-devmode,
+	// wsl-vhdx — devModeProbeCheck/wslVhdxProbeCheck in doctor.go)
+	// report exactly "n/a" off-Windows (the no-fake-parity principle)
+	// and pass/warn on Windows. Assert each platform's real contract
+	// instead of one lax set: n/a is REQUIRED on non-Windows for these
+	// two, and forbidden everywhere else (a fail means something broke;
+	// an unexpected n/a elsewhere would mean a check silently opted
+	// out).
+	windowsOnly := map[string]bool{"windows-devmode": true, "wsl-vhdx": true}
 	for _, c := range env.Details.Checks {
+		if windowsOnly[c.Name] {
+			if runtime.GOOS == "windows" {
+				if c.Status != "pass" && c.Status != "warn" {
+					t.Errorf("check %s status %q (a Windows probe must report pass/warn on Windows)", c.Name, c.Status)
+				}
+			} else if c.Status != "n/a" {
+				t.Errorf("check %s status %q (a Windows-only probe must report n/a on %s)", c.Name, c.Status, runtime.GOOS)
+			}
+			continue
+		}
 		switch c.Status {
 		case "pass", "warn":
 		default:

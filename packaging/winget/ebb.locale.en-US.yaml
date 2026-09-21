@@ -1,0 +1,58 @@
+# winget-pkgs DEFAULT LOCALE manifest for Ebb (en-US).
+#
+# Schema: manifest.defaultLocale.1.12.0 — verified against
+#   https://learn.microsoft.com/en-us/windows/package-manager/package/manifest
+#   defaultLocale spec: winget-pkgs/doc/manifest/schema/1.12.0/defaultLocale.md
+#
+# Required fields for defaultLocale (verified): PackageIdentifier,
+# PackageVersion, PackageLocale, Publisher, PackageName, License,
+# ShortDescription. Everything else below is optional metadata that improves
+# discovery (`winget search`) and is recommended by the winget-pkgs docs.
+#
+# MAINTAINER PUBLISH CHECKLIST:
+#   1. License is UNDECIDED. `__PENDING__` is a deliberate placeholder —
+#      do NOT replace it with a guess; the license choice belongs to the
+#      maintainer. When decided, set License to the SPDX identifier and
+#      LicenseUrl to the LICENSE file in the public repo. winget-pkgs
+#      validation will reject `__PENDING__` (by design, so it cannot be
+#      submitted accidentally).
+#   2. Replace OWNER in every URL with the real GitHub owner/org (the repo
+#      had no git remote configured when this template was written).
+#   3. Publisher: "Ebb" assumes the project publishes under its own name;
+#      change to the real publisher identity if different, and keep it
+#      consistent with the PackageIdentifier in ebb.yaml.
+#   4. PackageVersion must match ebb.yaml / ebb.installer.yaml exactly.
+#
+# File name in the winget-pkgs PR: manifests/e/Ebb/Ebb/0.1.0/Ebb.Ebb.locale.en-US.yaml
+PackageIdentifier: Ebb.Ebb
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: Ebb
+PublisherUrl: https://github.com/OWNER/ebb
+PackageName: Ebb
+Moniker: ebb
+PackageUrl: https://github.com/OWNER/ebb
+# MAINTAINER: license decision pending — see checklist above. Do not invent.
+License: __PENDING__
+# MAINTAINER: LicenseUrl is intentionally ABSENT until the license is decided.
+# Add it together with License, e.g.:
+#   LicenseUrl: https://github.com/OWNER/ebb/blob/main/LICENSE
+ShortDescription: Effortless, safe disk-space reclamation for development workspaces.
+Description: >-
+  Ebb reclaims disk space in development workspaces without losing anything
+  that matters. Verified trims remove regenerable build output while .env
+  files, private notes and other non-reconstructible files are preserved by
+  default. Workspaces can be parked into an encrypted restic vault and
+  restored later with independent verification. Fully offline, zero telemetry.
+Tags:
+  - cli
+  - developer-tools
+  - disk
+  - disk-space
+  - cleanup
+  - backup
+  - git
+  - restic
+ReleaseNotesUrl: https://github.com/OWNER/ebb/releases/tag/v0.1.0
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0

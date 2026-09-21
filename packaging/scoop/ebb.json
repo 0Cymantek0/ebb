@@ -1,0 +1,33 @@
+{
+  "version": "0.1.0",
+  "description": "Effortless, safe disk-space reclamation for development workspaces",
+  "homepage": "https://github.com/OWNER/ebb",
+  "license": "Unknown",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/OWNER/ebb/releases/download/v0.1.0/ebb-0.1.0-windows-amd64.zip",
+      "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "bin": [
+    [
+      "ebb-windows-amd64.exe",
+      "ebb"
+    ]
+  ],
+  "checkver": {
+    "github": "https://github.com/OWNER/ebb",
+    "regex": "tag/(?:v|V)?([\\d.]+)"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/OWNER/ebb/releases/download/v$version/ebb-v$version-windows-amd64.zip"
+      }
+    },
+    "hash": {
+      "url": "https://github.com/OWNER/ebb/releases/download/v$version/SHA256SUMS.txt",
+      "regex": "([a-fA-F0-9]{64})\\s+\\*?ebb-v$version-windows-amd64\\.zip"
+    }
+  }
+}
