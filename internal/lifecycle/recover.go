@@ -141,6 +141,16 @@ func (c *Coordinator) Recover(ctx context.Context, vault VaultRef, opID domain.O
 // used after the user resolved the blocker (closed handles, freed
 // space...). It performs the same evidence-verified resume Recover does,
 // but refuses phases that are not mid-removal.
+//
+// One SEALED entry (Wave 4 gauntlet bug B): a park whose destructive
+// tail was attempted and blocked BEFORE the quarantine rename succeeded
+// also sits in SEALED — the rename never ran, so no later phase was
+// ever committed — yet its park-time error advises --resume-removal
+// (the generic ErrRemovalBlocked safe action). resumeSealedParkRemoval
+// accepts that state, gated by the durable record (last_error proves a
+// tail attempt) and re-running the FULL tail, whose step-6 revalidation
+// is exactly the §12.4 SEALED rule ("Revalidate; do not assume deletion
+// remains authorized").
 func (c *Coordinator) ResumeRemoval(ctx context.Context, vault VaultRef, opID domain.OperationID) (RecoveryReport, error) {
 	if err := ctx.Err(); err != nil {
 		return RecoveryReport{}, err
@@ -159,11 +169,13 @@ func (c *Coordinator) ResumeRemoval(ctx context.Context, vault VaultRef, opID do
 	switch op.Phase {
 	case catalog.PhaseQuarantined, catalog.PhaseRemoving, catalog.PhaseRemovalBlocked:
 		return c.resumeParkRemoval(ctx, vault, op, rep)
+	case catalog.PhaseSealed:
+		return c.resumeSealedParkRemoval(ctx, vault, op, rep)
 	case catalog.PhaseTrimSealing:
 		return c.resumeTrimRemoval(ctx, vault, op, rep)
 	default:
 		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
-			"operation %s is %s; ResumeRemoval applies to QUARANTINED/REMOVING/REMOVAL_BLOCKED (park) or TRIM_SEALING (trim)", opID, op.Phase)}
+			"operation %s is %s; ResumeRemoval applies to QUARANTINED/REMOVING/REMOVAL_BLOCKED (park), a SEALED park whose removal tail was attempted and blocked, or TRIM_SEALING (trim)", opID, op.Phase)}
 	}
 }
 
@@ -961,7 +973,19 @@ func (c *Coordinator) recoverSealed(ctx context.Context, vault VaultRef, op cata
 	} else {
 		rep.Remaining = append(rep.Remaining, "removal was never started (no quarantine exists)")
 	}
-	rep.NextAction = "removal is not assumed authorized by recovery: cancel this operation to unblock the workspace (`ebb recover <op> --cancel`), then rerun the command for a fresh capture; the retained pair stays pinned"
+	if op.LastError != "" {
+		// The tail WAS attempted and failed (durable record): plain
+		// Recover still only reports, but the next action must name the
+		// door that works in THIS state (bug B: it used to advise only
+		// --cancel + recapture while the park-time error advised
+		// --resume-removal, which was then refused).
+		rep.Remaining = append(rep.Remaining, "the removal tail was attempted and failed: "+op.LastError)
+		rep.NextAction = fmt.Sprintf(
+			"after resolving the recorded blocker (e.g. cd any shell out of the workspace, close writers), resume with `ebb recover %s --resume-removal` (it revalidates the source against the sealed inventory before removing anything), or abandon with `ebb recover %s --cancel` and rerun the command for a fresh capture; the retained pair stays pinned",
+			op.ID, op.ID)
+	} else {
+		rep.NextAction = "removal is not assumed authorized by recovery: cancel this operation to unblock the workspace (`ebb recover <op> --cancel`), then rerun the command for a fresh capture; the retained pair stays pinned"
+	}
 	return rep, nil
 }
 
@@ -1071,6 +1095,93 @@ func (c *Coordinator) resumeParkRemoval(ctx context.Context, vault VaultRef, op 
 	}
 
 	rep.PhaseAfter = catalog.PhaseDone
+	rep.Actions = append(rep.Actions, "resumed the authorized removal walk to completion; committed PARKED -> DONE")
+	rep.Actions = append(rep.Actions, "workspace marked parked")
+	rep.NextAction = "workspace is parked; use ebb open to restore it"
+	return rep, nil
+}
+
+// resumeSealedParkRemoval is the explicit --resume-removal door for a
+// SEALED park whose destructive tail was attempted and blocked before
+// the quarantine rename succeeded (Wave 4 gauntlet bug B). The state is
+// real: parkTail fails the rename (errno 32 — the launching shell's own
+// cwd pin, an open handle without FILE_SHARE_DELETE) while the seal is
+// already committed, so the operation sits in SEALED with its removal
+// blocked — and the park-time error's safe action names --resume-removal,
+// which until this door existed refused exactly this phase.
+//
+// Acceptance gate, from durable evidence only:
+//
+//   - kind must be park with phase SEALED and last_error non-empty.
+//     Invariant: on a SEALED row, last_error is written only by the
+//     park tail (every capture-phase failure records under the row's
+//     pre-seal phase), so a non-empty last_error IS the durable record
+//     of an attempted tail. A plain crash-after-seal (empty last_error)
+//     keeps the report-only discipline — plain `ebb recover` governs.
+//   - the deterministic quarantine sibling must NOT exist: if it does,
+//     the step-7 rename already committed and recoverSealed's F5
+//     crash-window adoption (identity-checked) is the door, not this.
+//
+// The §12.4 SEALED rule ("Revalidate; do not assume deletion remains
+// authorized") is honored by construction: the door re-enters parkTail,
+// whose step 6 revalidates the live source against the sealed inventory
+// (root identity + full re-scan with hashing) BEFORE the rename; a
+// changed source fails closed with ErrSourceChanged and the row stays
+// SEALED. Every later gate (quarantine identity re-probe, per-entry
+// re-digest, CAS phase transitions) applies unchanged.
+func (c *Coordinator) resumeSealedParkRemoval(ctx context.Context, vault VaultRef, op catalog.Operation, rep RecoveryReport) (RecoveryReport, error) {
+	if op.Kind != catalog.OpKindPark {
+		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+			"operation %s is kind %q in SEALED; the SEALED --resume-removal door applies to a park whose removal tail was blocked", op.ID, op.Kind)}
+	}
+	if op.LastError == "" {
+		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+			"operation %s is SEALED with no recorded failure: its removal tail was never attempted (crash after seal), so there is no blocked removal to resume; plain `ebb recover %s` revalidates and reports, and `ebb recover %s --cancel` unblocks the workspace for a fresh capture", op.ID, op.ID, op.ID)}
+	}
+	// The F5 crash window: a sibling means the rename DID succeed before
+	// the journal commit — recoverSealed adopts it by identity instead.
+	parent := filepath.Dir(filepath.Clean(op.SourceRoot))
+	quar := quarantinePath(parent, op.ID)
+	if _, qerr := os.Lstat(quar); qerr == nil {
+		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+			"quarantine sibling %s exists, so the removal already renamed the root (crash window before the journal commit); run plain `ebb recover %s` — it adopts the quarantine by native identity and completes the removal", quar, op.ID)}
+	} else if !os.IsNotExist(qerr) {
+		return rep, fmt.Errorf("lifecycle: probe quarantine sibling %s: %w", quar, qerr)
+	}
+
+	ev, err := c.loadPayloadEvidence(ctx, vault, op)
+	if err != nil {
+		return rep, err
+	}
+	ident, perr := parseRootIdentity(op.SourceIdentity)
+	if perr != nil {
+		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf("operation %s: %v", op.ID, perr)}
+	}
+	st, err := c.rebuildCaptureState(ctx, vault, op, ev)
+	if err != nil {
+		return rep, err
+	}
+	defer st.journal.close()
+	st.rootIdent = ident
+
+	// F7: record the writer-assertion source of this destructive resume
+	// ("resume:SEALED") — same discipline as the later-phase resumes.
+	c.recordResumeAssertion(op, st.journal)
+
+	// Re-enter the full tail: step 6 revalidation (the do-not-assume
+	// gate) runs before the quarantine rename and the authorized walk.
+	if _, terr := c.parkTail(ctx, st); terr != nil {
+		// parkTail's failure paths record SEALED (tail never advanced)
+		// or REMOVAL_BLOCKED (the walk blocked) — report the durable
+		// truth, not a guess.
+		if fresh, ferr := c.cat.GetOperation(op.ID); ferr == nil {
+			rep.PhaseAfter = fresh.Phase
+		}
+		return c.resumeRemovalFailed(rep, terr)
+	}
+	rep.PhaseAfter = catalog.PhaseDone
+	rep.Actions = append(rep.Actions, fmt.Sprintf(
+		"re-entered the blocked removal tail from SEALED (recorded blocker: %s): revalidated the live source against the sealed inventory, quarantined the root and removed the authorized entries", op.LastError))
 	rep.Actions = append(rep.Actions, "resumed the authorized removal walk to completion; committed PARKED -> DONE")
 	rep.Actions = append(rep.Actions, "workspace marked parked")
 	rep.NextAction = "workspace is parked; use ebb open to restore it"
@@ -1215,10 +1326,18 @@ func (c *Coordinator) recordResumeAssertion(op catalog.Operation, j *opJournal) 
 func (c *Coordinator) resumeRemovalFailed(rep RecoveryReport, err error) (RecoveryReport, error) {
 	rep.Warnings = append(rep.Warnings, err.Error())
 	var blocked *ErrRemovalBlocked
-	if errors.As(err, &blocked) {
+	var changed *ErrSourceChanged
+	switch {
+	case errors.As(err, &blocked):
 		rep.Remaining = append(rep.Remaining, fmt.Sprintf("removal blocked at %s (%s); remaining authorized entries retained", blocked.Path, blocked.Code))
 		rep.NextAction = "resolve the blocker (e.g. close open handles), then ResumeRemoval"
-	} else {
+	case errors.As(err, &changed):
+		// The revalidation gate refused (§12.2 step 6 / §12.4 SEALED): the
+		// live source no longer matches the sealed inventory, so removal
+		// stays invalidated — the resume is NOT retryable as-is.
+		rep.Remaining = append(rep.Remaining, "the live source no longer matches the sealed inventory; removal is invalidated (P/S retained, source intact)")
+		rep.NextAction = "resolve the source change, then cancel this operation (`ebb recover <operation-id> --cancel`) and rerun the command for a fresh capture"
+	default:
 		rep.NextAction = "inspect the operation journal; the walk can be resumed after the cause is fixed"
 	}
 	return rep, err

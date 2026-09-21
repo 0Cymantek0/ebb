@@ -81,6 +81,13 @@ func cmdPark(args []string, streams Streams, deps Deps) int {
 			fmt.Sprintf("park %s: %v", disc.Root, err))
 	}
 
+	// Release the process cwd from inside the workspace BEFORE the
+	// destructive tail (Wave 4 gauntlet bug A: a cwd under the root pins
+	// the §12.2 step-7 quarantine rename on Windows). disc.Root is
+	// absolute and every later path derives from it, so moving now is
+	// safe; the note names the shell-pin limit.
+	releaseWorkspaceCwd(deps, streams, disc.Root, &env, *jsonOut)
+
 	var res lifecycle.ParkResult
 	cErr := sess.withVaultPassfile(ctx, func(repoDir, passfile string) error {
 		var rErr error

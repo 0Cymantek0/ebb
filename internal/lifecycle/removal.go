@@ -84,6 +84,14 @@ type removalStats struct {
 	SkippedGone int
 }
 
+// blocked builds the typed removal blocker carrying the permit's
+// operation id, so the CLI can name the literally runnable recovery
+// command (`ebb recover <id> --resume-removal`) instead of a
+// placeholder (Wave 4 gauntlet bug B: advice must be a working door).
+func (p *removalPermit) blocked(abs, code string, err error) *ErrRemovalBlocked {
+	return &ErrRemovalBlocked{OperationID: p.opID, Path: abs, Code: code, Err: err}
+}
+
 // progressEvery: journal cadence for removal progress (§16.5 "per-entry
 // removal progress can live in a bounded journal").
 const progressEvery = 256
@@ -111,7 +119,7 @@ func (p *removalPermit) execute(ctx context.Context, probe domain.PlatformProbe,
 			stats.SkippedGone++
 			continue
 		} else if err != nil {
-			return stats, &ErrRemovalBlocked{Path: abs, Code: BlockProbeFailed, Err: err}
+			return stats, p.blocked(abs, BlockProbeFailed, err)
 		}
 		sealed := p.allowed[rel]
 
@@ -120,11 +128,11 @@ func (p *removalPermit) execute(ctx context.Context, probe domain.PlatformProbe,
 		// cannot — platform probe finding).
 		facts, err := probe.ProbeFile(abs)
 		if err != nil {
-			return stats, &ErrRemovalBlocked{Path: abs, Code: BlockProbeFailed, Err: err}
+			return stats, p.blocked(abs, BlockProbeFailed, err)
 		}
 		if facts.Kind != sealed.Kind {
-			return stats, &ErrRemovalBlocked{Path: abs, Code: BlockKindMismatch,
-				Err: fmt.Errorf("on-disk kind %q is not the sealed kind %q (possible reparse substitution)", facts.Kind, sealed.Kind)}
+			return stats, p.blocked(abs, BlockKindMismatch,
+				fmt.Errorf("on-disk kind %q is not the sealed kind %q (possible reparse substitution)", facts.Kind, sealed.Kind))
 		}
 		switch sealed.Kind {
 		case domain.KindFile:
@@ -132,16 +140,16 @@ func (p *removalPermit) execute(ctx context.Context, probe domain.PlatformProbe,
 			// (E08). A changed file blocks removal and stays.
 			got, err := digestFile(abs)
 			if err != nil {
-				return stats, &ErrRemovalBlocked{Path: abs, Code: BlockProbeFailed, Err: err}
+				return stats, p.blocked(abs, BlockProbeFailed, err)
 			}
 			if got != sealed.Digest {
-				return stats, &ErrRemovalBlocked{Path: abs, Code: BlockDigestChanged,
-					Err: fmt.Errorf("content digest %s differs from sealed digest %s", got, sealed.Digest)}
+				return stats, p.blocked(abs, BlockDigestChanged,
+					fmt.Errorf("content digest %s differs from sealed digest %s", got, sealed.Digest))
 			}
 		case domain.KindSymlink, domain.KindJunction, domain.KindMountPoint:
 			if facts.LinkTarget != sealed.LinkTarget {
-				return stats, &ErrRemovalBlocked{Path: abs, Code: BlockLinkChanged,
-					Err: fmt.Errorf("link text %q differs from sealed text %q", facts.LinkTarget, sealed.LinkTarget)}
+				return stats, p.blocked(abs, BlockLinkChanged,
+					fmt.Errorf("link text %q differs from sealed text %q", facts.LinkTarget, sealed.LinkTarget))
 			}
 		}
 
@@ -274,17 +282,17 @@ func (p *removalPermit) classifyRemoveError(abs string, err error) error {
 		// Raced with an authorized removal of the same entry; treat as
 		// gone next iteration, but surface as blocked-with-context here
 		// since the walk stops.
-		return &ErrRemovalBlocked{Path: abs, Code: BlockRemoveFailed, Err: err}
+		return p.blocked(abs, BlockRemoveFailed, err)
 	}
 	if isSharingViolation(err) {
-		return &ErrRemovalBlocked{Path: abs, Code: BlockSharingViolation, Err: fmt.Errorf(
-			"Windows sharing violation (errno 32): a process holds an open handle without FILE_SHARE_DELETE; close it and ResumeRemoval (never scheduled on reboot, never killed — Foundation §12.3): %w", err)}
+		return p.blocked(abs, BlockSharingViolation, fmt.Errorf(
+			"Windows sharing violation (errno 32): a process holds an open handle without FILE_SHARE_DELETE; close it and ResumeRemoval (never scheduled on reboot, never killed — Foundation §12.3): %w", err))
 	}
 	if errors.Is(err, syscall.ENOTEMPTY) {
-		return &ErrRemovalBlocked{Path: abs, Code: BlockDirNotEmpty, Err: fmt.Errorf(
-			"directory not empty: content that was not in the sealed inventory appeared under it: %w", err)}
+		return p.blocked(abs, BlockDirNotEmpty, fmt.Errorf(
+			"directory not empty: content that was not in the sealed inventory appeared under it: %w", err))
 	}
-	return &ErrRemovalBlocked{Path: abs, Code: BlockRemoveFailed, Err: err}
+	return p.blocked(abs, BlockRemoveFailed, err)
 }
 
 // isSharingViolation reports Windows errno 32 (ERROR_SHARING_VIOLATION).
@@ -321,8 +329,10 @@ func removeEbbOwned(path string) error {
 // renameToQuarantine performs the audited §12.2 step 7 rename. The
 // target must not exist (rename-over-dir always fails on Windows —
 // platform probe finding; a pre-existing quarantine of the same op id
-// means this operation already ran its rename and crashed after).
-func renameToQuarantine(root, quarantine string) error {
+// means this operation already ran its rename and crashed after). opID
+// rides the typed sharing-violation blocker so the CLI can name the
+// literally runnable recovery command.
+func renameToQuarantine(opID domain.OperationID, root, quarantine string) error {
 	if _, err := os.Lstat(quarantine); err == nil {
 		return fmt.Errorf("lifecycle: quarantine %s already exists; a previous run may have renamed the root already (use Recover)", quarantine)
 	} else if !errors.Is(err, fs.ErrNotExist) {
@@ -330,8 +340,8 @@ func renameToQuarantine(root, quarantine string) error {
 	}
 	if err := os.Rename(root, quarantine); err != nil {
 		if isSharingViolation(err) {
-			return &ErrRemovalBlocked{Path: root, Code: BlockSharingViolation, Err: fmt.Errorf(
-				"rename to quarantine blocked by an open handle (errno 32); close writers and retry: %w", err)}
+			return &ErrRemovalBlocked{OperationID: opID, Path: root, Code: BlockSharingViolation, Err: fmt.Errorf(
+				"rename to quarantine blocked by an open handle (errno 32); release the holders — a shell or process whose working directory is inside the workspace pins the root until it cd's out — then resume the removal (the CLI safe action names the command): %w", err)}
 		}
 		return fmt.Errorf("lifecycle: rename %s -> %s: %w", root, quarantine, err)
 	}

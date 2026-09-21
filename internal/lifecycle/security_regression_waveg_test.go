@@ -242,7 +242,7 @@ func TestRecoverSealedQuarantineCrashWindowReconciles(t *testing.T) {
 	}
 	// The crash point: the quarantine rename happened, nothing after.
 	quar := quarantinePath(st.parent, st.opID)
-	if err := renameToQuarantine(root, quar); err != nil {
+	if err := renameToQuarantine(st.opID, root, quar); err != nil {
 		t.Fatal(err)
 	}
 
@@ -287,7 +287,7 @@ func TestRecoverSealedWrongIdentitySiblingReportedNotAdopted(t *testing.T) {
 	// root is absent (the crash), but the tree sitting at the sibling
 	// path is not the sealed root.
 	quar := quarantinePath(st.parent, st.opID)
-	if err := renameToQuarantine(root, quar); err != nil {
+	if err := renameToQuarantine(st.opID, root, quar); err != nil {
 		t.Fatal(err)
 	}
 	holding := filepath.Join(h.base, "the-real-root-holding")
@@ -576,7 +576,7 @@ func TestCancelSealedRefusedWhenQuarantineSiblingExists(t *testing.T) {
 	}
 	// The crash point: the quarantine rename happened, nothing after.
 	quar := quarantinePath(st.parent, st.opID)
-	if err := renameToQuarantine(root, quar); err != nil {
+	if err := renameToQuarantine(st.opID, root, quar); err != nil {
 		t.Fatal(err)
 	}
 

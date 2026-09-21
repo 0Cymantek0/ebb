@@ -82,10 +82,13 @@ const (
 // error to retain and report"). Remaining entries are retained in the
 // quarantine; the operation is REMOVAL_BLOCKED and P/S stay pinned. The
 // walk is resumable with ResumeRemoval after the cause is resolved.
+// OperationID (when the constructing site knows it) lets the CLI render
+// a literally runnable recovery command instead of a placeholder.
 type ErrRemovalBlocked struct {
-	Path string
-	Code string
-	Err  error
+	OperationID domain.OperationID
+	Path        string
+	Code        string
+	Err         error
 }
 
 func (e *ErrRemovalBlocked) Error() string {

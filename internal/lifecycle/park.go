@@ -49,7 +49,7 @@ func (c *Coordinator) parkTail(ctx context.Context, st *captureState) (ParkResul
 
 	// ---- §12.2 step 7: quarantine rename ----------------------------
 	quar := quarantinePath(st.parent, st.opID)
-	if err := renameToQuarantine(st.rootAbs, quar); err != nil {
+	if err := renameToQuarantine(st.opID, st.rootAbs, quar); err != nil {
 		c.failOperation(st.opID, catalog.PhaseSealed, err.Error())
 		return ParkResult{}, err
 	}
