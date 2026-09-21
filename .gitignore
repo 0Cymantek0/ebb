@@ -19,3 +19,14 @@ lab/git-probe/scratch/
 lab/drill/run/
 lab/drill/run-invocation.log
 lab/mermaid-check/node_modules/
+
+# Internal governing documents & system memory (strictly internal; never commit)
+Foundation.md
+Decisions.md
+Modules.md
+Learnings.md
+docs/PRODUCT_EVOLUTION_PLAN.md
+last_sessio.md
+last_session.md
+prompt.md
+
