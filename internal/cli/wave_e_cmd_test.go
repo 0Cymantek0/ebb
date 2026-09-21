@@ -109,28 +109,18 @@ func TestSnapshotEndToEnd(t *testing.T) {
 	}
 	assertNoSecrets(t, stderr)
 
-	// status shows the workspace live with its snapshot.
-	code, stdout, stderr := h.run("status", "--json")
-	if code != ExitOK {
-		t.Fatalf("status code = %d, stderr = %s", code, stderr)
+	// The workspace row is live with its retained snapshot (catalog
+	// read; `ebb status` is the stats dashboard since Wave 3).
+	w := h.workspaceRowOf("cliws")
+	if w.Status != catalog.WorkspaceLive {
+		t.Errorf("workspace status = %s, want live", w.Status)
 	}
-	env := envelopeOf(t, stdout)
-	det := env["details"].(map[string]any)
-	wss := det["workspaces"].([]any)
-	if len(wss) != 1 {
-		t.Fatalf("workspaces = %v", wss)
-	}
-	w := wss[0].(map[string]any)
-	if w["name"] != "cliws" || w["status"] != "live" {
-		t.Errorf("workspace row = %v", w)
-	}
-	snaps := w["latest_snapshots"].([]any)
+	snaps := h.snapshotsOf(w.ID)
 	if len(snaps) != 1 {
-		t.Fatalf("snapshots = %v", snaps)
+		t.Fatalf("snapshots = %+v, want exactly one", snaps)
 	}
-	s := snaps[0].(map[string]any)
-	if s["kind"] != "snapshot" || s["pinned"] != true {
-		t.Errorf("snapshot row = %v", s)
+	if snaps[0].Kind != catalog.SnapshotKindSnapshot || !snaps[0].Pinned {
+		t.Errorf("snapshot row = %+v", snaps[0])
 	}
 }
 
@@ -191,7 +181,7 @@ func TestSnapshotMissingPath(t *testing.T) {
 
 func TestParkEndToEndFlagAssertion(t *testing.T) {
 	h := newEHarness(t)
-	code, stdout, stderr := h.run("park", "--assert-writers-stopped", h.wsRoot)
+	code, _, stderr := h.run("park", "--assert-writers-stopped", h.wsRoot)
 	if code != ExitOK {
 		t.Fatalf("code = %d, stderr = %s", code, stderr)
 	}
@@ -205,15 +195,10 @@ func TestParkEndToEndFlagAssertion(t *testing.T) {
 	}
 	assertNoSecrets(t, stderr)
 
-	// JSON variant on a second workspace copy (root must exist).
-	code, stdout, stderr = h.run("status", "--json")
-	if code != ExitOK {
-		t.Fatalf("status code = %d, stderr = %s", code, stderr)
-	}
-	env := envelopeOf(t, stdout)
-	w := env["details"].(map[string]any)["workspaces"].([]any)[0].(map[string]any)
-	if w["status"] != "parked" {
-		t.Errorf("workspace status = %v, want parked", w["status"])
+	// The workspace row is parked (catalog read; status is the stats
+	// dashboard since Wave 3).
+	if w := h.workspaceRowOf("cliws"); w.Status != catalog.WorkspaceParked {
+		t.Errorf("workspace status = %s, want parked", w.Status)
 	}
 }
 
@@ -310,22 +295,17 @@ func TestTrimHappyPath(t *testing.T) {
 	}
 	assertNoSecrets(t, stderr)
 
-	// The trim snapshot is retained and visible.
-	code, stdout, _ := h.run("status", "--json")
-	if code != ExitOK {
-		t.Fatalf("status code = %d", code)
-	}
-	env := envelopeOf(t, stdout)
-	w := env["details"].(map[string]any)["workspaces"].([]any)[0].(map[string]any)
-	snaps := w["latest_snapshots"].([]any)
+	// The trim snapshot is retained (catalog read; status is the stats
+	// dashboard since Wave 3).
+	w := h.workspaceRowOf("cliws")
 	found := false
-	for _, s := range snaps {
-		if s.(map[string]any)["kind"] == "trim" {
+	for _, sn := range h.snapshotsOf(w.ID) {
+		if sn.Kind == catalog.SnapshotKindTrim {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("no trim snapshot in status: %v", snaps)
+		t.Errorf("no trim snapshot retained")
 	}
 }
 
@@ -402,15 +382,9 @@ func TestOpenAfterParkByName(t *testing.T) {
 	assertNoSecrets(t, stderr)
 	assertNoSecrets(t, stdout)
 
-	// The workspace is live again at the new root.
-	code, stdout, _ = h.run("status", "--json")
-	if code != ExitOK {
-		t.Fatalf("status code = %d", code)
-	}
-	env := envelopeOf(t, stdout)
-	w := env["details"].(map[string]any)["workspaces"].([]any)[0].(map[string]any)
-	if w["status"] != "live" || w["root"] != dest {
-		t.Errorf("workspace row after open = %v", w)
+	// The workspace is live again at the new root (catalog read).
+	if w := h.workspaceRowOf("cliws"); w.Status != catalog.WorkspaceLive || w.RootPath != dest {
+		t.Errorf("workspace row after open = %+v", w)
 	}
 }
 
@@ -633,15 +607,9 @@ func TestSignalCancelPreservesJournalAndRecoverResumes(t *testing.T) {
 			t.Errorf("quarantine %s survived", de.Name())
 		}
 	}
-	// Workspace is parked now.
-	code, stdout, _ = h.run("status", "--json")
-	if code != ExitOK {
-		t.Fatal("status failed")
-	}
-	env = envelopeOf(t, stdout)
-	w := env["details"].(map[string]any)["workspaces"].([]any)[0].(map[string]any)
-	if w["status"] != "parked" {
-		t.Errorf("status after resume = %v", w["status"])
+	// Workspace is parked now (catalog read).
+	if w := h.workspaceRowOf("cliws"); w.Status != catalog.WorkspaceParked {
+		t.Errorf("status after resume = %s, want parked", w.Status)
 	}
 
 	// Resuming a finished operation is a journal mismatch (exit 5).
@@ -663,17 +631,21 @@ func TestRecoverUnknownOperation(t *testing.T) {
 
 // ---- status ----------------------------------------------------------------
 
-func TestStatusEmptyAndFilter(t *testing.T) {
+func TestStatusAliasBasics(t *testing.T) {
 	h := newEHarness(t)
+	// `ebb status` is the stats alias since Wave 3: an empty catalog is
+	// a valid report (the dashboard with unknowns), and a positional
+	// argument is a usage error (stats takes none; the old workspace
+	// filter is superseded).
 	code, _, stderr := h.run("status")
 	if code != ExitOK {
 		t.Fatalf("code = %d, stderr = %s", code, stderr)
 	}
-	if !strings.Contains(stderr, "no workspaces recorded") {
-		t.Errorf("empty catalog must be a valid report:\n%s", stderr)
+	if !strings.Contains(stderr, "Ebb Developer Space Economy") {
+		t.Errorf("status did not render the stats dashboard:\n%s", stderr)
 	}
 	if code, _, _ := h.run("status", "ghost"); code != ExitUsage {
-		t.Fatalf("unknown filter code = %d, want %d", code, ExitUsage)
+		t.Fatalf("positional argument code = %d, want %d", code, ExitUsage)
 	}
 }
 

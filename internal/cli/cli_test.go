@@ -9,10 +9,15 @@ import (
 	"ebb/internal/version"
 )
 
-// run executes Main against buffers with the stub deps.
+// run executes Main against buffers with the stub deps. Stats-event
+// recording is unwired here: the dispatch matrix runs the real
+// state-dir seam and must never write telemetry into the developer's
+// real state directory.
 func run(args ...string) (code int, stdout, stderr string) {
 	var out, errb bytes.Buffer
-	code = Main(args, Streams{Out: &out, Err: &errb}, DefaultDeps())
+	deps := DefaultDeps()
+	deps.RecordStatEvent = nil
+	code = Main(args, Streams{Out: &out, Err: &errb}, deps)
 	return code, out.String(), errb.String()
 }
 

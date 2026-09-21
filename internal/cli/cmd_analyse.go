@@ -347,14 +347,20 @@ func analyseStderrDigest(stderr, root string) string {
 }
 
 // analyseExecReclaim runs one in-process `ebb reclaim <root> --yes` on
-// the headless nested dependency set. The inner command's stdout stays
-// discarded (its envelope would corrupt the outer one) but its stderr
-// is captured and reduced to one sanitized digest line, so gate
-// refusals are VISIBLE in the batch report instead of vanishing into
-// io.Discard. Only the exit code and the digest are surfaced.
+// the headless nested dependency set, recorded as a STALE stats event
+// ({"stale":true} — the executed item's reclaimed bytes feed
+// ZombieBytesExorcised). The inner command's stdout stays discarded
+// (its envelope would corrupt the outer one) but its stderr is captured
+// and reduced to one sanitized digest line, so gate refusals are
+// VISIBLE in the batch report instead of vanishing into io.Discard.
+// Only the exit code and the digest are surfaced.
 func analyseExecReclaim(ctx context.Context, deps Deps, root string) (status, detail string) {
 	var errBuf bytes.Buffer
-	code := cmdReclaim([]string{root, "--yes"}, Streams{Out: io.Discard, Err: &errBuf}, nestedHeadlessDeps(deps))
+	code := recordDispatchDetail(deps, Streams{Out: io.Discard, Err: &errBuf}, "reclaim",
+		[]string{root, "--yes"}, map[string]any{"stale": true},
+		func() int {
+			return cmdReclaim([]string{root, "--yes"}, Streams{Out: io.Discard, Err: &errBuf}, nestedHeadlessDeps(deps))
+		})
 	digest := analyseStderrDigest(errBuf.String(), root)
 	if digest != "" {
 		digest = "; " + digest

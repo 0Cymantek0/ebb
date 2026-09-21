@@ -316,6 +316,47 @@ type eHarness struct {
 	// terminal control
 	tty   bool
 	lines []string
+
+	// stats events recorded by the Wave 3 fake collector seam
+	statEvents []catalog.StatEvent
+}
+
+// statEventsOf returns a copy of the recorded stats events (assertion
+// helper for the recording tests).
+func (h *eHarness) statEventsOf() []catalog.StatEvent {
+	out := make([]catalog.StatEvent, len(h.statEvents))
+	copy(out, h.statEvents)
+	return out
+}
+
+// workspaceRowOf reads one workspace's catalog row directly. The Wave E
+// status probes became catalog reads when `ebb status` became the stats
+// alias (Wave 3): the assertions still verify the same durable truth
+// (status transitions after park/open/forget), just without the retired
+// status envelope.
+func (h *eHarness) workspaceRowOf(name string) catalog.Workspace {
+	h.t.Helper()
+	list, err := h.cat().ListWorkspaces()
+	if err != nil {
+		h.t.Fatalf("list workspaces: %v", err)
+	}
+	for _, w := range list {
+		if w.Name == name {
+			return w
+		}
+	}
+	h.t.Fatalf("workspace %q not recorded (rows: %+v)", name, list)
+	return catalog.Workspace{}
+}
+
+// snapshotsOf lists a workspace's retained snapshots in creation order.
+func (h *eHarness) snapshotsOf(id domain.WorkspaceID) []catalog.Snapshot {
+	h.t.Helper()
+	snaps, err := h.cat().ListSnapshots(id)
+	if err != nil {
+		h.t.Fatalf("list snapshots of %s: %v", id, err)
+	}
+	return snaps
 }
 
 // runMklinkJ creates a junction via the unprivileged Windows mklink
@@ -377,6 +418,13 @@ func newEHarness(t *testing.T) *eHarness {
 	// flow stubs this seam explicitly. Default: bare `open` degrades to
 	// the ordinary usage error, never a blocked terminal read.
 	deps.PickWorkspace = nil
+	// Wave 3 stats recording: an in-memory collector so tests can assert
+	// the per-invocation events without a second catalog handle (the
+	// recorded bytes come from the envelope the command itself emitted).
+	deps.RecordStatEvent = func(e catalog.StatEvent) error {
+		h.statEvents = append(h.statEvents, e)
+		return nil
+	}
 	h.deps = deps
 	return h
 }

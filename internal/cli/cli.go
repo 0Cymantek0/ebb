@@ -118,6 +118,15 @@ type Deps struct {
 	// durable phase (Foundation §17.5).
 	NewSignalContext func() (context.Context, func())
 
+	// ---- stats-event recording seam (Wave 3) ----
+
+	// RecordStatEvent appends one invocation event to the session
+	// catalog (production: a short-lived catalog.Open over the state
+	// dir; best-effort by contract). nil records nothing — the seam is
+	// deliberately nil-able so unit-test dependency sets and the plain
+	// dispatch-matrix drivers never write telemetry.
+	RecordStatEvent func(e catalog.StatEvent) error
+
 	// ---- analyse seams (Wave 2; nil = honest degrade with a warning) ----
 
 	// AnalyseGitSurvey is the workspace-topology surveyor behind `ebb
@@ -217,49 +226,51 @@ func Main(args []string, streams Streams, deps Deps) int {
 	}
 	switch args[0] {
 	case "version", "VERSION":
-		return cmdVersion(args[1:], streams)
+		return recordDispatch(deps, streams, "version", args[1:], func() int { return cmdVersion(args[1:], streams) })
 	case "init":
-		return cmdInit(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "init", args[1:], cmdInit)
 	case "inspect":
-		return cmdInspect(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "inspect", args[1:], cmdInspect)
 	case "plan":
-		return cmdPlan(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "plan", args[1:], cmdPlan)
 	case "snapshot":
-		return cmdSnapshot(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "snapshot", args[1:], cmdSnapshot)
 	case "park":
-		return cmdPark(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "park", args[1:], cmdPark)
 	case "trim":
-		return cmdTrim(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "trim", args[1:], cmdTrim)
 	case "reclaim":
-		return cmdReclaim(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "reclaim", args[1:], cmdReclaim)
 	case "open":
-		return cmdOpen(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "open", args[1:], cmdOpen)
 	case "restore":
-		return cmdRestore(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "restore", args[1:], cmdRestore)
 	case "freeze":
-		return cmdFreeze(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "freeze", args[1:], cmdFreeze)
 	case "recover":
-		return cmdRecover(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "recover", args[1:], cmdRecover)
 	case "forget":
-		return cmdForget(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "forget", args[1:], cmdForget)
 	case "gc":
-		return cmdGc(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "gc", args[1:], cmdGc)
 	case "delete":
-		return cmdDelete(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "delete", args[1:], cmdDelete)
 	case "config":
-		return cmdConfig(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "config", args[1:], cmdConfig)
 	case "analyse", "analyze":
-		return cmdAnalyse(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "analyse", args[1:], cmdAnalyse)
 	case "verify":
-		return cmdVerify(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "verify", args[1:], cmdVerify)
 	case "export":
-		return cmdExport(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "export", args[1:], cmdExport)
 	case "import":
-		return cmdImport(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "import", args[1:], cmdImport)
+	case "stats":
+		return dispatchRecorded(deps, streams, "stats", args[1:], cmdStats)
 	case "status":
-		return cmdStatus(args[1:], streams, deps)
+		return dispatchRecorded(deps, streams, "status", args[1:], cmdStatus)
 	case "doctor":
-		return cmdDoctor(args[1:], streams)
+		return recordDispatch(deps, streams, "doctor", args[1:], func() int { return cmdDoctor(args[1:], streams) })
 	case "help", "-h", "--help":
 		usage(streams.Err)
 		return ExitOK
@@ -268,6 +279,14 @@ func Main(args []string, streams Streams, deps Deps) int {
 		usage(streams.Err)
 		return ExitUsage
 	}
+}
+
+// dispatchRecorded runs one verb dispatch under the Wave 3 stats-event
+// recorder (one catalog.StatEvent per dispatched invocation; see
+// statrec.go). Two shapes exist: the common (args, streams, deps)
+// command signature and the few deps-free commands adapted by closure.
+func dispatchRecorded(deps Deps, streams Streams, command string, args []string, fn func([]string, Streams, Deps) int) int {
+	return recordDispatch(deps, streams, command, args, func() int { return fn(args, streams, deps) })
 }
 
 // reorderFlags moves flag tokens (and the value of each name listed in
@@ -342,7 +361,9 @@ commands:
                              produce an independent encrypted capsule (the source stays pinned)
   import <file>               register a capsule's snapshot into a vault without opening it
                              (the snapshot stays pinned; imported approvals start empty)
-  status [workspace]         show local recorded state (workspaces, snapshots, operations)
+  status                     alias for "ebb stats" (the developer space economy dashboard)
+  stats                      show your developer space economy dashboard: lifetime
+                             reclaimed/restored, hoarding score, streaks and scale
   analyse [path]             scan parent roots (config projects_dir, or the given directory) and
                              recommend reclamation per project (alias: analyze; read-only)
   doctor                     report supported capabilities and configuration problems

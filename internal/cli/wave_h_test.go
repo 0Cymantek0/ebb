@@ -120,12 +120,12 @@ func TestInitRebuildCatalogAfterLoss(t *testing.T) {
 		t.Errorf("pin reasons = %v, want a discovered:<date> entry", got.PinReasons)
 	}
 
-	// The product WORKS after a rebuild: status lists the UNBOUND
-	// workspace; open selects per D011 and restores to a named
+	// The product WORKS after a rebuild: the catalog lists the UNBOUND
+	// workspace (direct read; `ebb status` is the stats dashboard since
+	// Wave 3); open selects per D011 and restores to a named
 	// destination (UNBOUND has no root path, so --to is required).
-	code, _, stderr = h.run("status")
-	if code != ExitOK || !strings.Contains(stderr, "UNBOUND") || !strings.Contains(stderr, "cliws") {
-		t.Fatalf("status code = %d stderr = %s", code, stderr)
+	if w := h.workspaceRowOf("cliws"); w.Status != catalog.WorkspaceUnbound {
+		t.Fatalf("rebuilt workspace status = %s, want UNBOUND", w.Status)
 	}
 	// open without --to is a usage error from UNBOUND state (checked
 	// before the successful open occupies the path).
