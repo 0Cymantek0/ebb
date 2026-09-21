@@ -342,7 +342,7 @@ func resolveFreezeEntry(sess *session, idArg string) (entry catalog.DockerImage,
 		e, gerr := sess.cat.GetDockerImage(id)
 		if gerr != nil {
 			return catalog.DockerImage{}, "", fmt.Errorf(
-				"ebb freeze --restore: no frozen-image entry %s in the catalog. Safe action: `ebb status` lists freeze entries; pass an image id to resolve by image", idArg)
+				"ebb freeze --restore: no frozen-image entry %s in the catalog. Safe action: pass the docker image id to resolve by image, or re-freeze the image with `ebb freeze <image-id>`; `ebb doctor` reports the catalog's frozen-image row count (no list command exists yet)", idArg)
 		}
 		return e, unverifiedWarning(e), nil
 	}

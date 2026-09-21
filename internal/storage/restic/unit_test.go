@@ -1,8 +1,12 @@
 package resticstore
 
 import (
+	"context"
 	"errors"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -255,5 +259,112 @@ func TestIsSnapshotID(t *testing.T) {
 		if isSnapshotID(bad) {
 			t.Fatalf("accepted %q", bad)
 		}
+	}
+}
+
+// ---- New binary resolution (W2-7) ---------------------------------------
+//
+// The doc contract says "" and bare names resolve through PATH. The old
+// implementation called filepath.Abs directly, so a bare name silently
+// selected <cwd>\restic — the cwd-hijack trap. These tests pin the
+// closed trap: the PATH copy wins over a decoy in the working directory,
+// absolute paths pass through unchanged, and a bare name PATH cannot
+// resolve surfaces as a typed error at command time (never a cwd copy).
+
+// fakeBinSuffix is the executable suffix LookPath needs on this GOOS.
+func fakeBinSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
+}
+
+// chdirTest changes the working directory for the rest of the test and
+// restores it (LIFO) before the temp dirs are removed.
+func chdirTest(t *testing.T, dir string) {
+	t.Helper()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(old); err != nil {
+			t.Errorf("restore working dir: %v", err)
+		}
+	})
+}
+
+func TestNewBareNameResolvesThroughPATHNotCWD(t *testing.T) {
+	name := "ebb-fake-restic-probe"
+	// Windows quirk: exec.LookPath consults the CURRENT directory before
+	// PATH unless NoDefaultCurrentDirectoryInExePath is set — pin it off
+	// so the PATH copy is the only legal answer the resolver may pick.
+	t.Setenv("NoDefaultCurrentDirectoryInExePath", "1")
+	// The PATH copy.
+	pathDir := t.TempDir()
+	pathCopy := filepath.Join(pathDir, name+fakeBinSuffix())
+	if err := os.WriteFile(pathCopy, []byte("path copy\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", pathDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// The decoy in the working directory: the pre-fix behavior
+	// (filepath.Abs of the bare name) would have selected exactly this.
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, name+fakeBinSuffix()), []byte("decoy\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	chdirTest(t, cwd)
+
+	s := New(name)
+	t.Cleanup(s.Close)
+	if s.binary != pathCopy {
+		t.Fatalf("New(%q) resolved %q; want the PATH copy %q (the cwd decoy must lose)", name, s.binary, pathCopy)
+	}
+}
+
+func TestNewEmptyNameBehavesLikeBareRestic(t *testing.T) {
+	want, err := exec.LookPath("restic")
+	if err != nil {
+		t.Skipf("restic not on PATH: %v", err)
+	}
+	s := New("")
+	t.Cleanup(s.Close)
+	if s.binary != want {
+		t.Fatalf("New(\"\") resolved %q; want the PATH restic %q", s.binary, want)
+	}
+}
+
+func TestNewAbsolutePathUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "some-restic"+fakeBinSuffix())
+	if err := os.WriteFile(bin, []byte("x\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := New(bin)
+	t.Cleanup(s.Close)
+	if s.binary != bin {
+		t.Fatalf("New(absolute) = %q; want %q unchanged", s.binary, bin)
+	}
+}
+
+func TestNewUnresolvableBareNameFailsTypedAtCommandTime(t *testing.T) {
+	s := New("ebb-no-such-restic-binary")
+	t.Cleanup(s.Close)
+	if filepath.IsAbs(s.binary) {
+		t.Fatalf("an unresolvable bare name must stay bare (got %q) — absolutizing it would select a cwd copy", s.binary)
+	}
+	// The honest failure surface: the first command reports a typed
+	// StoreError, not a cwd-hijacked subprocess run.
+	_, err := s.RepoID(context.Background(), "whatever-repo", "whatever-passfile")
+	var se *domain.StoreError
+	if !errors.As(err, &se) {
+		t.Fatalf("RepoID error is not *domain.StoreError: %v", err)
+	}
+	if !strings.Contains(err.Error(), "executable") && !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error does not name the missing binary: %v", err)
 	}
 }

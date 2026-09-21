@@ -258,7 +258,11 @@ func runDoctorChecks() []doctorCheck {
 // catalogCheck compares vaults.json registrations with the catalog
 // (Foundation §11.5). Fresh installations legitimately hold a registered
 // vault and an empty catalog, so the warn wording names the loss
-// hypothesis explicitly instead of asserting one.
+// hypothesis explicitly instead of asserting one. The loss heuristic
+// counts EVERY durable row family: docker_images freeze rows are real
+// retained records, so a catalog holding only freeze rows is intact,
+// not lost (W2-4 — a workspace-less freeze-only catalog must never be
+// misdiagnosed as lost).
 func catalogCheck(cfgDir string) doctorCheck {
 	vaults, verr := vault.New(filepath.Join(cfgDir, vault.RegistryFile)).List()
 	if verr != nil {
@@ -288,17 +292,22 @@ func catalogCheck(cfgDir string) doctorCheck {
 			Detail: fmt.Sprintf("catalog %s is unreadable/corrupt (%v); if a vault holds captured workspaces, rebuild with `ebb init --rebuild-catalog`", catFile, oerr)}
 	}
 	defer cat.Close()
-	ws, snaps, qerr := cat.Counts()
+	counts, qerr := cat.Counts()
 	if qerr != nil {
 		return doctorCheck{Name: "catalog", Status: "warn",
 			Detail: fmt.Sprintf("catalog %s did not answer a row count (%v); it may be corrupt — `ebb init --rebuild-catalog` can rebuild from the vault", catFile, qerr)}
 	}
-	if ws == 0 && snaps == 0 && len(vaults) > 0 {
+	if counts.Workspaces == 0 && counts.Snapshots == 0 && counts.DockerImages == 0 && len(vaults) > 0 {
 		return doctorCheck{Name: "catalog", Status: "warn",
 			Detail: fmt.Sprintf("catalog holds no workspaces while %d vault(s) are registered — if workspaces were captured on this machine, the catalog was lost; rebuild with `ebb init --rebuild-catalog`", len(vaults))}
 	}
-	return doctorCheck{Name: "catalog", Status: "pass",
-		Detail: fmt.Sprintf("%d workspace(s), %d snapshot(s)", ws, snaps)}
+	detail := fmt.Sprintf("%d workspace(s), %d snapshot(s)", counts.Workspaces, counts.Snapshots)
+	if counts.DockerImages > 0 {
+		// The freeze rows are present and reported: their existence is
+		// exactly why a workspace-less catalog is not "lost".
+		detail += fmt.Sprintf(", %d frozen docker image(s)", counts.DockerImages)
+	}
+	return doctorCheck{Name: "catalog", Status: "pass", Detail: detail}
 }
 
 // toolVersion runs `<bin> <args...>` and returns the first
