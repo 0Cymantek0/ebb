@@ -172,10 +172,12 @@ var verbValueFlags = map[string][]string{
 	"plan":    {"from-inventory", "target"},
 	"trim":    {"groups"},
 	"reclaim": {"target"},
-	"open":    {"to", "resume", "cancel"},
+	"open":    {"to"},
 	"restore": {"strategy"},
 	"export":  {"output"},
 	"import":  {"vault"},
+	"stats":   {"out"},
+	"status":  {"out"},
 }
 
 // firstPositional returns the verb's first positional token (heuristic

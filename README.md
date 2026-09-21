@@ -174,15 +174,11 @@ A local dashboard over your own catalog: lifetime reclaimed and restored bytes, 
 
 ### `ebb stats --web`: a control center that cannot mutate
 
-> Ships in the next release: the `--web` server is built (strictly read-only, tested) and the CLI flag is landing with the graphic-card export. `ebb stats` itself works today.
-
 `ebb stats --web` serves a strictly read-only control center on localhost: command palette, deep search across workspaces and operations, full history, and a snapshot content explorer that browses exactly what each vault snapshot preserved. Actions in the web UI are **copy-to-terminal**: every button copies the equivalent ebb CLI command instead of executing it.
 
 That is deliberate. The server exposes zero mutation endpoints. There is no endpoint to delete, unpark, forget, or prune anything, so there is nothing for a CSRF attack or a DNS-rebinding page to trigger. A malicious webpage can stare at your local ebb server and find nothing to command it to do. Mutation stays where the audit trail, the confirmations, and the typed assertions live: your terminal.
 
 ### `ebb stats --share`: a PNG card
-
-> Ships in the next release, together with `--web`.
 
 Exports the dashboard as a PNG card, for the team chat where someone asked how you freed 40 GiB last sprint.
 
@@ -235,7 +231,7 @@ go test ./...     # full suite; restic acceptance tests auto-skip without restic
 | [`ebb park [path]`](docs/cli.md#ebb-park) | Verified encrypted capture, then the workspace folder is removed |
 | [`ebb open [name]`](docs/cli.md#ebb-open) | Recover a parked workspace, verified by an independent oracle |
 | [`ebb analyse [path]`](docs/cli.md#ebb-analyse) | Scan project roots: staleness, shields, Docker tiers, batch actions |
-| [`ebb stats`](docs/cli.md#ebb-stats) | Local dashboard (`--web` control center and `--share` PNG card: next release) |
+| [`ebb stats`](docs/cli.md#ebb-stats) | Local dashboard, `--web` read-only control center, `--share` PNG card |
 | [`ebb freeze <image-id>`](docs/cli.md#ebb-freeze) | Stream a Docker image into the vault, verified; `--restore` loads it back |
 | [`ebb init`](docs/cli.md#ebb-init) | Enroll a vault, verify unlock, show detected groups (suggestions only) |
 | [`ebb delete <target>`](docs/cli.md#ebb-delete) | End recovery obligations and prune freed vault storage in one action |
