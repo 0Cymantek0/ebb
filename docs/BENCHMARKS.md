@@ -451,10 +451,10 @@ did not block anything because it lives OUTSIDE every declared output —
 the scenario pins that ebb's removal authority stays inside declared
 outputs rather than sweeping parents.
 
-### Open finding (ebb bug; does not gate these tables): park from inside the workspace
+### Resolved finding (found by this gauntlet, fixed after run 1): park from inside the workspace
 
 `ebb park` run with its cwd INSIDE the workspace — the CLI's own
-default shape, `ebb park [path]` with path "." — fails on Windows at
+default shape, `ebb park [path]` with path "." — failed on Windows at
 the quarantine rename with errno 32 every time: the invoking process's
 own cwd handle blocks renaming the root directory. Exit 5
 (`reconciliation-required`):
@@ -466,18 +466,25 @@ lifecycle: removal blocked at C:\ebb-gauntlet\run-...\corpus\heavy-asset
 The process cannot access the file because it is being used by another process.
 ```
 
-An identical fixture parked from OUTSIDE with an explicit path succeeds
+An identical fixture parked from OUTSIDE with an explicit path succeeded
 (exit 0, DONE). Reproduced minimally both ways (evidence:
-lab/gauntlet/results/20260921T194516Z); the tables above therefore run
-park/open from outside — a documented deviation, not a massage. Two
-follow-on inconsistencies in the same path: the park error tells the
-user to run `ebb recover <op> --resume-removal`, but recover REFUSES
-for a SEALED park operation ("ResumeRemoval applies to
-QUARANTINED/REMOVING/REMOVAL_BLOCKED"), and plain `ebb recover <op>`
-then exits 0 "ok" WITHOUT removing the workspace. Likely fix direction:
-before the quarantine rename, if the target root is the process cwd,
-`os.Chdir` to the parent first. Until the fix lands and the gauntlet is
-re-run, the park/open numbers here describe the from-outside shape.
+lab/gauntlet/results/20260921T194516Z). Two follow-on inconsistencies
+rode the same path: the park error advised `ebb recover <op>
+--resume-removal`, but recover refused for a SEALED park operation, and
+plain `ebb recover <op>` exited 0 "ok" without completing the removal.
+
+**Fixed** (regression-pinned from both directions: with the fix
+disabled, the new tests reproduce the exact failure above; the recovery
+door tests fail without the door): the CLI now moves its own working
+directory out of the workspace (visible note; envelope warning in
+--json) before the removal phase of park and the reclaim park
+escalation, and `recover --resume-removal` now accepts a SEALED park
+whose durable record shows a blocked removal tail — revalidating the
+source against the sealed inventory before any rename. The gauntlet
+tables above keep the from-outside park/open shape (documented
+deviation): the numbers describe the same machinery either way, and
+from-inside now also completes (covered by the product regression
+suite, not by these tables).
 
 ### Limitations (honest)
 
@@ -492,6 +499,6 @@ re-run, the park/open numbers here describe the from-outside shape.
   a 1.2 MiB measured noise floor; park's freed-obs is further confounded
   by vault growth on the same volume (noted above).
 - Single wall-clock runs, not medians; the machine is a live laptop.
-- park/open are measured via the from-outside shape because of the open
-  park-cwd finding above; re-run the gauntlet after that fix to cover
-  the CLI's default from-inside shape too.
+- park/open are measured via the from-outside shape; the from-inside
+  shape (the CLI default) is now fixed and covered by the product
+  regression suite, and measures the same removal machinery.
