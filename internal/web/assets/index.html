@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Ebb Control Center</title>
+<link rel="icon" href="/static/logo.svg">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <img class="brand-logo" src="/static/logo.svg" alt="">
+    <span class="brand-name">Ebb</span>
+    <span class="brand-sub">Control Center</span>
+    <span class="chip readonly" title="This dashboard is strictly read-only: the only action is copying ebb CLI commands.">read-only</span>
+  </div>
+  <nav class="tabs" id="tabs" aria-label="Views">
+    <button type="button" class="tab active" data-view="dashboard">Dashboard</button>
+    <button type="button" class="tab" data-view="workspaces">Workspaces</button>
+    <button type="button" class="tab" data-view="history">History</button>
+    <button type="button" class="tab" data-view="snapshot">Snapshot Explorer</button>
+    <button type="button" class="tab" data-view="analyse">Analyse</button>
+  </nav>
+  <div class="topbar-actions">
+    <button type="button" class="btn subtle" id="btn-refresh" title="Reload all data">Refresh</button>
+    <button type="button" class="btn subtle" id="btn-palette" title="Command palette">Ctrl K</button>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- Dashboard -->
+  <section class="view" id="view-dashboard">
+    <div class="heroes" id="dash-heroes"></div>
+    <div class="stats-grid" id="dash-secondary"></div>
+    <div class="panel-grid">
+      <div class="panel">
+        <h2>Top commands</h2>
+        <div id="dash-topcmds"></div>
+      </div>
+      <div class="panel">
+        <h2>For scale</h2>
+        <div class="compare-grid" id="dash-compare"></div>
+      </div>
+    </div>
+    <p class="hint" id="dash-since"></p>
+  </section>
+
+  <!-- Workspaces -->
+  <section class="view hidden" id="view-workspaces">
+    <div class="toolbar">
+      <input type="search" id="ws-search" class="input grow" placeholder="Search name, root, ecosystem…" autocomplete="off" spellcheck="false">
+      <select id="ws-status" class="input select" aria-label="Filter by status">
+        <option value="all">all statuses</option>
+        <option value="active">active</option>
+        <option value="parked">parked</option>
+      </select>
+      <select id="ws-eco" class="input select" aria-label="Filter by ecosystem">
+        <option value="all">all ecosystems</option>
+      </select>
+      <span class="muted nowrap" id="ws-count"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Workspace</th>
+            <th>Status</th>
+            <th>Root</th>
+            <th>Ecosystem</th>
+            <th>Last activity</th>
+            <th class="num">Size</th>
+            <th class="num">Reclaimed</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="ws-tbody"></tbody>
+      </table>
+    </div>
+    <p class="hint">Actions copy ebb CLI commands to the clipboard — nothing ever executes from this page.</p>
+  </section>
+
+  <!-- History -->
+  <section class="view hidden" id="view-history">
+    <ul class="timeline" id="history-list"></ul>
+    <div class="load-more">
+      <button type="button" class="btn" id="btn-load-more">Load more</button>
+      <span class="muted" id="history-count"></span>
+    </div>
+  </section>
+
+  <!-- Snapshot Explorer -->
+  <section class="view hidden" id="view-snapshot">
+    <div class="toolbar">
+      <input type="text" id="snap-id" class="input grow mono" placeholder="snapshot id — 8 to 64 hex characters" autocomplete="off" spellcheck="false">
+      <button type="button" class="btn" id="btn-snap">Browse</button>
+    </div>
+    <div id="snap-result"></div>
+    <p class="hint" id="snap-hint">Paste a snapshot id from the vault (for example from <code>ebb status</code> output) and press Browse. Snapshot trees are read from the catalog on demand; entries appear exactly as the backend listed them.</p>
+  </section>
+
+  <!-- Analyse -->
+  <section class="view hidden" id="view-analyse">
+    <div id="analyse-list"></div>
+    <p class="hint">Shielded findings are never offered as commands — resolve the shield first, then rerun <code>ebb analyse</code>.</p>
+  </section>
+
+</main>
+
+<div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
+
+<!-- Command palette -->
+<div class="palette hidden" id="palette">
+  <div class="palette-box">
+    <input type="text" id="palette-input" class="input palette-input" placeholder="Search workspaces, commands, views, history…" autocomplete="off" spellcheck="false">
+    <ul class="palette-list" id="palette-list"></ul>
+    <div class="palette-foot">&#8593;&#8595; navigate &middot; Enter select &middot; Esc close</div>
+  </div>
+</div>
+
+<footer class="statusline">
+  <span id="status-left">read-only local dashboard — the clipboard is the only action</span>
+  <span id="status-right"></span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
