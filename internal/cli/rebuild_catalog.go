@@ -15,6 +15,12 @@
 // duplicate, a divergent candidate is surfaced as a SUSPICIOUS finding
 // with the row left untouched (Wave J review J4).
 //
+// Freeze-tagged vault snapshots (ebb:v1 + op:freeze, the `ebb freeze`
+// blobs) are RETAINED but never reconstructed into docker_images rows:
+// the freeze record's image id, stream digest and filename live only in
+// the local catalog, not in the tags, so the rebuild reports them as
+// retained-not-rebuildable instead of fabricating rows.
+//
 // Exit contract: 0 with a rebuilt catalog; 2 usage (unwired seams, flag
 // mistakes); 3 blocked (non-empty catalog without --force-rebuild); 4 the
 // vault itself failed verification after a working unlock (the discovery
@@ -83,7 +89,14 @@ type rebuildDetails struct {
 	Unsealed         []rebuildUnsealed   `json:"unsealed_payloads"`
 	Suspicious       []rebuildSuspicious `json:"suspicious_refused"`
 	Unrecognized     int                 `json:"unrecognized_snapshots"`
-	NextStep         string              `json:"next_step"`
+	// FreezeImagesRetained counts vault snapshots carrying the freeze
+	// tags (ebb:v1 + op:freeze, written by `ebb freeze`'s stdin backup):
+	// the image blobs stay retained in the vault, but the docker_images
+	// catalog records (image id, stream digest, filename) live only in
+	// the local catalog and are NOT rebuildable from the snapshots
+	// alone. Reported, never fabricated.
+	FreezeImagesRetained int    `json:"freeze_images_retained"`
+	NextStep             string `json:"next_step"`
 }
 
 // runCatalogRebuild executes the rebuild flow inside cmdInit once a
@@ -119,8 +132,9 @@ func runCatalogRebuild(sess *session, streams Streams, deps Deps, jsonOut, force
 	}
 
 	// Existing-catalog gate: refuse a non-empty catalog without the
-	// explicit acknowledgement; never drop data either way.
-	wsCount, snapCount, cerr := sess.cat.Counts()
+	// explicit acknowledgement; never drop data either way. Freeze rows
+	// count as live records too — a freeze-only catalog is intact.
+	counts, cerr := sess.cat.Counts()
 	if cerr != nil {
 		return emitFailure(env, jsonOut, streams, ExitBlocked,
 			fmt.Sprintf("init --rebuild-catalog: reading catalog %s: %v. Safe action: if the catalog file is corrupt, move it aside and rerun (the rebuild never deletes data)",
@@ -132,12 +146,12 @@ func runCatalogRebuild(sess *session, streams Streams, deps Deps, jsonOut, force
 		Workspaces: []rebuildWorkspace{}, Unsealed: []rebuildUnsealed{},
 		Suspicious: []rebuildSuspicious{}, NextStep: "",
 	}
-	if wsCount > 0 || snapCount > 0 {
+	if counts.Workspaces > 0 || counts.Snapshots > 0 || counts.DockerImages > 0 {
 		if !forceRebuild {
 			return emitFailure(env, jsonOut, streams, ExitBlocked, blockerMessage(
 				CodeRebuildNeedsForce, "init --rebuild-catalog",
-				fmt.Sprintf("the catalog at %s already holds %d workspace(s) and %d snapshot(s); rebuilding over it is refused to avoid surprising an intact catalog",
-					details.Catalog, wsCount, snapCount),
+				fmt.Sprintf("the catalog at %s already holds %s; rebuilding over it is refused to avoid surprising an intact catalog",
+					details.Catalog, renderCatalogCounts(counts)),
 				"Safe action: if the catalog is intact, no rebuild is needed; if you are sure, rerun with --force-rebuild (the rebuild only merges and reports duplicates — it never drops rows)"))
 		}
 	}
@@ -297,7 +311,28 @@ func rebuildFromVault(ctx context.Context, sess *session, v *vault.Vault, repoDi
 		})
 	}
 	details.Unrecognized = len(disc.Unrecognized)
+	details.FreezeImagesRetained = len(disc.FreezeImages)
 	return nil
+}
+
+// renderCatalogCounts names the non-zero row families of a catalog (the
+// non-empty-catalog gate message). Freeze rows are named like any other
+// live record: their presence is why the gate fires.
+func renderCatalogCounts(c catalog.Counts) string {
+	var parts []string
+	if c.Workspaces > 0 {
+		parts = append(parts, fmt.Sprintf("%d workspace(s)", c.Workspaces))
+	}
+	if c.Snapshots > 0 {
+		parts = append(parts, fmt.Sprintf("%d snapshot(s)", c.Snapshots))
+	}
+	if c.DockerImages > 0 {
+		parts = append(parts, fmt.Sprintf("%d frozen docker image(s)", c.DockerImages))
+	}
+	if len(parts) == 0 {
+		return "no rows"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // snapshotExists reports whether the logical snapshot id is already in
@@ -330,6 +365,11 @@ func rebuildNextStep(d rebuildDetails) string {
 	}
 	if len(d.Suspicious) > 0 {
 		b.WriteString("; the refused candidates are retained untouched in the vault (repair mode, §11.5)")
+	}
+	if d.FreezeImagesRetained > 0 {
+		b.WriteString(fmt.Sprintf(
+			"; %d frozen docker-image snapshot(s) are retained in the vault but their freeze records are not rebuildable — re-freeze any image you still need with `ebb freeze <image-id>`",
+			d.FreezeImagesRetained))
 	}
 	return b.String()
 }
@@ -368,6 +408,10 @@ func renderRebuildHuman(d rebuildDetails) string {
 	}
 	if d.Unrecognized > 0 {
 		line("  %d vault snapshot(s) carried no Ebb tags: unrecognized, left untouched\n", d.Unrecognized)
+	}
+	if d.FreezeImagesRetained > 0 {
+		line("  %d frozen docker-image snapshot(s) retained in the vault; their freeze records (image id, digest, filename) live only in the catalog and cannot be rebuilt from the snapshots — re-freeze any image you still need with `ebb freeze <image-id>`\n",
+			d.FreezeImagesRetained)
 	}
 	line("next: %s\n", d.NextStep)
 	return b.String()

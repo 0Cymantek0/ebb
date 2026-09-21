@@ -625,8 +625,8 @@ func TestImportDryRunTouchesNothing(t *testing.T) {
 	// No catalog rows, no vault calls (the vault password is gone; an
 	// unlock attempt would have failed the command), no scratch.
 	cat := h.cat()
-	if wc, sc, err := cat.Counts(); err != nil || wc != 0 || sc != 0 {
-		t.Errorf("catalog counts = %d/%d (%v), want 0/0", wc, sc, err)
+	if ct, err := cat.Counts(); err != nil || ct.Workspaces != 0 || ct.Snapshots != 0 {
+		t.Errorf("catalog counts = %d/%d (%v), want 0/0", ct.Workspaces, ct.Snapshots, err)
 	}
 	if got := len(importOpsOf(t, cat)); got != 0 {
 		t.Errorf("import ops = %d, want 0", got)
@@ -666,8 +666,8 @@ func TestImportUnlockFailure(t *testing.T) {
 	}
 	// Nothing registered; the capsule file is untouched.
 	cat := h.cat()
-	if wc, sc, err := cat.Counts(); err != nil || wc != 0 || sc != 0 {
-		t.Errorf("catalog counts = %d/%d (%v), want 0/0", wc, sc, err)
+	if ct, err := cat.Counts(); err != nil || ct.Workspaces != 0 || ct.Snapshots != 0 {
+		t.Errorf("catalog counts = %d/%d (%v), want 0/0", ct.Workspaces, ct.Snapshots, err)
 	}
 	if ids := h.destSnaps(t); len(ids) != 0 {
 		t.Errorf("destination vault mutated by a failed unlock: %v", ids)
@@ -795,8 +795,8 @@ func TestInspectCapsulePublicOnly(t *testing.T) {
 	}
 	// Zero registrations, vault untouched.
 	cat := h.cat()
-	if wc, sc, cerr := cat.Counts(); cerr != nil || wc != 0 || sc != 0 {
-		t.Errorf("catalog counts = %d/%d (%v), want 0/0", wc, sc, cerr)
+	if ct, cerr := cat.Counts(); cerr != nil || ct.Workspaces != 0 || ct.Snapshots != 0 {
+		t.Errorf("catalog counts = %d/%d (%v), want 0/0", ct.Workspaces, ct.Snapshots, cerr)
 	}
 	if ids := h.destSnaps(t); len(ids) != 0 {
 		t.Errorf("destination vault mutated by inspect: %v", ids)
@@ -833,8 +833,8 @@ func TestInspectCapsuleVerifiedRegistersNothing(t *testing.T) {
 	// ZERO registrations: no workspace, no snapshot, no replica, no
 	// operation, no destination-vault mutation (staging was private).
 	cat := h.cat()
-	if wc, sc, err := cat.Counts(); err != nil || wc != 0 || sc != 0 {
-		t.Errorf("catalog counts = %d/%d (%v), want 0/0", wc, sc, err)
+	if ct, err := cat.Counts(); err != nil || ct.Workspaces != 0 || ct.Snapshots != 0 {
+		t.Errorf("catalog counts = %d/%d (%v), want 0/0", ct.Workspaces, ct.Snapshots, err)
 	}
 	if got := len(importOpsOf(t, cat)); got != 0 {
 		t.Errorf("import ops = %d, want 0", got)

@@ -343,18 +343,32 @@ func (c *Catalog) ImportDiscoveredSnapshot(wsID domain.WorkspaceID, wsName strin
 	})
 }
 
-// Counts returns the number of workspace and snapshot rows. It is the
-// cheap emptiness probe the rebuild-catalog path (`ebb init
-// --rebuild-catalog`, Foundation §11.5) and `ebb doctor` use to tell a
-// lost/empty catalog from one holding live records.
-func (c *Catalog) Counts() (workspaces, snapshots int64, err error) {
-	if err := c.db.QueryRow(`SELECT COUNT(*) FROM workspaces`).Scan(&workspaces); err != nil {
-		return 0, 0, fmt.Errorf("catalog: count workspaces: %w", err)
+// Counts is the row-count summary of one catalog: the cheap emptiness
+// probe the rebuild-catalog path (`ebb init --rebuild-catalog`,
+// Foundation §11.5) and `ebb doctor` use to tell a lost/empty catalog
+// from one holding live records. DockerImages counts docker_images rows
+// (schemaV3 freeze records): a catalog that only ever served `ebb
+// freeze` holds 0 workspaces and 0 snapshots but real retained freeze
+// rows — it is NOT lost, and this count is what proves it.
+type Counts struct {
+	Workspaces   int64
+	Snapshots    int64
+	DockerImages int64
+}
+
+// Counts returns the workspace, snapshot and docker-image row counts.
+func (c *Catalog) Counts() (Counts, error) {
+	var ct Counts
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM workspaces`).Scan(&ct.Workspaces); err != nil {
+		return Counts{}, fmt.Errorf("catalog: count workspaces: %w", err)
 	}
-	if err := c.db.QueryRow(`SELECT COUNT(*) FROM snapshots`).Scan(&snapshots); err != nil {
-		return 0, 0, fmt.Errorf("catalog: count snapshots: %w", err)
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM snapshots`).Scan(&ct.Snapshots); err != nil {
+		return Counts{}, fmt.Errorf("catalog: count snapshots: %w", err)
 	}
-	return workspaces, snapshots, nil
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM docker_images`).Scan(&ct.DockerImages); err != nil {
+		return Counts{}, fmt.Errorf("catalog: count docker images: %w", err)
+	}
+	return ct, nil
 }
 
 // rowScanner is satisfied by both *sql.Row and *sql.Rows.

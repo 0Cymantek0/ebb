@@ -36,6 +36,7 @@ package resticstore
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -68,15 +69,36 @@ type Store struct {
 	cacheErr  error
 }
 
-// New returns a Store running the given restic binary ("" and "restic"
-// both resolve through PATH). Commands fail with a typed error when the
-// binary cannot be found.
+// New returns a Store running the given restic binary ("" and bare
+// names such as "restic" resolve through PATH, via exec.LookPath BEFORE
+// any absolutization — a bare name must never silently select a restic
+// binary sitting in the working directory). An absolute path is used as
+// given (separator-normalized); an explicitly relative path ("./restic")
+// names a cwd-relative file on purpose and is absolutized. A bare name
+// PATH cannot resolve stays bare, so the first command fails with the
+// honest not-found error instead of a cwd-hijacked copy.
 func New(binary string) *Store {
 	if binary == "" {
 		binary = "restic"
 	}
-	if abs, err := filepath.Abs(binary); err == nil {
-		binary = abs
+	switch {
+	case filepath.IsAbs(binary):
+		if abs, err := filepath.Abs(binary); err == nil {
+			binary = abs
+		}
+	case strings.ContainsAny(binary, `/\`):
+		// An explicitly relative path is deliberate cwd-relative naming,
+		// not a bare name the caller expects PATH to answer.
+		if abs, err := filepath.Abs(binary); err == nil {
+			binary = abs
+		}
+	default:
+		// Bare name: resolve through PATH, never filepath.Abs — Abs
+		// here would turn "restic" into <cwd>\restic, the cwd-hijack
+		// trap freezer.New's resolution deliberately avoids.
+		if resolved, err := exec.LookPath(binary); err == nil {
+			binary = resolved
+		}
 	}
 	return &Store{binary: binary, timeout: DefaultTimeout}
 }

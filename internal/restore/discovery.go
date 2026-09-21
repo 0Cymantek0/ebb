@@ -76,7 +76,11 @@ package restore
 // for pairing, never as proof: restic tags are mutable metadata (and
 // retagging mints a new snapshot id). Every adoption decision rests on
 // the seal tree's shape (.ebb-seal-<opID>/receipt.json), the strict
-// receipt parse and the digest re-derivation described above.
+// receipt parse and the digest re-derivation described above. The one
+// additional tag pair this file reads is ebb:v1 + op:freeze — a freeze
+// blob is never paired or adopted (it has no seal tree and no workspace
+// manifest), only classified into VaultDiscovery.FreezeImages and
+// reported; its freeze record is not rebuildable from the tags.
 
 import (
 	"context"
@@ -97,6 +101,19 @@ const (
 	tagEbbKind     = "ebb-kind"
 	tagKindSeal    = "seal"
 	tagKindPayload = "payload"
+)
+
+// Freeze blobs (`ebb freeze`, internal/freezer via BackupStdin) carry the
+// base ebb:v1 tag plus op:freeze (and an image:<token> tag) instead of
+// an ebb-kind: they are one-file image archives, not workspace payloads.
+// Reader-side twins of the tags the freezer writes, per the local-reader
+// rule — and like every tag here, they only route the REPORT; they never
+// authorize anything.
+const (
+	tagBaseKey  = "ebb"
+	tagBaseVal  = "v1"
+	tagOp       = "op"
+	tagOpFreeze = "freeze"
 )
 
 // Reader-side twins of the §16.2 contract vocabulary the writer freezes
@@ -194,6 +211,14 @@ type VaultDiscovery struct {
 	// Unrecognized backend snapshot ids carried no ebb tags: reported,
 	// never touched (they may be the user's own restic snapshots).
 	Unrecognized []string
+	// FreezeImages are backend snapshot ids carrying the freeze tags
+	// (ebb:v1 + op:freeze): docker-image blobs retained by `ebb freeze`.
+	// They are not workspace payloads, and their docker_images catalog
+	// records (image id, stream digest, filename) live only in the local
+	// catalog — never in the tags — so a rebuilt catalog cannot recover
+	// them. Discovery reports the blobs as retained; the caller must say
+	// the records are not rebuildable rather than fabricate rows.
+	FreezeImages []string
 }
 
 // DiscoverVault walks one vault and reconstructs the sealed pairs,
@@ -222,7 +247,15 @@ func DiscoverVault(ctx context.Context, store domain.SnapshotStore, vault VaultR
 		case tagKindPayload:
 			// collected below
 		default:
-			d.Unrecognized = append(d.Unrecognized, r.BackendID)
+			// Freeze blobs (ebb:v1 + op:freeze) get their own named
+			// category; everything else without an ebb-kind tag stays
+			// unrecognized. Strict pair: a bare op:freeze without the
+			// ebb:v1 base tag is not Ebb's snapshot.
+			if r.Tags[tagBaseKey] == tagBaseVal && r.Tags[tagOp] == tagOpFreeze {
+				d.FreezeImages = append(d.FreezeImages, r.BackendID)
+			} else {
+				d.Unrecognized = append(d.Unrecognized, r.BackendID)
+			}
 		}
 	}
 

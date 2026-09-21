@@ -100,6 +100,37 @@ func TestRecordAndFindDockerImages(t *testing.T) {
 	}
 }
 
+// TestCountsSeesDockerImages: Counts must count docker_images rows. The
+// freeze rows are the difference between "the catalog was lost" and
+// "this machine only ever froze images" — doctor's lost-catalog
+// heuristic and the rebuild non-empty-catalog gate both read these
+// numbers (W2-4 regression).
+func TestCountsSeesDockerImages(t *testing.T) {
+	c := newFreezeCatalog(t)
+
+	ct, err := c.Counts()
+	if err != nil {
+		t.Fatalf("counts: %v", err)
+	}
+	if ct.Workspaces != 0 || ct.Snapshots != 0 || ct.DockerImages != 0 {
+		t.Fatalf("fresh counts = %+v, want all zero", ct)
+	}
+
+	if _, err := c.RecordDockerImage(freezeRow("sha256:aaaa")); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if _, err := c.RecordDockerImage(freezeRow("sha256:bbbb")); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	ct, err = c.Counts()
+	if err != nil {
+		t.Fatalf("counts: %v", err)
+	}
+	if ct.DockerImages != 2 || ct.Workspaces != 0 || ct.Snapshots != 0 {
+		t.Fatalf("counts = %+v, want 0 workspace, 0 snapshot, 2 docker images", ct)
+	}
+}
+
 func TestDockerImageVerifyAndRemoveStamps(t *testing.T) {
 	c := newFreezeCatalog(t)
 

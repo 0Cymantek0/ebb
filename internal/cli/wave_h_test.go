@@ -8,6 +8,7 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -308,5 +309,117 @@ func TestDoctorCatalogCheck(t *testing.T) {
 	}
 	if c := catalogCheck(dir); c.Status != "pass" || !strings.Contains(c.Detail, "1 snapshot") {
 		t.Errorf("populated-catalog check = %+v", c)
+	}
+
+	// A catalog holding ONLY docker_images freeze rows is NOT a lost
+	// catalog (W2-4 regression: the heuristic used to fire on
+	// workspaces==0 alone and point at --rebuild-catalog, which can
+	// never reconstruct freeze records). The rows are reported present.
+	fdir := t.TempDir()
+	if _, err := vault.New(filepath.Join(fdir, vault.RegistryFile)).Register("main", filepath.Join(fdir, "repo"), ""); err != nil {
+		t.Fatal(err)
+	}
+	fcat, err := catalog.Open(filepath.Join(fdir, vault.CatalogFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fcat.RecordDockerImage(catalog.DockerImage{
+		ImageID:    "sha256:" + strings.Repeat("ab", 32),
+		SnapshotID: strings.Repeat("c", 64),
+		Filename:   "docker-image-frozen.tar",
+		SHA256:     strings.Repeat("d", 64),
+		Bytes:      4096,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fcat.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c = catalogCheck(fdir)
+	if c.Status != "pass" || strings.Contains(c.Detail, "catalog was lost") {
+		t.Errorf("freeze-only catalog check = %+v, want pass without the lost-catalog warning", c)
+	}
+	if !strings.Contains(c.Detail, "frozen docker image") {
+		t.Errorf("freeze-only detail does not report the freeze rows: %+v", c)
+	}
+}
+
+// TestInitRebuildReportsFreezeSnapshotsNotRebuildable: after a catalog
+// loss, a freeze-tagged vault snapshot (ebb:v1 + op:freeze, the tags
+// `ebb freeze`'s BackupStdin writes) must be retained and honestly
+// reported — classified by name, never reconstructed into docker_images
+// rows (the freeze record's image id, digest and filename live only in
+// the lost catalog), never silently counted as unrecognized (W2-4).
+func TestInitRebuildReportsFreezeSnapshotsNotRebuildable(t *testing.T) {
+	h := newEHarness(t)
+	parkH(t, h)
+
+	// A freeze blob in the same vault. The tree bytes are irrelevant —
+	// only the tags classify it; they mirror encodeTags' output around
+	// the freezer's op/image tags. (The blob gets its own fixture dir:
+	// the park above removed the workspace root.)
+	freezeSrc := filepath.Join(t.TempDir(), "image.tar")
+	if err := os.WriteFile(freezeSrc, []byte("pretend docker-save stream\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	freezeTags := map[string]string{"ebb": "v1", "op": "freeze", "image": "sha256_frozenimage"}
+	ref, err := h.store.Snapshot(context.Background(), "", filepath.Dir(freezeSrc),
+		[]string{filepath.Base(freezeSrc)}, "", freezeTags)
+	if err != nil {
+		t.Fatalf("freeze blob snapshot: %v", err)
+	}
+	loseCatalog(t, h)
+
+	code, stdout, stderr := h.run("init", "--rebuild-catalog", "--json")
+	if code != ExitOK {
+		t.Fatalf("rebuild code = %d, stderr = %s", code, stderr)
+	}
+	det := rebuildEnvelope(t, stdout)
+	if got := det["snapshots_adopted"].(float64); got != 1 {
+		t.Errorf("snapshots_adopted = %v, want 1 (the park pair only)", got)
+	}
+	if got := det["freeze_images_retained"].(float64); got != 1 {
+		t.Errorf("freeze_images_retained = %v, want 1", got)
+	}
+	if got := det["unrecognized_snapshots"].(float64); got != 0 {
+		t.Errorf("unrecognized_snapshots = %v, want 0 (the freeze blob is classified, not unknown)", got)
+	}
+
+	// Nothing was fabricated: the rebuilt catalog holds the workspace
+	// pair but ZERO docker_images rows.
+	ct, err := h.cat().Counts()
+	if err != nil {
+		t.Fatalf("counts: %v", err)
+	}
+	if ct.DockerImages != 0 {
+		t.Errorf("rebuilt catalog fabricated %d docker_images row(s)", ct.DockerImages)
+	}
+	// And the blob itself is retained untouched in the vault.
+	if _, ok := h.store.snaps[ref.BackendID]; !ok {
+		t.Fatal("the freeze blob was deleted from the vault")
+	}
+}
+
+// TestRenderRebuildHumanNamesFreezeLimits pins the report wording: the
+// freeze line must say retained + not rebuildable + the true follow-up
+// command, never a command that does not exist.
+func TestRenderRebuildHumanNamesFreezeLimits(t *testing.T) {
+	d := rebuildDetails{FreezeImagesRetained: 2, NextStep: rebuildNextStep(rebuildDetails{FreezeImagesRetained: 2})}
+	out := renderRebuildHuman(d)
+	for _, want := range []string{
+		"2 frozen docker-image snapshot(s) retained in the vault",
+		"cannot be rebuilt from the snapshots",
+		"`ebb freeze <image-id>`",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rebuild report lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "--list") {
+		t.Errorf("rebuild report points at a nonexistent list command:\n%s", out)
+	}
+	next := rebuildNextStep(d)
+	if !strings.Contains(next, "freeze records are not rebuildable") {
+		t.Errorf("next step lacks the honest freeze note: %s", next)
 	}
 }

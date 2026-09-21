@@ -391,6 +391,31 @@ func TestFreezeCLIRestoreVerifyBeforeLoad(t *testing.T) {
 	}
 }
 
+// TestFreezeRestoreUnknownEntrySafeActionIsHonest pins the safe-action
+// text of the entry-id miss (W2-4): `ebb status` renders nothing about
+// freezes and no freeze list command exists, so the guidance may only
+// name the real command surface — resolve by image id, re-freeze, and
+// `ebb doctor` for the catalog's frozen-image row count.
+func TestFreezeRestoreUnknownEntrySafeActionIsHonest(t *testing.T) {
+	h := newFreezeHarness(t)
+
+	code, _, stderr := h.run("--restore", strings.Repeat("0", 32))
+	if code != ExitUsage {
+		t.Fatalf("unknown entry code = %d, stderr = %s", code, stderr)
+	}
+	if strings.Contains(stderr, "ebb status") {
+		t.Fatalf("safe action still points at `ebb status`, which renders nothing about freezes: %s", stderr)
+	}
+	if strings.Contains(stderr, "--list") {
+		t.Fatalf("safe action points at a nonexistent list command: %s", stderr)
+	}
+	for _, want := range []string{"image id", "re-freeze", "`ebb freeze", "`ebb doctor`"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("safe action lacks %q: %s", want, stderr)
+		}
+	}
+}
+
 func TestFreezeCLIUnknownImageAndBadArgs(t *testing.T) {
 	h := newFreezeHarness(t)
 	h.setCTL("inspect-missing", "1")
