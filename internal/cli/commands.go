@@ -182,8 +182,14 @@ func planOutcome(r planner.Result) string {
 }
 
 // emit writes the terminal result: JSON to stdout when jsonOut is set,
-// otherwise the human text to stderr.
+// otherwise the human text to stderr. The envelope is also handed to
+// the Wave 3 stats recorder's sink (statrec.go) so the dispatch wrapper
+// can record the invocation's byte flows from the command's own
+// accounting; a nil sink (no recorded dispatch in flight) is a no-op.
 func emit(env Envelope, jsonOut bool, streams Streams, human string) {
+	if envelopeSink != nil {
+		envelopeSink(env)
+	}
 	if jsonOut {
 		if err := env.emitJSON(streams.Out); err != nil {
 			fmt.Fprintf(streams.Err, "ebb: writing result: %v\n", err)

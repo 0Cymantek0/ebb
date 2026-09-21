@@ -28,10 +28,15 @@ func requireTool(t *testing.T, bin string) {
 	}
 }
 
-// runReal executes Main with the production dependency set.
+// runReal executes Main with the production dependency set. Stats-event
+// recording is unwired here: these runs drive the real state-dir seam
+// and must never write telemetry into the developer's real state
+// directory.
 func runReal(args ...string) (code int, stdout, stderr string) {
 	var out, errb bytes.Buffer
-	code = Main(args, Streams{Out: &out, Err: &errb}, RealDeps())
+	deps := RealDeps()
+	deps.RecordStatEvent = nil
+	code = Main(args, Streams{Out: &out, Err: &errb}, deps)
 	return code, out.String(), errb.String()
 }
 

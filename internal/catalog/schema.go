@@ -3,7 +3,7 @@ package catalog
 // Forward-only schema migrations. The slice index is the version
 // recorded in schema_migrations; migration N runs inside one transaction
 // together with its version insert (see Catalog.migrate).
-var migrations = []string{schemaV1, schemaV2, schemaV3}
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4}
 
 // schemaMigrationsDDL is created separately from any versioned
 // migration so a fresh database can record versions at all.
@@ -164,4 +164,25 @@ CREATE TABLE docker_images (
 );
 
 CREATE INDEX idx_docker_images_image ON docker_images(image_id, created_at);
+`
+
+// schemaV4 (Wave 3, stats foundation) adds the stats_events table: one
+// append-only row per dispatched CLI verb recording its byte flows for
+// `ebb stats` (the Developer Space Economy dashboard). The table is pure
+// telemetry — it never feeds a safety decision, holds no secrets (bytes,
+// the command verb, a workspace label and a compact detail object we
+// minted ourselves) and a lost table degrades the dashboard to "—", never
+// a recovery. A CREATE TABLE touches no existing row shape.
+const schemaV4 = `
+CREATE TABLE IF NOT EXISTS stats_events (
+  id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  command TEXT NOT NULL,
+  workspace TEXT,
+  bytes_in INTEGER NOT NULL DEFAULT 0,
+  bytes_out INTEGER NOT NULL DEFAULT 0,
+  detail TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_stats_events_ts ON stats_events(ts);
 `

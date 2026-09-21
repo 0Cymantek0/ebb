@@ -121,6 +121,23 @@ func RealDeps() Deps {
 	if bin, lerr := exec.LookPath("docker"); lerr == nil {
 		deps.AnalyseDocker = dockerEngineAdapter{eng: dockeradapter.New(bin)}
 	}
+	// Wave 3 stats recording: one best-effort event append per
+	// dispatched verb, through a short-lived catalog open over the SAME
+	// state-dir seam the session machinery honors (so test overrides of
+	// StateDir keep telemetry inside the test world). Failures are the
+	// caller's to warn about, never the command's to fail on.
+	deps.RecordStatEvent = func(e catalog.StatEvent) error {
+		dir, err := deps.StateDir()
+		if err != nil {
+			return fmt.Errorf("stats event: state dir: %w", err)
+		}
+		cat, err := catalog.Open(filepath.Join(dir, vault.CatalogFile))
+		if err != nil {
+			return fmt.Errorf("stats event: open catalog: %w", err)
+		}
+		defer cat.Close()
+		return cat.AppendStatEvent(context.Background(), e)
+	}
 	return deps
 }
 
