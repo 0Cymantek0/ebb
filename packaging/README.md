@@ -22,10 +22,16 @@ nothing here is publishable until the placeholders are filled.
 Release assets attached to a GitHub release tag `vX.Y.Z`:
 
 ```
-ebb-X.Y.Z-windows-amd64.zip      # archive MEMBER inside: ebb-windows-amd64.exe
-ebb-X.Y.Z-linux-amd64.tar.gz     # archive MEMBER inside: ebb-linux-amd64
-SHA256SUMS.txt                   # "<sha256>  <archive-name>" per line, over ARCHIVES
+ebb-vX.Y.Z-windows-amd64.zip      # archive MEMBER inside: ebb-windows-amd64.exe
+ebb-vX.Y.Z-linux-amd64.tar.gz     # archive MEMBER inside: ebb-linux-amd64
+SHA256SUMS.txt                    # "<sha256>  <archive-name>" per line, over ARCHIVES
 ```
+
+The archive FILENAME carries the FULL tag including the leading `v`
+(`ebb-v0.1.0-windows-amd64.zip`), and so does the release download URL's
+`.../download/v0.1.0/` directory — installers and manifests must spell both
+exactly this way (this was audit finding D1: every consumer once dropped the
+`v` from the filename and 404'd against a real release).
 
 The member name inside an archive has NO version in it — manifests and
 installers must reference `ebb-windows-amd64.exe` / `ebb-linux-amd64`
@@ -147,8 +153,15 @@ Test hooks (documented for CI): `install.sh` honors `EBB_TAG`,
 ## Validating the templates
 
 ```sh
-sh packaging/validate.sh
+bash packaging/validate.sh
 ```
+
+Invoke it with `bash`, not `sh` (the shebang already says bash): the script
+uses `BASH_SOURCE` and `set -o pipefail`, so a POSIX `sh` (dash on Debian)
+dies with `Bad substitution` under the `sh packaging/validate.sh` spelling
+(audit finding V2). On Linux CI, also install PowerShell (`pwsh`) first —
+without a PowerShell engine the install.ps1 parser check honestly fails,
+and a green run needs it.
 
 Checks: POSIX syntax of `install.sh` (`sh -n`, plus `dash -n` when
 available), PowerShell parser round-trip of `install.ps1` (pwsh and, if
@@ -157,3 +170,38 @@ and structural key-presence checks on the winget YAML files. The YAML
 checks are grep-level: they verify required keys exist, not full schema
 conformance — full conformance is checked by winget-create /
 winget-pkgs PR validation at submission time.
+
+## Unsigned binaries (honest trust story)
+
+The release binaries are **not signed**. There is no Authenticode
+signing in the pipeline yet, and this section documents what that means
+instead of leaving it unsaid:
+
+- **What the SHA256SUMS gate does:** both installers and both package
+  managers verify the downloaded archive's SHA256 against the release's
+  `SHA256SUMS.txt` BEFORE anything is extracted, executed, or put on PATH.
+  This catches corrupted mirrors, truncated downloads, and any byte-level
+  tampering between the release page and the user's machine.
+- **What it does NOT do:** `SHA256SUMS.txt` is fetched from the SAME
+  origin (the GitHub release) as the archive itself. It is a transport
+  integrity check, not an independent trust root — a compromise of the
+  release channel (a hostile tag push, a seized publisher account, a
+  tampered `get.ebb.dev`) serves a self-consistent archive+sums pair and
+  defeats the gate **by design**. The actual trust root today is the
+  TLS-protected GitHub channel plus the publisher identity behind it.
+- **SmartScreen / Mark-of-the-Web (Windows):** the zip route (`curl` a
+  zip, or download-and-extract from the release page) applies the zone
+  identifier (MOTW) to the downloaded archive, and Windows extraction
+  flows propagate it to the extracted `ebb.exe`; a first Explorer-launched
+  run can therefore hit a SmartScreen "unknown publisher" warning. The
+  `irm … | iex` route runs the installer entirely in memory (no MOTW on
+  the script itself); the binary it installs is checksum-gated but
+  unsigned. winget and scoop soften the UX (their own hash gates,
+  no SmartScreen prompt of this shape) but inherit the same-origin trust
+  property above.
+- **Signing plans:** Authenticode signing of the Windows binary is NOT
+  yet in place (no cert story exists yet). When it lands, the signature
+  becomes the publisher-identity root and `SHA256SUMS.txt` remains the
+  transport integrity layer. Until then, users who want to pin trust
+  should verify hashes out-of-band against the release page over an
+  authenticated session.

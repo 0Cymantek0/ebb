@@ -11,6 +11,10 @@
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Scratch files (parser stderr captures) live in a private temp dir and are
+# removed on exit — never written into the caller's CWD (parallel-run safe).
+errdir=$(mktemp -d) || { echo "validate.sh: error: mktemp failed" >&2; exit 1; }
+trap 'rm -rf "$errdir"' EXIT
 fails=0
 passes=0
 
@@ -21,13 +25,12 @@ info() { echo "  note: $*"; }
 # ---- install.sh: POSIX sh syntax --------------------------------------------
 
 echo "[install.sh]"
-if sh -n "$here/install.sh" 2>err.txt; then pass "sh -n (POSIX syntax)"; else fail "sh -n: $(cat err.txt)"; fi
+if sh -n "$here/install.sh" 2>"$errdir/err.txt"; then pass "sh -n (POSIX syntax)"; else fail "sh -n: $(cat "$errdir/err.txt")"; fi
 if command -v dash >/dev/null 2>&1; then
-	if dash -n "$here/install.sh" 2>err.txt; then pass "dash -n (dash/POSIX syntax)"; else fail "dash -n: $(cat err.txt)"; fi
+	if dash -n "$here/install.sh" 2>"$errdir/err.txt"; then pass "dash -n (dash/POSIX syntax)"; else fail "dash -n: $(cat "$errdir/err.txt")"; fi
 else
 	info "dash not available; sh -n only"
 fi
-rm -f err.txt
 
 # ---- install.ps1: PowerShell parser round-trip ------------------------------
 
@@ -48,16 +51,15 @@ ps_parse() { # ps_parse <pwsh-or-powershell>
 			exit 1
 		}
 		exit 0
-	" 2>ps_err.txt
+	" 2>"$errdir/ps_err.txt"
 }
 ps_checked=0
 for bin in pwsh powershell; do
 	if command -v "$bin" >/dev/null 2>&1; then
 		ps_checked=$((ps_checked + 1))
-		if ps_parse "$bin"; then pass "$bin parser: no syntax errors"; else fail "$bin parser: $(head -5 ps_err.txt)"; fi
+		if ps_parse "$bin"; then pass "$bin parser: no syntax errors"; else fail "$bin parser: $(head -5 "$errdir/ps_err.txt")"; fi
 	fi
 done
-rm -f ps_err.txt
 [ "$ps_checked" -gt 0 ] || fail "no PowerShell available to parse install.ps1"
 
 # ---- scoop/ebb.json: JSON validity ------------------------------------------
@@ -65,13 +67,13 @@ rm -f ps_err.txt
 echo "[scoop/ebb.json]"
 json_ok=notdone
 if command -v python >/dev/null 2>&1; then
-	if python -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$here/scoop/ebb.json" 2>err.txt; then
+	if python -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$here/scoop/ebb.json" 2>"$errdir/err.txt"; then
 		pass "python json.load: valid JSON"; json_ok=done
-	else fail "python json.load: $(cat err.txt)"; fi
+	else fail "python json.load: $(cat "$errdir/err.txt")"; fi
 elif command -v node >/dev/null 2>&1; then
-	if node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$here/scoop/ebb.json" 2>err.txt; then
+	if node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$here/scoop/ebb.json" 2>"$errdir/err.txt"; then
 		pass "node JSON.parse: valid JSON"; json_ok=done
-	else fail "node JSON.parse: $(cat err.txt)"; fi
+	else fail "node JSON.parse: $(cat "$errdir/err.txt")"; fi
 else
 	# go fallback: minimal one-off program (repo toolchain is Go)
 	tmpgo=$(mktemp -d)
@@ -98,12 +100,11 @@ func main() {
 	}
 }
 EOF
-	if (cd "$tmpgo" && go run . "$here/scoop/ebb.json") 2>err.txt; then
+	if (cd "$tmpgo" && go run . "$here/scoop/ebb.json") 2>"$errdir/err.txt"; then
 		pass "go encoding/json: valid JSON"; json_ok=done
-	else fail "go encoding/json: $(head -3 err.txt)"; fi
+	else fail "go encoding/json: $(head -3 "$errdir/err.txt")"; fi
 	rm -rf "$tmpgo"
 fi
-rm -f err.txt
 
 # scoop structure: bin mapping renames the archived member to ebb
 # (layout-tolerant: "ebb-windows-amd64.exe" and "ebb" may be on one line or
