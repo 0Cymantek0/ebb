@@ -274,6 +274,10 @@ Nothing is silently lost. Operations journal their durable phases; a killed park
 **Can I move a workspace to another machine?**
 Yes. `ebb export <snapshot-id> --output project.ebb` writes an independently encrypted capsule (a fresh restic repository in a ZIP64 container); the passphrase is displayed once. On the other side, `ebb import project.ebb` registers the snapshot into a vault, verified, and `ebb open <name>` restores it. Imported snapshots stay pinned and their rebuild approvals start empty: trust is never imported.
 
+## License
+
+Ebb is free to use, study, modify, embed, and redistribute, and it is source-available under the Apache License, Version 2.0 with the Commons Clause v1.0 condition. In plain terms: build anything on top of it, including paid products, and sell those products freely. What the license forbids is selling Ebb itself, or a repackaged or trivially renamed Ebb, as a product whose value comes from Ebb rather than from what you added. Both full texts live in [LICENSE](LICENSE).
+
 ---
 
 Every destructive path in ebb is gated, journaled, and independently verified. [Full CLI reference](docs/cli.md) | [Benchmarks](docs/BENCHMARKS.md)
