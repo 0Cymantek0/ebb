@@ -30,3 +30,9 @@ last_sessio.md
 last_session.md
 prompt.md
 
+
+# internal working dirs (local only)
+/lab/
+/graphify-out/
+/agents.md
+/CONTEXT.md
