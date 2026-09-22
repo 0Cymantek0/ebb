@@ -404,8 +404,15 @@ func TestFreezeCancellationMidStream(t *testing.T) {
 		})
 		done <- err
 	}()
-	// Let the stream actually start, then cancel.
-	time.Sleep(250 * time.Millisecond)
+	// Wait until the save stream has ACTUALLY started before cancelling:
+	// a fixed sleep races the first fakedocker launch (each test process
+	// builds the fake into a fresh temp dir; a cold exe's first spawn can
+	// exceed any fixed budget under AV scans or a loaded machine), and a
+	// cancel that lands before the first subprocess would exercise
+	// nothing while still "passing" the cancellation assertions.
+	if !e.waitForLog("start save", 30*time.Second) {
+		t.Fatalf("save never started; log:\n%s", e.dockerLog())
+	}
 	cancel()
 
 	select {
