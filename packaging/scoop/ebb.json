@@ -9,7 +9,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/OWNER/ebb/releases/download/v0.1.0-alpha/ebb-v0.1.0-alpha-windows-amd64.zip",
-      "hash": "4e3d3bf7ddee2bb48f2604efcb4f75204bc973d41855e232fab57fd8cc970a1a"
+      "hash": "269dcf0971ca77d4772280ae0160203f88088cec92a0a642877f7739b5482f25"
     }
   },
   "bin": [

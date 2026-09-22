@@ -27,11 +27,12 @@
 #   1. Fill InstallerUrl: replace OWNER with the real GitHub owner/org
 #      (the repo had no git remote configured when this template was written).
 #   2. InstallerSha256 is PINNED to tag v0.1.0-alpha: it is the SHA256 of
-#      the zip built from that exact tagged commit (reproducible via
-#      `scripts/release.sh v0.1.0-alpha` on a clean tree — the hash must
-#      match the release SHA256SUMS.txt line). If the tag ever moves,
-#      rebuild and re-pin; a mismatched hash is rejected by winget-pkgs
-#      validation and by every installer's checksum gate.
+#      the zip built by `scripts/release.sh v0.1.0-alpha` from the release
+#      commit (must equal the release SHA256SUMS.txt line; a mismatched
+#      hash is rejected by winget-pkgs validation and by every installer's
+#      checksum gate). release.sh passes -buildvcs=false, so the hash
+#      follows the compiled source only: packaging/OWNER edits do NOT
+#      move it; Go-source or version changes do — rebuild and re-pin.
 #   3. PackageVersion and PackageIdentifier must match ebb.yaml exactly.
 #
 # File name in the winget-pkgs PR: manifests/e/Ebb/Ebb/0.1.0-alpha/Ebb.Ebb.installer.yaml
@@ -48,7 +49,7 @@ Installers:
       - RelativeFilePath: ebb-windows-amd64.exe
         PortableCommandAlias: ebb
     InstallerUrl: https://github.com/OWNER/ebb/releases/download/v0.1.0-alpha/ebb-v0.1.0-alpha-windows-amd64.zip
-    InstallerSha256: 4e3d3bf7ddee2bb48f2604efcb4f75204bc973d41855e232fab57fd8cc970a1a
+    InstallerSha256: 269dcf0971ca77d4772280ae0160203f88088cec92a0a642877f7739b5482f25
     Commands:
       - ebb
 ManifestType: installer

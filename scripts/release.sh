@@ -83,6 +83,14 @@ trap 'rm -rf "$tmpdir"' EXIT
 # tree root, a fixed-date commit object sets the entry timestamps, and
 # the resulting archive bytes are reproducible for identical inputs.
 # (1980-01-01 is the oldest timestamp the zip DOS date field encodes.)
+# -buildvcs=false (below) is what keeps that property true across commits
+# and dirty trees: without it, Go stamps vcs.revision/vcs.modified into
+# the binary's build info, so the SAME source content built at a different
+# commit (or with a dirty tree) hashes differently and the release
+# SHA256SUMS drift. The release tag -> commit mapping is recorded by git
+# itself; the binary does not need a second copy. (Found by rebuilding
+# v0.1.0-alpha after manifest-only commits: the hash changed although no
+# Go source had.)
 make_zip() { # make_zip <file-to-embed> <basename-in-archive> <output.zip>
 	local embed=$1 base=$2 out=$3 idx="$tmpdir/index" blob tree commit
 	rm -f "$idx"
@@ -153,7 +161,7 @@ for target in $targets; do
 
 	echo "==> build $goos/$goarch"
 	GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 \
-		go build -trimpath -ldflags "$ldflags" -o "$outroot/$bin" ./cmd/ebb \
+		go build -trimpath -buildvcs=false -ldflags "$ldflags" -o "$outroot/$bin" ./cmd/ebb \
 		|| die "build failed for $goos/$goarch"
 
 	echo "==> archive $goos/$goarch"
