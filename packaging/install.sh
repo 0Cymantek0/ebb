@@ -25,10 +25,8 @@
 #                             (default: ~/.local/bin)
 set -eu
 
-# MAINTAINER: replace OWNER with the real GitHub owner/org once the public
-# repo exists (the repository had no git remote configured when this
-# template was written).
-REPO_URL='https://github.com/OWNER/ebb'
+# The public repository is github.com/0Cymantek0/ebb (owner filled 2026-09-22).
+REPO_URL='https://github.com/0Cymantek0/ebb'
 
 die() {
 	echo "install.sh: error: $*" >&2

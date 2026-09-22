@@ -25,9 +25,8 @@
   %LOCALAPPDATA%\Programs\ebb).
 
 .PARAMETER RepoUrl
-  Optional repository override (default https://github.com/OWNER/ebb — the
-  maintainer must replace OWNER when the public repo exists). Primarily a
-  test/mirror hook; checksum verification applies unchanged.
+  Optional repository override (default https://github.com/0Cymantek0/ebb).
+  Primarily a test/mirror hook; checksum verification applies unchanged.
 
 .NOTES
   - Works on Windows PowerShell 5.1 and PowerShell 7+ (no modern-only syntax).
@@ -44,7 +43,7 @@
 param(
     [string]$Version = '',
     [string]$Destination = '',
-    [string]$RepoUrl = 'https://github.com/OWNER/ebb'
+    [string]$RepoUrl = 'https://github.com/0Cymantek0/ebb'
 )
 
 $ErrorActionPreference = 'Stop'

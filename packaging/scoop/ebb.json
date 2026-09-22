@@ -1,15 +1,15 @@
 {
   "version": "0.1.0-alpha",
   "description": "Effortless, safe disk-space reclamation for development workspaces",
-  "homepage": "https://github.com/OWNER/ebb",
+  "homepage": "https://github.com/0Cymantek0/ebb",
   "license": {
     "identifier": "Proprietary",
-    "url": "https://github.com/OWNER/ebb/blob/main/LICENSE"
+    "url": "https://github.com/0Cymantek0/ebb/blob/main/LICENSE"
   },
   "architecture": {
     "64bit": {
-      "url": "https://github.com/OWNER/ebb/releases/download/v0.1.0-alpha/ebb-v0.1.0-alpha-windows-amd64.zip",
-      "hash": "269dcf0971ca77d4772280ae0160203f88088cec92a0a642877f7739b5482f25"
+      "url": "https://github.com/0Cymantek0/ebb/releases/download/v0.1.0-alpha/ebb-v0.1.0-alpha-windows-amd64.zip",
+      "hash": "66d1ec519c430b2e4a33d6fb1db50dd17c2ba6271f80bb6bc4661e3811f08d83"
     }
   },
   "bin": [
@@ -19,17 +19,17 @@
     ]
   ],
   "checkver": {
-    "github": "https://github.com/OWNER/ebb",
+    "github": "https://github.com/0Cymantek0/ebb",
     "regex": "tag/(?:v|V)?([\\d.]+(?:-[0-9A-Za-z.-]+)?)"
   },
   "autoupdate": {
     "architecture": {
       "64bit": {
-        "url": "https://github.com/OWNER/ebb/releases/download/v$version/ebb-v$version-windows-amd64.zip"
+        "url": "https://github.com/0Cymantek0/ebb/releases/download/v$version/ebb-v$version-windows-amd64.zip"
       }
     },
     "hash": {
-      "url": "https://github.com/OWNER/ebb/releases/download/v$version/SHA256SUMS.txt",
+      "url": "https://github.com/0Cymantek0/ebb/releases/download/v$version/SHA256SUMS.txt",
       "regex": "([a-fA-F0-9]{64})\\s+\\*?ebb-v$version-windows-amd64\\.zip"
     }
   }

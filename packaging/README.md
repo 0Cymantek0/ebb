@@ -45,7 +45,6 @@ Search for these markers; every occurrence is deliberate:
 
 | Marker | Where | Replace with |
 |---|---|---|
-| `OWNER` (in `github.com/OWNER/ebb`) | all files except install.sh comments; scoop JSON cannot carry comments, hence README | the real GitHub owner/org slug. The repo had **no git remote** when these templates were written — set one first (`git remote add origin https://github.com/<owner>/ebb.git`) |
 | `0000...0` (64 zeros) | winget installer `InstallerSha256`; scoop `url` hash | real SHA256 of the archive (from the release `SHA256SUMS.txt` line) |
 | `Ebb.Ebb` / `Publisher: Ebb` | winget manifests | keep, or change to the real publisher identity — must be consistent across all three files and unique in winget-pkgs |
 

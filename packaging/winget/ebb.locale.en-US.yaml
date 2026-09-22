@@ -15,8 +15,9 @@
 #      Clause has no SPDX identifier, so `License` carries the free-text
 #      spelling and `LicenseUrl` points at the repo LICENSE (which holds
 #      both full texts). winget-pkgs accepts free-text License values.
-#   2. Replace OWNER in every URL with the real GitHub owner/org (the repo
-#      had no git remote configured when this template was written).
+#   2. Owner is FILLED (0Cymantek0, 2026-09-22). Remaining before publish:
+#      confirm the repo exists under that slug and the PackageVersion matches
+#      the pushed tag.
 #   3. Publisher: "Ebb" assumes the project publishes under its own name;
 #      change to the real publisher identity if different, and keep it
 #      consistent with the PackageIdentifier in ebb.yaml.
@@ -27,14 +28,14 @@ PackageIdentifier: Ebb.Ebb
 PackageVersion: 0.1.0-alpha
 PackageLocale: en-US
 Publisher: Ebb
-PublisherUrl: https://github.com/OWNER/ebb
+PublisherUrl: https://github.com/0Cymantek0/ebb
 PackageName: Ebb
 Moniker: ebb
-PackageUrl: https://github.com/OWNER/ebb
+PackageUrl: https://github.com/0Cymantek0/ebb
 # License decided 2026-09-22 — free-text spelling because the Commons
 # Clause has no SPDX identifier; both full texts live in the repo LICENSE.
 License: Apache-2.0 with Commons Clause
-LicenseUrl: https://github.com/OWNER/ebb/blob/main/LICENSE
+LicenseUrl: https://github.com/0Cymantek0/ebb/blob/main/LICENSE
 ShortDescription: Effortless, safe disk-space reclamation for development workspaces.
 Description: >-
   Ebb reclaims disk space in development workspaces without losing anything
@@ -51,6 +52,6 @@ Tags:
   - backup
   - git
   - restic
-ReleaseNotesUrl: https://github.com/OWNER/ebb/releases/tag/v0.1.0-alpha
+ReleaseNotesUrl: https://github.com/0Cymantek0/ebb/releases/tag/v0.1.0-alpha
 ManifestType: defaultLocale
 ManifestVersion: 1.12.0

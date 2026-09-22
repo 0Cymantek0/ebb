@@ -24,14 +24,14 @@
 # until release.sh actually publishes them.
 #
 # MAINTAINER PUBLISH CHECKLIST:
-#   1. Fill InstallerUrl: replace OWNER with the real GitHub owner/org
-#      (the repo had no git remote configured when this template was written).
+#   1. InstallerUrl owner is FILLED (0Cymantek0, 2026-09-22); the URLs go
+#      live the moment the repo and the v0.1.0-alpha release exist.
 #   2. InstallerSha256 is PINNED to tag v0.1.0-alpha: it is the SHA256 of
 #      the zip built by `scripts/release.sh v0.1.0-alpha` from the release
 #      commit (must equal the release SHA256SUMS.txt line; a mismatched
 #      hash is rejected by winget-pkgs validation and by every installer's
 #      checksum gate). release.sh passes -buildvcs=false, so the hash
-#      follows the compiled source only: packaging/OWNER edits do NOT
+#      follows the compiled source only: packaging edits do NOT
 #      move it; Go-source or version changes do — rebuild and re-pin.
 #   3. PackageVersion and PackageIdentifier must match ebb.yaml exactly.
 #
@@ -48,8 +48,8 @@ Installers:
     NestedInstallerFiles:
       - RelativeFilePath: ebb-windows-amd64.exe
         PortableCommandAlias: ebb
-    InstallerUrl: https://github.com/OWNER/ebb/releases/download/v0.1.0-alpha/ebb-v0.1.0-alpha-windows-amd64.zip
-    InstallerSha256: 269dcf0971ca77d4772280ae0160203f88088cec92a0a642877f7739b5482f25
+    InstallerUrl: https://github.com/0Cymantek0/ebb/releases/download/v0.1.0-alpha/ebb-v0.1.0-alpha-windows-amd64.zip
+    InstallerSha256: 66d1ec519c430b2e4a33d6fb1db50dd17c2ba6271f80bb6bc4661e3811f08d83
     Commands:
       - ebb
 ManifestType: installer
