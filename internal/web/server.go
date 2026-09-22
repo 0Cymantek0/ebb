@@ -1,22 +1,31 @@
 // server.go is the complete HTTP surface of the Control Center: a
 // GET-only handler with Host-header enforcement (DNS-rebinding
-// immunity), strict query validation, JSON error envelopes and
-// go:embed-ed assets. Run constructs it with the bound port; tests
-// construct it directly with an injected port.
+// immunity), a per-run URL token (local-reader authentication), strict
+// query validation, JSON error envelopes and go:embed-ed assets. Run
+// constructs it with the bound port and the freshly minted token; tests
+// construct it directly with fixed values.
 //
-// The surface in full (everything GET, everything read-only):
+// The surface in full (everything GET, everything read-only, everything
+// under the per-run token prefix /<token>):
 //
-//	/                  → embedded index.html
-//	/static/*          → embedded css/js/svg (fixed set, map-served —
-//	                    no filesystem lookup, so traversal is impossible)
-//	/api/overview      → {metrics, comparison_reclaimed,
-//	                    comparison_restored, workspaces, recommendations}
-//	/api/history?limit → {events:[...]} (default 500, cap 5000, min 1)
-//	/api/tree?id=hex   → {id, entries:[...]} (id: 8-64 hex chars)
+//	/<token>/             → embedded index.html
+//	/<token>              → 301 to /<token>/ (the canonical slash form,
+//	                        http.ServeMux's subtree convention)
+//	/<token>/static/*     → embedded css/js/svg (fixed set, map-served —
+//	                        no filesystem lookup, so traversal is impossible)
+//	/<token>/api/overview → {metrics, comparison_reclaimed,
+//	                        comparison_restored, workspaces, recommendations}
+//	/<token>/api/history?limit → {events:[...]} (default 500, cap 5000, min 1)
+//	/<token>/api/tree?id=hex     → {id, entries:[...]} (id: 8-64 hex chars)
+//
+// Anything not under /<token>/ — including bare "/" — is a 403 before
+// routing: a co-located process that can reach 127.0.0.1 but never saw
+// the printed URL learns nothing, not even which methods exist.
 
 package web
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"regexp"
@@ -49,19 +58,24 @@ var snapIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8,64}$`)
 
 // server is the Control Center HTTP handler. port is the actual port of
 // the listener it is served from; every request's Host header must name
-// 127.0.0.1 / localhost / [::1] with exactly that port. logf receives
-// one line per request (method, path, status — never bodies); nil
-// disables logging.
+// 127.0.0.1 / localhost / [::1] with exactly that port. token is the
+// per-run unguessable path segment Run mints; every request's URL path
+// must sit under /<token>/. tokenB is its precomputed []byte twin for
+// the constant-time compares. logf receives one line per request
+// (method, TOKEN-STRIPPED path, status — never bodies, never the
+// token); nil disables logging.
 type server struct {
 	provider Provider
 	port     int
+	token    string
+	tokenB   []byte
 	logf     func(format string, args ...any)
 }
 
 // newServer builds the handler for a provider serving on the given
-// local port.
-func newServer(p Provider, port int, logf func(string, ...any)) http.Handler {
-	return &server{provider: p, port: port, logf: logf}
+// local port behind the given per-run URL token.
+func newServer(p Provider, port int, token string, logf func(string, ...any)) http.Handler {
+	return &server{provider: p, port: port, token: token, tokenB: []byte(token), logf: logf}
 }
 
 // statusRecorder captures the response status for request logging.
@@ -88,20 +102,45 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// headers are ever set: same-origin only.
 	rec.Header().Set("X-Content-Type-Options", "nosniff")
 	rec.Header().Set("Cache-Control", "no-store")
+	// logPath is what the request log prints: the TOKEN-STRIPPED path
+	// once the token gate has passed (the token is printed exactly once,
+	// in Run's serving-at line, and must never repeat per request);
+	// before that it is the raw requested path, which by construction
+	// cannot carry the valid token prefix.
+	logPath := r.URL.Path
 	defer func() {
 		if s.logf != nil {
-			s.logf("%s %s %d", r.Method, r.URL.Path, rec.status)
+			s.logf("%s %s %d", r.Method, logPath, rec.status)
 		}
 	}()
 
-	// Security model #3: DNS-rebinding immunity — the Host header must
-	// name this exact loopback listener before anything else is even
-	// looked at.
+	// Gate 1 — DNS-rebinding immunity (security model #3): the Host
+	// header must name this exact loopback listener before anything else
+	// is even looked at. This check is aimed at REMOTE pages and rebound
+	// DNS names only; its port-less acceptance ("127.0.0.1" with no
+	// port) is intentional and unchanged — the local-reader audience is
+	// gate 2's job, not this one's.
 	if !allowedHost(r.Host, s.port) {
 		s.writeError(rec, http.StatusForbidden, "forbidden: host does not name this local listener")
 		return
 	}
-	// Security model #1: GET-only (HEAD shares the headers, no body).
+
+	// Gate 2 — local-reader authentication (security model #2b): the
+	// URL path must be exactly "/"+token or start with "/"+token+"/".
+	// Loopback is reachable by every account on the machine, so the bind
+	// authenticates nobody local; the unguessable per-run token does.
+	// Anything else — including bare "/" — is a 403 that reveals
+	// nothing else about the surface.
+	path, ok := s.stripToken(r.URL.Path)
+	if !ok {
+		s.writeError(rec, http.StatusForbidden, "forbidden: this control center requires its per-run URL")
+		return
+	}
+	logPath = path
+
+	// Gate 3 — security model #1: GET-only (HEAD shares the headers, no
+	// body). Deliberately AFTER the token gate so an unauthenticated
+	// reader cannot even learn which methods exist.
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		rec.Header().Set("Allow", "GET")
 		s.writeError(rec, http.StatusMethodNotAllowed, "method not allowed: this dashboard is strictly read-only (GET only)")
@@ -113,7 +152,19 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		out = bodyless{rec}
 	}
 
-	switch r.URL.Path {
+	// The exact "/"+token form redirects to the canonical slashed base
+	// so relative asset references resolve against /<token>/ — the same
+	// redirect http.ServeMux applies to subtree patterns.
+	if r.URL.Path == "/"+s.token {
+		loc := "/" + s.token + "/"
+		if r.URL.RawQuery != "" {
+			loc += "?" + r.URL.RawQuery
+		}
+		http.Redirect(out, r, loc, http.StatusMovedPermanently)
+		return
+	}
+
+	switch path {
 	case pathIndex:
 		if !s.checkQuery(out, r) {
 			return
@@ -135,24 +186,49 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.handleTree(out, r)
 	default:
-		if strings.HasPrefix(r.URL.Path, staticPrefix) {
-			s.handleStatic(out, r)
+		if strings.HasPrefix(path, staticPrefix) {
+			s.handleStatic(out, r, path)
 			return
 		}
-		s.writeError(out, http.StatusNotFound, "not found: "+r.URL.Path)
+		s.writeError(out, http.StatusNotFound, "not found: "+path)
 	}
+}
+
+// stripToken enforces the local-reader gate: path must be exactly
+// "/"+token or begin with "/"+token+"/"; the return is the
+// token-stripped remainder ("/" for the exact form). The comparison
+// goes through crypto/subtle so it is timing-constant wherever
+// practical. A server built with an empty token serves nothing at all —
+// fail closed, never open.
+func (s *server) stripToken(path string) (string, bool) {
+	if s.token == "" {
+		return "", false
+	}
+	if len(path) == 0 || path[0] != '/' {
+		return "", false
+	}
+	p := path[1:]
+	if subtle.ConstantTimeCompare([]byte(p), s.tokenB) == 1 {
+		return "/", true
+	}
+	if len(p) > len(s.token) && p[len(s.token)] == '/' &&
+		subtle.ConstantTimeCompare([]byte(p[:len(s.token)]), s.tokenB) == 1 {
+		return p[len(s.token):], true
+	}
+	return "", false
 }
 
 // ---- static + index ------------------------------------------------------
 
 // handleStatic serves the fixed embedded asset set. The name is only
 // ever a map key — there is no filesystem lookup, so path traversal has
-// nothing to traverse.
-func (s *server) handleStatic(w http.ResponseWriter, r *http.Request) {
-	name := strings.TrimPrefix(r.URL.Path, staticPrefix)
+// nothing to traverse. path is the token-stripped request path
+// (guaranteed to start with staticPrefix).
+func (s *server) handleStatic(w http.ResponseWriter, r *http.Request, path string) {
+	name := strings.TrimPrefix(path, staticPrefix)
 	a, ok := staticAssets[name]
 	if !ok {
-		s.writeError(w, http.StatusNotFound, "not found: "+r.URL.Path)
+		s.writeError(w, http.StatusNotFound, "not found: "+path)
 		return
 	}
 	if !s.checkQuery(w, r) {

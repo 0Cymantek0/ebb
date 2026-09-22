@@ -13,6 +13,19 @@
 //   - Bind exclusively to 127.0.0.1 on an ephemeral port.
 //   - DNS-rebinding immunity: the Host header of every request must
 //     name this exact listener; anything else fails closed with 403.
+//     Together the loopback bind and the Host check defeat REMOTE pages
+//     and rebound DNS names — and nothing else: loopback is not an
+//     authentication boundary, every local account's processes can
+//     reach 127.0.0.1.
+//   - Local-reader authentication: every Run invocation mints an
+//     unguessable 256-bit token (crypto/rand, hex) and serves the
+//     entire surface under /<token>/; a request without it — including
+//     bare "/" — gets 403 before it learns anything else. The token is
+//     what keeps co-located processes (any account on the machine, no
+//     port guess needed thanks to the port-less Host spelling) from
+//     reading the catalog metadata. It is printed exactly once, as the
+//     path of the serving-at URL below, and embedded in the browser
+//     opener URL; it never repeats in per-request logs.
 //   - Zero external references in served content (go:embed only).
 //   - Hardened net/http timeouts and a bounded, clean shutdown.
 //
@@ -28,6 +41,8 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -135,8 +150,9 @@ type Provider interface {
 }
 
 // Options tunes one Run invocation. Out receives the single progress
-// line ("serving at <url>"); Err receives request logs (method, path,
-// status — never bodies). Both may be nil.
+// line ("serving at <tokened-url>" — the one place the per-run token is
+// ever printed); Err receives request logs (method, token-stripped
+// path, status — never bodies). Both may be nil.
 type Options struct {
 	Out, Err io.Writer
 	// OpenBrowser attempts the OS opener after the listen succeeds.
@@ -153,9 +169,10 @@ type Options struct {
 const shutdownGrace = 1500 * time.Millisecond
 
 // Run starts the read-only Control Center on 127.0.0.1 with an
-// ephemeral port and blocks until ctx is cancelled, then shuts down
-// cleanly and returns nil. The single progress line goes to o.Out; a
-// failed browser launch is logged to o.Err and never fatal.
+// ephemeral port and a freshly minted per-run URL token, and blocks
+// until ctx is cancelled, then shuts down cleanly and returns nil. The
+// single progress line goes to o.Out; a failed browser launch is logged
+// to o.Err and never fatal.
 func Run(ctx context.Context, p Provider, o Options) error {
 	if p == nil {
 		return errors.New("web: nil provider")
@@ -167,6 +184,16 @@ func Run(ctx context.Context, p Provider, o Options) error {
 	if errw == nil {
 		errw = io.Discard
 	}
+
+	// Security model (local-reader gate): 32 crypto/rand bytes,
+	// hex-encoded — an unguessable 256-bit path segment every reader
+	// must already know. Co-located processes that can reach 127.0.0.1
+	// but never saw the printed URL get 403 on everything.
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return fmt.Errorf("web: minting per-run URL token: %w", err)
+	}
+	token := hex.EncodeToString(tokenBytes)
 
 	// Security model #2: loopback-only, ephemeral port — never a
 	// wildcard bind, never a fixed port another process could pre-claim.
@@ -182,9 +209,9 @@ func Run(ctx context.Context, p Provider, o Options) error {
 	}
 
 	// Security model #5: hardened server on top of the GET-only,
-	// Host-checked handler.
+	// Host-checked, token-gated handler.
 	srv := &http.Server{
-		Handler:           newServer(p, port, logf),
+		Handler:           newServer(p, port, token, logf),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -192,7 +219,9 @@ func Run(ctx context.Context, p Provider, o Options) error {
 		MaxHeaderBytes:    1 << 16,
 	}
 
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d/", port)
+	// The one line the token ever appears in: the serving URL and the
+	// opener URL both carry it as their path.
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d/%s/", port, token)
 	fmt.Fprintf(out, "serving at %s\n", baseURL)
 
 	if o.OpenBrowser {

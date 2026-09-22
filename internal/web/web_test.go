@@ -1,6 +1,8 @@
 // web_test.go exercises the Run lifecycle: loopback-only bind on an
-// ephemeral port, the serving-at progress line, the browser-launch seam
-// (exactly once, failure non-fatal), Host enforcement through the real
+// ephemeral port, the per-run URL token in the serving-at line (64 hex
+// chars, unique per invocation), the tokened serving URL, the
+// browser-launch seam (exactly once, with the tokened URL, failure
+// non-fatal), Host enforcement and the token gate through the real
 // listener, request logging to Options.Err and the bounded clean
 // shutdown on context cancellation.
 
@@ -14,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -70,7 +73,9 @@ func TestRunServesLoopbackAndShutsDown(t *testing.T) {
 	baseURL, stop := startRun(t, p, Options{Out: &strings.Builder{}})
 	defer stop()
 
-	// The bound address is exactly 127.0.0.1 with a real ephemeral port.
+	// The bound address is exactly 127.0.0.1 with a real ephemeral port,
+	// and the URL path carries the per-run token in its canonical form
+	// /<64 lowercase hex chars>/.
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		t.Fatalf("serving line is not a URL: %q: %v", baseURL, err)
@@ -81,8 +86,12 @@ func TestRunServesLoopbackAndShutsDown(t *testing.T) {
 	if u.Port() == "" || u.Port() == "0" {
 		t.Errorf("bound port = %q, want a real ephemeral port", u.Port())
 	}
+	token := strings.Trim(u.Path, "/")
+	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(token) {
+		t.Errorf("serving URL path = %q, want /<64 lowercase hex chars>/ (the per-run token)", u.Path)
+	}
 
-	// Data is served end-to-end through the real listener.
+	// Data is served end-to-end through the real listener, under the token.
 	resp, err := http.Get(baseURL + "api/overview")
 	if err != nil {
 		t.Fatalf("GET /api/overview: %v", err)
@@ -98,6 +107,86 @@ func TestRunServesLoopbackAndShutsDown(t *testing.T) {
 	if payload.Metrics.ActiveWorkspaces != p.metrics.ActiveWorkspaces {
 		t.Errorf("overview carried ActiveWorkspaces %d, want %d",
 			payload.Metrics.ActiveWorkspaces, p.metrics.ActiveWorkspaces)
+	}
+}
+
+// tokenOf extracts the per-run token from a serving URL (the single
+// 64-hex path segment).
+func tokenOf(t *testing.T, baseURL string) string {
+	t.Helper()
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		t.Fatalf("parse %q: %v", baseURL, err)
+	}
+	return strings.Trim(u.Path, "/")
+}
+
+// Every Run invocation must mint a DIFFERENT unguessable token: two
+// sequential servers (each started and stopped through startRun, so
+// there is no timing race) carry distinct 64-hex path segments — the
+// entropy sanity for the local-reader gate.
+func TestRunMintsUniqueTokens(t *testing.T) {
+	u1, stop1 := startRun(t, richProvider(), Options{Out: &strings.Builder{}})
+	tok1 := tokenOf(t, u1)
+	stop1()
+
+	u2, stop2 := startRun(t, richProvider(), Options{Out: &strings.Builder{}})
+	tok2 := tokenOf(t, u2)
+	defer stop2()
+
+	hex64 := regexp.MustCompile(`^[0-9a-f]{64}$`)
+	for name, tok := range map[string]string{"first": tok1, "second": tok2} {
+		if !hex64.MatchString(tok) {
+			t.Errorf("%s token %q is not 64 lowercase hex chars", name, tok)
+		}
+	}
+	if tok1 == tok2 {
+		t.Errorf("two Run invocations minted the same token %q — the per-run gate would be guessable across sessions", tok1)
+	}
+}
+
+// The token is the local-reader gate over the REAL listener: a request
+// that reaches the loopback origin but drops the token path — the exact
+// shape a co-located scanner sends — is refused on every surface,
+// while the same request under the token succeeds.
+func TestRunTokenlessRequestsRefused(t *testing.T) {
+	baseURL, stop := startRun(t, richProvider(), Options{Out: &strings.Builder{}})
+	defer stop()
+
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		t.Fatalf("parse %q: %v", baseURL, err)
+	}
+	origin := u.Scheme + "://" + u.Host // loopback origin, no path
+	client := &http.Client{Timeout: 2 * time.Second}
+	for _, path := range []string{"/", "/api/overview", "/api/history", "/static/app.js"} {
+		resp, err := client.Get(origin + path)
+		if err != nil {
+			t.Fatalf("tokenless GET %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("tokenless GET %s: status %d, want 403 (body %s)", path, resp.StatusCode, body)
+		}
+		if strings.Contains(string(body), `"workspaces"`) {
+			t.Errorf("tokenless GET %s leaked metadata: %s", path, body)
+		}
+	}
+	// The port-less Host spelling changes nothing: the token, not the
+	// port, is the gate.
+	req, err := http.NewRequest(http.MethodGet, origin+"/api/overview", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "127.0.0.1"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("tokenless GET with port-less Host: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("tokenless GET with port-less Host: status %d, want 403", resp.StatusCode)
 	}
 }
 
@@ -244,9 +333,15 @@ func TestRunLogsRequestsToErr(t *testing.T) {
 		t.Errorf("request log line missing; Err=%q", errLog.String())
 	}
 	// Bodies never reach the log (the fake's hoarding label is payload
-	// data).
+	// data)...
 	if strings.Contains(errLog.String(), "casual collector") {
 		t.Errorf("request log leaked payload: %q", errLog.String())
+	}
+	// ...and neither does the per-run token: request lines carry the
+	// token-stripped path, so the token appears exactly once per Run —
+	// in the serving-at line — and never in the paste-prone log.
+	if strings.Contains(errLog.String(), tokenOf(t, baseURL)) {
+		t.Errorf("request log leaked the per-run token: %q", errLog.String())
 	}
 }
 

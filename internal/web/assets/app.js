@@ -97,7 +97,7 @@
 
   async function loadOverview() {
     try {
-      state.overview = await fetchJSON("/api/overview");
+      state.overview = await fetchJSON("api/overview");
       state.overviewError = null;
     } catch (e) {
       state.overviewError = e.message;
@@ -106,7 +106,7 @@
 
   async function loadHistory(limit) {
     try {
-      const body = await fetchJSON("/api/history?limit=" + encodeURIComponent(limit));
+      const body = await fetchJSON("api/history?limit=" + encodeURIComponent(limit));
       state.history = (body && body.events) || [];
       // Fewer events than requested means the ledger is exhausted.
       state.historyDone = state.history.length < limit;
@@ -125,7 +125,7 @@
       return;
     }
     try {
-      state.tree = await fetchJSON("/api/tree?id=" + encodeURIComponent(id));
+      state.tree = await fetchJSON("api/tree?id=" + encodeURIComponent(id));
       state.treeError = null;
     } catch (e) {
       state.tree = null;

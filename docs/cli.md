@@ -167,7 +167,7 @@ ebb stats [--json] [--web | --share [--out <file>]]
 | Option | Description |
 |---|---|
 | `--json` | Machine envelope on stdout (works with `--share`; refused with `--web`) |
-| `--web` | Serve the read-only local control center on `127.0.0.1` until Ctrl+C; opens the browser only when stdin is a terminal |
+| `--web` | Serve the read-only local control center on `127.0.0.1` at a fresh unguessable per-run URL until Ctrl+C; opens the browser only when stdin is a terminal |
 | `--share` | Render the dashboard as a shareable PNG card (1600x900, deterministic for the same day's data) |
 | `--out <file>` | Destination for `--share` (default: `ebb-stats-YYYYMMDD.png` in the current directory) |
 
@@ -177,7 +177,7 @@ Exit codes: 0 report produced (an empty catalog is a valid report); 2 usage (pos
 
 `--web` serves a control center bound to localhost: command palette, deep search across workspaces, snapshots, and operations, full operation history, and a snapshot content explorer showing exactly what each vault snapshot preserved.
 
-Every action in the web UI is copy-to-terminal: buttons copy the equivalent ebb CLI command to your clipboard instead of executing anything. That is a security decision, not a limitation. The server exposes zero mutation endpoints. There is no route that deletes, unpins, forgets, prunes, or starts anything, so there is nothing for a cross-site request forgery attempt or a DNS-rebinding page to trigger: a hostile webpage can reach the port and find nothing to command. Mutation stays in the terminal, where the audit trail, the typed confirmations, and the writer assertions live.
+Every action in the web UI is copy-to-terminal: buttons copy the equivalent ebb CLI command to your clipboard instead of executing anything. That is a security decision, not a limitation. The server exposes zero mutation endpoints, and it serves everything under a random per-run URL segment minted at startup, so other processes on the machine cannot read the dashboard without the URL printed by the serving line. There is no route that deletes, unpins, forgets, prunes, or starts anything, so there is nothing for a cross-site request forgery attempt or a DNS-rebinding page to trigger: a hostile webpage can reach the port and find nothing to command. Mutation stays in the terminal, where the audit trail, the typed confirmations, and the writer assertions live.
 
 `--share` writes a PNG summary card, suitable for pasting into a chat or a PR description.
 
