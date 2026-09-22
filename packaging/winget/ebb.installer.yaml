@@ -5,8 +5,9 @@
 #   installer spec: winget-pkgs/doc/manifest/schema/1.12.0/installer.md
 #
 # How the artifact is shaped (defined by scripts/release.sh, do not guess):
-#   - release asset: ebb-<version>-windows-amd64.zip
-#     (dist/<version>/ebb-<version>-windows-amd64.zip)
+#   - release asset: ebb-v<version>-windows-amd64.zip
+#     (dist/v<version>/ebb-v<version>-windows-amd64.zip — the archive
+#     FILENAME carries the full tag WITH the leading v)
 #   - archive MEMBER name: ebb-windows-amd64.exe (binary at archive root,
 #     NO version in the member name)
 #   - SHA256 of the ZIP equals the matching line of the release SHA256SUMS.txt
@@ -26,7 +27,7 @@
 #   1. Fill InstallerUrl: replace OWNER with the real GitHub owner/org
 #      (the repo had no git remote configured when this template was written).
 #   2. Fill InstallerSha256: the SHA256 of the ZIP asset — take it from the
-#      release SHA256SUMS.txt line for ebb-<version>-windows-amd64.zip.
+#      release SHA256SUMS.txt line for ebb-v<version>-windows-amd64.zip.
 #      The 64-zero value below is a PLACEHOLDER and will be rejected by
 #      winget-pkgs validation; it must never be submitted as-is.
 #   3. PackageVersion and PackageIdentifier must match ebb.yaml exactly.
@@ -44,7 +45,7 @@ Installers:
     NestedInstallerFiles:
       - RelativeFilePath: ebb-windows-amd64.exe
         PortableCommandAlias: ebb
-    InstallerUrl: https://github.com/OWNER/ebb/releases/download/v0.1.0/ebb-0.1.0-windows-amd64.zip
+    InstallerUrl: https://github.com/OWNER/ebb/releases/download/v0.1.0/ebb-v0.1.0-windows-amd64.zip
     InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
     Commands:
       - ebb
