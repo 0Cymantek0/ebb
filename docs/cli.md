@@ -128,7 +128,7 @@ Docker tiers (`--docker`): tier 0 pure dead clutter (dangling images, orphaned a
 
 ### `ebb freeze`
 
-Stream a Docker image into the vault as cold storage: `docker save` piped directly into `restic backup --stdin` with zero bytes staged on disk, SHA-256 hashed in flight, and proven by an independent readback before anything is reported captured. `--restore` is the inverse (`restic dump` piped to `docker load`), with the digest verified before a single byte reaches the daemon. The daemon-side `docker rmi` runs only behind a second, separate confirmation (`--remove` plus `--yes-removal` or the prompt) and only after a verified freeze.
+Stream a Docker image into the vault as cold storage: `docker save` piped directly into `restic backup --stdin` with zero bytes staged on disk, SHA-256 hashed in flight, and proven by an independent readback before anything is reported captured. `--restore` is the inverse (`restic dump` piped to `docker load`), with the digest verified before a single byte reaches the daemon. The daemon-side `docker rmi` runs only behind a second, separate confirmation (`--remove` plus `--yes-removal` or the prompt) and only after a verified freeze. Frozen images are retained in the vault indefinitely: there is no `ebb`-side forget path for freeze entries yet (`ebb delete` and `ebb gc` never touch them), so plan vault capacity accordingly.
 
 ```
 ebb freeze <image-id> [flags]
