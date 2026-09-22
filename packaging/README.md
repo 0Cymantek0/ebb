@@ -11,7 +11,7 @@ nothing here is publishable until the placeholders are filled.
 |---|---|---|
 | `winget/ebb.yaml` | winget (version manifest) | root of the 3-file winget-pkgs manifest set |
 | `winget/ebb.installer.yaml` | winget (installer manifest) | portable exe inside a zip (`NestedInstallerType: portable`) |
-| `winget/ebb.locale.en-US.yaml` | winget (defaultLocale manifest) | metadata; carries the pending license |
+| `winget/ebb.locale.en-US.yaml` | winget (defaultLocale manifest) | metadata; carries the license |
 | `scoop/ebb.json` | scoop | manifest + `checkver`/`autoupdate` against GitHub releases |
 | `install.ps1` | `irm https://get.ebb.dev/ps1 \| iex` | Windows user-scope installer, always checksum-gated |
 | `install.sh` | `curl -fsSL https://get.ebb.dev \| sh` | Linux amd64 installer, always checksum-gated |
@@ -47,10 +47,16 @@ Search for these markers; every occurrence is deliberate:
 |---|---|---|
 | `OWNER` (in `github.com/OWNER/ebb`) | all files except install.sh comments; scoop JSON cannot carry comments, hence README | the real GitHub owner/org slug. The repo had **no git remote** when these templates were written — set one first (`git remote add origin https://github.com/<owner>/ebb.git`) |
 | `0000...0` (64 zeros) | winget installer `InstallerSha256`; scoop `url` hash | real SHA256 of the archive (from the release `SHA256SUMS.txt` line) |
-| `License: __PENDING__` | winget locale manifest | the SPDX identifier once the maintainer decides; also add `LicenseUrl`. **Do not invent a license.** |
-| `"license": "Unknown"` | scoop JSON (JSON has no comments, so the placeholder lives here) | the license identifier once decided |
 | `Ebb.Ebb` / `Publisher: Ebb` | winget manifests | keep, or change to the real publisher identity — must be consistent across all three files and unique in winget-pkgs |
 | `0.1.0` / `v0.1.0` | everywhere | the version being published |
+
+The license is DECIDED (2026-09-22): Apache-2.0 with the Commons Clause
+v1.0 condition — source-available, not OSI open source. The repo-root
+`../LICENSE` holds both full texts; the winget locale manifest carries
+the free-text spelling (`Apache-2.0 with Commons Clause`, no SPDX
+identifier exists) and the scoop manifest uses the `Proprietary`
+identifier with the LICENSE url (scoop's honest bucket for a
+non-OSI license).
 
 `packaging/validate.sh` re-checks structure and flags remaining
 placeholders (it prints them as UNFILLED, which is the expected state
@@ -116,9 +122,10 @@ before a release — not an error).
 - `bin: [["ebb-windows-amd64.exe","ebb"]]` renames the archive member
   to the `ebb` shim.
 
-To publish: add `ebb.json` to a bucket (your own
-`github.com/<owner>/scoop-bucket`, or PR to a community bucket once the
-license is decided — extras requires a known license). Verify with
+To publish: add `ebb.json` to a bucket you own
+(`github.com/<owner>/scoop-bucket`). Community buckets such as extras
+require an OSI open-source license; a Commons-Clause package does not
+qualify, so a personal bucket is the path. Verify with
 `scoop checkup` / `scoop install ebb` and `scoop info ebb`.
 
 ## get.ebb.dev

@@ -10,12 +10,11 @@
 # discovery (`winget search`) and is recommended by the winget-pkgs docs.
 #
 # MAINTAINER PUBLISH CHECKLIST:
-#   1. License is UNDECIDED. `__PENDING__` is a deliberate placeholder —
-#      do NOT replace it with a guess; the license choice belongs to the
-#      maintainer. When decided, set License to the SPDX identifier and
-#      LicenseUrl to the LICENSE file in the public repo. winget-pkgs
-#      validation will reject `__PENDING__` (by design, so it cannot be
-#      submitted accidentally).
+#   1. License is DECIDED (2026-09-22): Apache-2.0 with the Commons Clause
+#      v1.0 condition — source-available, not OSI open source. Commons
+#      Clause has no SPDX identifier, so `License` carries the free-text
+#      spelling and `LicenseUrl` points at the repo LICENSE (which holds
+#      both full texts). winget-pkgs accepts free-text License values.
 #   2. Replace OWNER in every URL with the real GitHub owner/org (the repo
 #      had no git remote configured when this template was written).
 #   3. Publisher: "Ebb" assumes the project publishes under its own name;
@@ -32,11 +31,10 @@ PublisherUrl: https://github.com/OWNER/ebb
 PackageName: Ebb
 Moniker: ebb
 PackageUrl: https://github.com/OWNER/ebb
-# MAINTAINER: license decision pending — see checklist above. Do not invent.
-License: __PENDING__
-# MAINTAINER: LicenseUrl is intentionally ABSENT until the license is decided.
-# Add it together with License, e.g.:
-#   LicenseUrl: https://github.com/OWNER/ebb/blob/main/LICENSE
+# License decided 2026-09-22 — free-text spelling because the Commons
+# Clause has no SPDX identifier; both full texts live in the repo LICENSE.
+License: Apache-2.0 with Commons Clause
+LicenseUrl: https://github.com/OWNER/ebb/blob/main/LICENSE
 ShortDescription: Effortless, safe disk-space reclamation for development workspaces.
 Description: >-
   Ebb reclaims disk space in development workspaces without losing anything
