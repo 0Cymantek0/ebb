@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 // TestStateDirDefaultUnchanged pins the default path: with EBB_STATE_DIR

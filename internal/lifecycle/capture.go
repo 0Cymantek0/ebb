@@ -21,11 +21,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ebb/internal/actions"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/inventory"
-	"ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/inventory"
+	"github.com/0Cymantek0/ebb/internal/policy"
 )
 
 // captureState carries one capture's durable facts between steps. It is

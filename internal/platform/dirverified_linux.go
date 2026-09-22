@@ -7,7 +7,7 @@ import (
 	"os"
 	"syscall"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // devInoIdentity is the single spelling of Linux native identity,

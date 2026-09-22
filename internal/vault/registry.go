@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // docVersion is the vaults.json schema version.

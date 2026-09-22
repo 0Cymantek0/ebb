@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 func fixtureActionDef() actions.Definition {

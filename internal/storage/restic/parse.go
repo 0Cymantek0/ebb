@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // backupSummary is the single final stdout record of `backup --json`

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // TestSnapshotRoundTrip: a plain capture (§12.2 steps 1-5, terminal DONE)

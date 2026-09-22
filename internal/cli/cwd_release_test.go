@@ -22,7 +22,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/pathcanon"
+	"github.com/0Cymantek0/ebb/internal/pathcanon"
 )
 
 // sameDir compares two directory spellings canonically (t.TempDir

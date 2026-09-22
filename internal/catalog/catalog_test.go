@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // open opens a catalog in a fresh temp dir.

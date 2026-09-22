@@ -10,8 +10,8 @@ import (
 	"sort"
 	"strings"
 
-	"ebb/internal/domain"
-	"ebb/internal/planner"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/planner"
 )
 
 // InspectReport is the full inspect result (the --json details object).

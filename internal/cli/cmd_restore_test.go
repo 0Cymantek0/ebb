@@ -15,10 +15,10 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/actions"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/restore"
 )
 
 // newRestoreHarness builds the e-harness with the fake action runner

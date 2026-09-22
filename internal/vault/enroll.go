@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // locatorVersion is the recovery locator schema version.

@@ -29,7 +29,7 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/pathcanon"
+	"github.com/0Cymantek0/ebb/internal/pathcanon"
 )
 
 // Thresholds from the D040 tier table (see tiers.go for the full set).

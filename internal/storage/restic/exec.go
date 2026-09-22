@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // stderrExcerptLimit bounds how much captured stderr is embedded in

@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // newStdinStore resolves the restic binary the way the higher-level

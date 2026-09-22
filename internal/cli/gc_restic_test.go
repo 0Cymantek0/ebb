@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	resticstore "ebb/internal/storage/restic"
-	"ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	resticstore "github.com/0Cymantek0/ebb/internal/storage/restic"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 // gcTestPassword is the repository password shared by the env source

@@ -19,8 +19,8 @@ import (
 	"fmt"
 	"strings"
 
-	"ebb/internal/catalog"
-	"ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
 )
 
 // parkDetails is the --json payload of a completed park (§5.2 shape).

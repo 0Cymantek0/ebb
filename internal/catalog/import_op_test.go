@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // TestImportOperationWalksPhasesToDone mirrors the export precedent: the

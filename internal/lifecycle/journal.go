@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // opJournal is the per-operation progress journal (Foundation §16.5:

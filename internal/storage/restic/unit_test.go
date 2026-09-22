@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 func TestValidateRelPaths(t *testing.T) {

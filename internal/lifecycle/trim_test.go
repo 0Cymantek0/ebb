@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // TestTrimRoundTrip: the §17.3 sequence over the standard fixture. After

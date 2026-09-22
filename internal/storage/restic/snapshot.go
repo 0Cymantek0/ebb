@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Snapshot captures exactly the listed baseDir-relative paths and

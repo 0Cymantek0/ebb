@@ -3,8 +3,8 @@ package lifecycle
 import (
 	"testing"
 
-	"ebb/internal/domain"
-	"ebb/internal/version"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/version"
 )
 
 // TestProducerVersionSingleSource pins the version lockstep

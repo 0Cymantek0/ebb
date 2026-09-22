@@ -36,10 +36,10 @@ import (
 	"sync"
 	"testing"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/platform"
-	"ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/policy"
 )
 
 // ---- fakeStore ---------------------------------------------------------

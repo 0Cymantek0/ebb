@@ -48,9 +48,9 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Dependencies wires the opener. All fields except Clock, CreateLink and

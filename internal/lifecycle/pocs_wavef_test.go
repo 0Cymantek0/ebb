@@ -49,9 +49,9 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/inventory"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/inventory"
 )
 
 // ---- F1 -----------------------------------------------------------------

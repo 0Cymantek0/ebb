@@ -8,10 +8,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"ebb/internal/domain"
-	"ebb/internal/planner"
-	"ebb/internal/policy"
-	"ebb/internal/version"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/planner"
+	"github.com/0Cymantek0/ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/version"
 )
 
 // cmdVersion implements `ebb version`.

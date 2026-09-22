@@ -15,8 +15,8 @@ import (
 	"flag"
 	"fmt"
 
-	"ebb/internal/domain"
-	"ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
 )
 
 // snapshotDetails is the --json payload shared by snapshot and park (park

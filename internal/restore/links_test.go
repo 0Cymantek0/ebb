@@ -15,8 +15,8 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/domain"
-	"ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/platform"
 )
 
 // fixtureLink returns the fixture's link entry (kind + retained text).

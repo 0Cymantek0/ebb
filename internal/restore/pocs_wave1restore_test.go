@@ -29,8 +29,8 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/actions"
-	"ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/catalog"
 )
 
 // ---- F1: native lockfile rewrite under merge/current ----------------------

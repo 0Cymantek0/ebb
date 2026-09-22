@@ -35,11 +35,11 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/capsule"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/restore"
-	"ebb/internal/version"
+	"github.com/0Cymantek0/ebb/internal/capsule"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/version"
 )
 
 // exportDetails is the --json payload of an export (success or dry-run).

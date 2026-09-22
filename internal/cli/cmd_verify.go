@@ -35,11 +35,11 @@ import (
 	"sort"
 	"strings"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/lifecycle"
-	"ebb/internal/restore"
-	"ebb/internal/version"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/version"
 )
 
 // verifyCheck is one named check's outcome (§4.1).

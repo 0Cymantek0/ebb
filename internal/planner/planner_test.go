@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/domain"
-	"ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/policy"
 )
 
 // alloc returns a pointer to n (test helper for *int64 fields).

@@ -7,7 +7,7 @@ import (
 	"errors"
 	"testing"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 func TestActionRunsLifecycle(t *testing.T) {

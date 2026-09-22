@@ -21,11 +21,11 @@ import (
 	"fmt"
 	"strings"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/stats"
-	"ebb/internal/vault"
-	"ebb/internal/web"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/stats"
+	"github.com/0Cymantek0/ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/web"
 )
 
 // statsWebProvider serves the control center from one session. ctx is

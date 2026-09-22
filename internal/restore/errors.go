@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Typed errors of the restore ("open") coordinator, mirroring the style

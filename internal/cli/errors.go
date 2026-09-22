@@ -11,12 +11,12 @@ import (
 	"errors"
 	"fmt"
 
-	"ebb/internal/capsule"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/lifecycle"
-	"ebb/internal/restore"
-	"ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/capsule"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 // Stable CLI blocker codes (Foundation §5.5). The lifecycle/restore typed

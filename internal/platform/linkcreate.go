@@ -28,7 +28,7 @@ package platform
 import (
 	"fmt"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // CreateLink recreates one link of the given inventory kind at path with

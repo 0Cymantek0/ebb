@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/catalog"
 )
 
 // GiB is the test byte unit.

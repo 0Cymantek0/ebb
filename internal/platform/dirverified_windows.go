@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // OpenDirVerified implements domain.VerifiedDirProbe — the SCAN-RACE-1

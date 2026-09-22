@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Workspace status values (Foundation §16.5). After a catalog rebuild

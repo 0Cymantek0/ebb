@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // stubKeyring replaces the credential-store seam for one test and

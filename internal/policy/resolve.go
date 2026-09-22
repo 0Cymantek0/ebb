@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Stable issue codes emitted by Resolve.

@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/inventory"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/inventory"
 )
 
 // volumeNoiseFloor estimates concurrent free-space drift on the volume

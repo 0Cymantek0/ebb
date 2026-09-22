@@ -18,7 +18,7 @@ import (
 
 	"golang.org/x/image/font"
 
-	"ebb/internal/stats"
+	"github.com/0Cymantek0/ebb/internal/stats"
 )
 
 // decode renders and decodes, failing the test on any error.

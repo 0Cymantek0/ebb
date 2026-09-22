@@ -21,9 +21,9 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"ebb/internal/catalog"
-	"ebb/internal/platform"
-	"ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 // doctorCheck is one capability/configuration observation.

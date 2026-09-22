@@ -13,7 +13,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // windowsProbe implements domain.PlatformProbe for Windows NTFS-family

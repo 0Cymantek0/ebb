@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Approval records one local authorization (Foundation §7.3): the exact

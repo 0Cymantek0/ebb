@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/catalog"
 )
 
 // trimManifestOf dumps the trim capture's retained manifest.json from the

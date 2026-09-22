@@ -90,8 +90,8 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // discoveryTags classify backend snapshots during discovery. They mirror

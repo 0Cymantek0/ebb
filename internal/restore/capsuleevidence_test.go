@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // asDocVerification asserts err is a *ErrVerification with Check

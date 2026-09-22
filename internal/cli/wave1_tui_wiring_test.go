@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/cli/tui"
+	"github.com/0Cymantek0/ebb/internal/cli/tui"
 )
 
 // TestOpenBarePickerOpensChosenWorkspace drives a bare `ebb open` on a

@@ -48,13 +48,13 @@ import (
 	"sort"
 	"strings"
 
-	"ebb/internal/actions"
-	"ebb/internal/actions/approvalstore"
-	"ebb/internal/catalog"
-	"ebb/internal/cli/tui"
-	"ebb/internal/domain"
-	"ebb/internal/platform"
-	"ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/actions/approvalstore"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/cli/tui"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/restore"
 )
 
 // WorkspaceChoice is one row of the bare-`ebb open` picker (D032).

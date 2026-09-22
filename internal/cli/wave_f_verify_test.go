@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/catalog"
 )
 
 // tamperPayloadFile reaches into the fake store's payload snapshot and

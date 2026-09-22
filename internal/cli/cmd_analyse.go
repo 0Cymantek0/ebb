@@ -40,9 +40,9 @@ import (
 	"sort"
 	"strings"
 
-	gitadapter "ebb/internal/adapters/git"
-	"ebb/internal/analyse"
-	"ebb/internal/config"
+	gitadapter "github.com/0Cymantek0/ebb/internal/adapters/git"
+	"github.com/0Cymantek0/ebb/internal/analyse"
+	"github.com/0Cymantek0/ebb/internal/config"
 )
 
 // analyseDetails is the --json payload: the full scan report plus the

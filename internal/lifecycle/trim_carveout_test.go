@@ -15,10 +15,10 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/inventory"
-	"ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/inventory"
+	"github.com/0Cymantek0/ebb/internal/policy"
 )
 
 // carvePolicyTOML declares the deps group over node_modules plus an

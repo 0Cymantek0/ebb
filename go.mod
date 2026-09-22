@@ -1,4 +1,4 @@
-module ebb
+module github.com/0Cymantek0/ebb
 
 go 1.27
 

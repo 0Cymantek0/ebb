@@ -29,10 +29,10 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/inventory"
-	"ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/inventory"
+	"github.com/0Cymantek0/ebb/internal/platform"
 )
 
 // fixtureSpec knobs for the fault/shape cases each test needs.

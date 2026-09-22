@@ -10,7 +10,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // kernel32 functions NOT exported by golang.org/x/sys/windows v0.48.0

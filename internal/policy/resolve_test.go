@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // entry is a test entry on the main root.

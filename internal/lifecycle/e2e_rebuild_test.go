@@ -24,12 +24,12 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/actions/approvalstore"
-	"ebb/internal/catalog"
-	"ebb/internal/platform"
-	"ebb/internal/policy"
-	"ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/actions/approvalstore"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/restore"
 )
 
 // e2eRebuildHelperSource is the single-file source of the e2e action

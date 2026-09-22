@@ -13,9 +13,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/pathcanon"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/pathcanon"
 )
 
 // preflight validates the requested destination, its separation from

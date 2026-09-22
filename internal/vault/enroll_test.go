@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/domain"
-	resticstore "ebb/internal/storage/restic"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	resticstore "github.com/0Cymantek0/ebb/internal/storage/restic"
 )
 
 // ---- fake-store enrollment (always runs) ----

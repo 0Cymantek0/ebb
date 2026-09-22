@@ -30,7 +30,7 @@ import (
 	"fmt"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // trimPlanDocReader mirrors lifecycle's trimPlanDoc (removal-manifest.json).

@@ -18,8 +18,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ebb/internal/domain"
-	"ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/platform"
 )
 
 // vhdxSlackThreshold: the plan advises compaction only above 5 GiB of

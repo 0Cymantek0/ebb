@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/actions"
 )
 
 // validDef is the baseline used by the validation table; each case

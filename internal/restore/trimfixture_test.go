@@ -18,10 +18,10 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/platform"
 )
 
 // trimFixtureSpec knobs for the case each test needs.

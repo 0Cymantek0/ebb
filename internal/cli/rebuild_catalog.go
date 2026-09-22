@@ -36,11 +36,11 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/lifecycle"
-	"ebb/internal/restore"
-	"ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 // CodeRebuildNeedsForce is the §5.5 code for refusing to rebuild over an

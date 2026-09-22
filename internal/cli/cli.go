@@ -17,12 +17,12 @@ import (
 	"io"
 	"strings"
 
-	"ebb/internal/adapters/ecosystem"
-	"ebb/internal/analyse"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/lifecycle"
-	"ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/adapters/ecosystem"
+	"github.com/0Cymantek0/ebb/internal/analyse"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/restore"
 )
 
 // Exit codes are Ebb's public process contract (Foundation §17.5).
@@ -40,7 +40,7 @@ const (
 
 // The Ebb build version reported by `ebb version` and recorded in
 // receipts is single-sourced from internal/version.Version — a leaf
-// package stamped at link time (-X ebb/internal/version.Version=<ver>),
+// package stamped at link time (-X github.com/0Cymantek0/ebb/internal/version.Version=<ver>),
 // shared with internal/lifecycle so manifests, receipts and CLI output
 // can never diverge.
 

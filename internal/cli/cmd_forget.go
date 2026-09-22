@@ -40,9 +40,9 @@ import (
 	"fmt"
 	"strings"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/restore"
 )
 
 // forgetDetails is the --json payload of a forget (success or partial).

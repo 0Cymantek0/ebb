@@ -38,7 +38,7 @@ import (
 	"strings"
 	"sync"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 type fakeLink struct {

@@ -15,8 +15,8 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/catalog"
-	"ebb/internal/pathcanon"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/pathcanon"
 )
 
 // ---- F6: bidirectional canonical preflight overlap (I06) ------------------

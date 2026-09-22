@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/catalog"
 )
 
 // seedStatsEvent appends one journal event through the harness catalog.

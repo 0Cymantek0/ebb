@@ -22,12 +22,12 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/lifecycle"
-	"ebb/internal/platform"
-	"ebb/internal/policy"
-	"ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/restore"
 )
 
 // runImport drives one Import against the fixture with the standard

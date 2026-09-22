@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/policy"
 )
 
 // Network declares an action's network requirement and approval

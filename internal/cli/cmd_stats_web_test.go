@@ -21,11 +21,11 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/stats"
-	"ebb/internal/vault"
-	"ebb/internal/web"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/stats"
+	"github.com/0Cymantek0/ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/web"
 )
 
 // hexToken matches the per-run 64-lowercase-hex web token shape.
