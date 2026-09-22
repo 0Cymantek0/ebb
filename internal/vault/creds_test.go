@@ -131,6 +131,185 @@ func TestPasswordKeyringFailureSurfaces(t *testing.T) {
 	}
 }
 
+// ---- PasswordNonInteractive (wave-4 K3: request handlers must never
+// block on the terminal prompt rung) --------------------------------------
+
+// TestPasswordNonInteractiveEnvWins: the env source resolves first,
+// source "env", no error.
+func TestPasswordNonInteractiveEnvWins(t *testing.T) {
+	stubKeyring(t,
+		func(string) (string, error) { return "keyring-pw", nil },
+		func(string, string) error { return nil },
+		func(string) error { return nil },
+	)
+	t.Setenv(EnvPassword, "env-pw")
+	pw, src, err := PasswordNonInteractive("vid")
+	if err != nil || pw != "env-pw" || src != SourceEnv {
+		t.Fatalf("env must win: got (%q, %q, %v)", pw, src, err)
+	}
+}
+
+// TestPasswordNonInteractiveKeyring: with the env source unset, a
+// present keyring entry resolves with source "os-keyring".
+func TestPasswordNonInteractiveKeyring(t *testing.T) {
+	stubKeyring(t,
+		func(string) (string, error) { return "keyring-pw", nil },
+		func(string, string) error { return nil },
+		func(string) error { return nil },
+	)
+	unsetEnvPassword(t)
+	pw, src, err := PasswordNonInteractive("vid")
+	if err != nil || pw != "keyring-pw" || src != SourceOSKeyring {
+		t.Fatalf("keyring entry must resolve: got (%q, %q, %v)", pw, src, err)
+	}
+}
+
+// TestPasswordNonInteractiveNoSource: with neither source supplying a
+// secret, the result is *NoSourceError naming the vault and explaining
+// that the interactive prompt is unavailable for background reads —
+// never a guess, never a block.
+func TestPasswordNonInteractiveNoSource(t *testing.T) {
+	stubKeyring(t,
+		func(string) (string, error) { return "", ErrNotFound },
+		func(string, string) error { return nil },
+		func(string) error { return nil },
+	)
+	unsetEnvPassword(t)
+	stubTerminal(t, false, "")
+	pw, src, err := PasswordNonInteractive("vid")
+	if err == nil {
+		t.Fatalf("no source must error, got (%q, %q)", pw, src)
+	}
+	var nse *NoSourceError
+	if !errors.As(err, &nse) {
+		t.Fatalf("error must be *NoSourceError, got %T: %v", err, err)
+	}
+	if nse.VaultID != "vid" {
+		t.Fatalf("NoSourceError must name the vault, got %+v", nse)
+	}
+	if !strings.Contains(nse.Error(), "unavailable for background reads") {
+		t.Fatalf("NoSourceError must explain the background-reads reason: %s", nse.Error())
+	}
+}
+
+// TestPasswordNonInteractiveRefusesEvenOnTTY is the STRUCTURAL K3 pin:
+// with stdin REPORTED as a terminal and a scripted read available, the
+// non-interactive chain must still refuse with *NoSourceError rather
+// than consume the prompt rung — the rung is absent from this chain,
+// not merely skipped because stdin happened to be a pipe.
+func TestPasswordNonInteractiveRefusesEvenOnTTY(t *testing.T) {
+	stubKeyring(t,
+		func(string) (string, error) { return "", errors.Join(ErrNotFound, errors.New("no entry")) },
+		func(string, string) error { return nil },
+		func(string) error { return nil },
+	)
+	unsetEnvPassword(t)
+	// A promptable terminal with a ready password line: reaching the
+	// prompt rung would return ("typed-pw", SourcePrompt, nil).
+	stubTerminal(t, true, "", "typed-pw")
+	pw, src, err := PasswordNonInteractive("vid")
+	var nse *NoSourceError
+	if !errors.As(err, &nse) {
+		t.Fatalf("must refuse even on a TTY, got (%q, %q, %T: %v)", pw, src, err, err)
+	}
+	if pw != "" || src != "" {
+		t.Fatalf("a refusal must carry no partial credential: (%q, %q)", pw, src)
+	}
+}
+
+// TestPasswordNonInteractiveKeyringUnsupportedIsNoSource: an
+// unsupported keyring platform is a missing rung, not a failure — the
+// chain ends in NoSourceError.
+func TestPasswordNonInteractiveKeyringUnsupportedIsNoSource(t *testing.T) {
+	stubKeyring(t,
+		func(string) (string, error) { return "", ErrUnsupported },
+		func(string, string) error { return ErrUnsupported },
+		func(string) error { return ErrUnsupported },
+	)
+	unsetEnvPassword(t)
+	stubTerminal(t, true, "", "typed-pw")
+	_, _, err := PasswordNonInteractive("vid")
+	var nse *NoSourceError
+	if !errors.As(err, &nse) {
+		t.Fatalf("unsupported keyring must end in NoSourceError, got %T: %v", err, err)
+	}
+}
+
+// TestPasswordNonInteractiveKeyringFailureSurfaces: a keyring hard
+// failure (not a missing entry) propagates, exactly like Password.
+func TestPasswordNonInteractiveKeyringFailureSurfaces(t *testing.T) {
+	stubKeyring(t,
+		func(string) (string, error) { return "", errors.New("keyring boom") },
+		func(string, string) error { return nil },
+		func(string) error { return nil },
+	)
+	unsetEnvPassword(t)
+	stubTerminal(t, true, "", "should-not-be-reached")
+	_, _, err := PasswordNonInteractive("vid")
+	if err == nil || !strings.Contains(err.Error(), "keyring boom") {
+		t.Fatalf("a broken keyring must surface its error, got %v", err)
+	}
+	var nse *NoSourceError
+	if errors.As(err, &nse) {
+		t.Fatalf("a hard keyring failure is not a no-source refusal: %v", err)
+	}
+}
+
+// TestWithPassfileNonInteractiveLifecycle: the passfile variant of the
+// happy path — fn sees the exact env password bytes, and the file is
+// removed afterwards (same §13.1 contract as WithPassfile).
+func TestWithPassfileNonInteractiveLifecycle(t *testing.T) {
+	stubKeyring(t,
+		func(string) (string, error) { return "", ErrNotFound },
+		func(string, string) error { return nil },
+		func(string) error { return nil },
+	)
+	t.Setenv(EnvPassword, "pw-123-exact")
+	var observed, mine string
+	err := WithPassfileNonInteractive("vid", func(path string) error {
+		mine = path
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("passfile must exist during fn: %v", err)
+		}
+		observed = string(b)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed != "pw-123-exact" {
+		t.Fatalf("passfile must hold the EXACT password, got %q", observed)
+	}
+	if _, serr := os.Stat(mine); !os.IsNotExist(serr) {
+		t.Fatalf("passfile %s must be removed after fn, stat: %v", mine, serr)
+	}
+}
+
+// TestWithPassfileNonInteractiveNoSource: with no non-interactive
+// source, the *NoSourceError surfaces and fn never runs.
+func TestWithPassfileNonInteractiveNoSource(t *testing.T) {
+	stubKeyring(t,
+		func(string) (string, error) { return "", ErrNotFound },
+		func(string, string) error { return nil },
+		func(string) error { return nil },
+	)
+	unsetEnvPassword(t)
+	stubTerminal(t, true, "", "typed-pw") // even a promptable TTY must not save it
+	ran := false
+	err := WithPassfileNonInteractive("vid", func(path string) error {
+		ran = true
+		return nil
+	})
+	var nse *NoSourceError
+	if !errors.As(err, &nse) {
+		t.Fatalf("must surface *NoSourceError, got %T: %v", err, err)
+	}
+	if ran {
+		t.Fatal("fn must not run when no credential source is available")
+	}
+}
+
 func TestPromptNewPasswordDoubleEntry(t *testing.T) {
 	stubTerminal(t, true, "", "alpha", "alpha")
 	got, err := PromptNewPassword()
