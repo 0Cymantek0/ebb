@@ -23,7 +23,7 @@ ebb stats                             # what you freed, and what you are hoardin
 
 ### `ebb reclaim`
 
-Free space from a live workspace in place. Reclaim plans against the measured workspace, executes the declared reconstructible-output removals under full validation (each preceded by a verified capture of the removal plan), and escalates to a whole-workspace park only when the target cannot be met otherwise. Escalation is a separate typed confirmation plus a writer assertion; `--yes` never answers it. A shortfall is an honest exit 8, never a reason to delete something undeclared.
+Free space from a live workspace in place. Reclaim plans against the measured workspace, executes the declared reconstructible-output removals under full validation (each preceded by a verified capture of the removal plan), and escalates to a whole-workspace park only when the target cannot be met otherwise. Escalation is a separate typed confirmation plus a writer assertion; `--yes` never answers it. A shortfall is exit 8, never a reason to delete something undeclared.
 
 ```
 ebb reclaim [path] [flags]
@@ -106,7 +106,7 @@ Exit codes: 0 done (files-only included); 2 usage; 3 blocked (trim or seal-kind 
 
 ### `ebb analyse`
 
-Alias: `analyze`. Autonomous workspace discovery over configured roots (or one explicit directory). Shallow, read-only scanning: stats, directory listings, one manifest read. Classifies each project (bloated active, stale, abandoned, merged worktree, or honest quiet/active/unknown), applies git safety shields, prints copyable recommendations, and can execute batches behind explicit consent. Destructive action exists only behind the batch flags; shields block every batch; the projects' own safety gates stay in charge during execution.
+Alias: `analyze`. Autonomous workspace discovery over configured roots (or one explicit directory). Shallow, read-only scanning: stats, directory listings, one manifest read. Classifies each project (bloated active, stale, abandoned, merged worktree, or quiet/active/unknown), applies git safety shields, prints copyable recommendations, and can execute batches behind explicit consent. Destructive action exists only behind the batch flags; shields block every batch; the projects' own safety gates stay in charge during execution.
 
 ```
 ebb analyse [path] [flags]
@@ -148,7 +148,7 @@ Exit codes: 0 frozen, restored, or estimated; 2 usage; 3 blocked (daemon unreach
 
 ### `ebb doctor`
 
-Report supported capabilities and configuration problems. No automatic repair. Checks: restic (the one hard prerequisite; a missing binary is exit 2), git, platform probe, volume usage, writer inspection, named streams, config dir, catalog. Every check is pass, warn, fail, or n/a; platform gaps (for example Restart Manager outside Windows) are reported honestly as unsupported.
+Report supported capabilities and configuration problems. No automatic repair. Checks: restic (the one hard prerequisite; a missing binary is exit 2), git, platform probe, volume usage, writer inspection, named streams, config dir, catalog. Every check is pass, warn, fail, or n/a; platform gaps (for example Restart Manager outside Windows) are reported as unsupported.
 
 ```
 ebb doctor [--json]
@@ -306,14 +306,14 @@ These commands remain fully functional. They are the layers the daily loop compo
 
 | Code | Name | Meaning |
 |---|---|---|
-| 0 | ok | Requested outcome completed (an honest shortfall-free report) |
+| 0 | ok | Requested outcome completed (a shortfall-free report) |
 | 2 | usage-error | Invalid arguments, schema, or unsupported command feature |
 | 3 | blocked | Blocked before mutation by policy, capability, trust, or stopped-writers |
 | 4 | verification-failed | Capture or integrity verification failed (nothing removed) |
 | 5 | reconciliation-required | Interrupted or partial destructive operation; run `ebb recover` |
 | 6 | rebuild-failed | Preserved files recovered; reconstruction failed or was blocked (files intact, resumable) |
 | 7 | vault-unavailable | Vault, unlock, or provider unavailable |
-| 8 | shortfall | No useful gain, or reclaim target shortfall (an honest result) |
+| 8 | shortfall | No useful gain, or reclaim target shortfall |
 | 130 | cancelled | Controlled user cancellation (Ctrl+C); the journal keeps the last durable phase |
 
 Every non-zero exit prints a stable blocker code (for example `EBB_E_NO_VAULT`, `EBB_E_LAST_OF_PARKED`, `EBB_E_ESCALATION_UNCONFIRMED`), the affected scope, the reason, and a safe action. Machine mode carries the same facts in the envelope.

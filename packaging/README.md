@@ -64,7 +64,7 @@ v1.0 condition — source-available, not OSI open source. The repo-root
 `../LICENSE` holds both full texts; the winget locale manifest carries
 the free-text spelling (`Apache-2.0 with Commons Clause`, no SPDX
 identifier exists) and the scoop manifest uses the `Proprietary`
-identifier with the LICENSE url (scoop's honest bucket for a
+identifier with the LICENSE url (scoop's fitting bucket for a
 non-OSI license).
 
 `packaging/validate.sh` re-checks structure and flags remaining
@@ -176,7 +176,7 @@ Invoke it with `bash`, not `sh` (the shebang already says bash): the script
 uses `BASH_SOURCE` and `set -o pipefail`, so a POSIX `sh` (dash on Debian)
 dies with `Bad substitution` under the `sh packaging/validate.sh` spelling
 (audit finding V2). On Linux CI, also install PowerShell (`pwsh`) first —
-without a PowerShell engine the install.ps1 parser check honestly fails,
+without a PowerShell engine the install.ps1 parser check fails,
 and a green run needs it.
 
 Checks: POSIX syntax of `install.sh` (`sh -n`, plus `dash -n` when
@@ -187,7 +187,7 @@ checks are grep-level: they verify required keys exist, not full schema
 conformance — full conformance is checked by winget-create /
 winget-pkgs PR validation at submission time.
 
-## Unsigned binaries (honest trust story)
+## Unsigned binaries (trust story)
 
 The release binaries are **not signed**. There is no Authenticode
 signing in the pipeline yet, and this section documents what that means

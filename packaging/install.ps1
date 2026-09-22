@@ -248,7 +248,7 @@ if (-not $sessionHas) {
 $ebb = Join-Path $Destination 'ebb.exe'
 Write-Host ''
 Write-Host "installed: $ebb"
-# Honest shadowing check: show which ebb actually wins on PATH — an earlier
+# Shadowing check: show which ebb actually wins on PATH — an earlier
 # entry with a stale ebb.exe would silently shadow the fresh install.
 $resolved = @((Get-Command ebb -CommandType Application -ErrorAction SilentlyContinue) | ForEach-Object { $_.Source })
 if ($resolved.Count -gt 0 -and ($resolved[0] -ine $ebb)) {

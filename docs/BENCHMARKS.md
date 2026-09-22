@@ -41,7 +41,7 @@ be touched. No network is used.
 | Go | go1.27.1 windows/amd64 |
 | Total harness runtime | 804.3 s (13 m 24 s) at default scale 1.0 |
 | Peak harness RSS | 590.2 MiB (runtime.MemStats; restic subprocess memory excluded) |
-| Volume free-space noise | drift 84.0 KiB over 8 pre-run samples (see honesty notes) |
+| Volume free-space noise | drift 84.0 KiB over 8 pre-run samples (see measurement notes) |
 
 ## Corpus
 
@@ -139,7 +139,7 @@ entries` (per entry, the §14.4 metric):
 | media | 7 | 11.2 | 1607 | 2800 |
 | shared | 31 | 26.4 | 851 | 851 |
 
-## Interpretation (honest)
+## Interpretation
 
 1. **Readback dominates everything, and it is per-FILE, not per-byte.**
    For the small-file fixtures, readback is 60–92 % of park wall time, and
@@ -211,7 +211,7 @@ entries` (per entry, the §14.4 metric):
    media dumps (`DumpFile` returns whole files as byte slices — the current
    production readback path). A streaming transport would also fix this.
 
-## Honesty notes
+## Measurement notes
 
 - Single wall-clock runs, not medians; the machine is a live laptop.
 - The default run took 13 m 24 s, slightly over the ~10-minute target: the
@@ -286,7 +286,7 @@ store implements `TreeTarDumper`:
 Per-file overhead on the fallback transport is unchanged (~0.81–0.99
 s/file — invocation-bound, as the baseline established); the tar
 transport is a constant ~0.8 s subprocess per TREE plus byte-bound
-streaming (media, 4 × 64 MiB, is the honest byte-bound case at 6.4x).
+streaming (media, 4 × 64 MiB, is the byte-bound case at 6.4x).
 
 ## What this does to the reference-scale projections
 
@@ -298,7 +298,7 @@ sizes), and a snapshot or park of that tree to minutes, not hours.
 D021's "reconsider when reference-scale runs become cheap enough" gate
 is now met — the default corpus can grow on the next baseline refresh.
 
-## Honesty notes for this run
+## Run notes
 
 - Single wall-clock run, live laptop, same caveats as the baseline.
 - The per-file readback column and the new tar column run back to back
@@ -414,7 +414,7 @@ outside declared outputs) were byte-identical after both flows.
 
 park's freed-obs stays far below the estimate because the park
 SNAPSHOT grows the vault on the same volume by roughly what the removal
-frees — the honest attribution number is the estimate (1.6 GiB), with
+frees — the attributable number is the estimate (1.6 GiB), with
 the runner-observed open delta writing it all back. Peak park RSS
 577 MiB is the flow tree's commit peak while streaming 2 × 700 MiB
 safetensors through restic.
@@ -486,7 +486,7 @@ deviation): the numbers describe the same machinery either way, and
 from-inside now also completes (covered by the product regression
 suite, not by these tables).
 
-### Limitations (honest)
+### Limitations
 
 - Restore recipes recreate 5 MiB marker trees, NOT full dependency
   reinstalls (offline by design; full reinstalls are covered by

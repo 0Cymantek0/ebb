@@ -32,7 +32,9 @@ prompt.md
 
 
 # internal working dirs (local only)
-/lab/
+/lab/*
+!/lab/bench/
+/lab/bench/results/
 /graphify-out/
 /agents.md
 /CONTEXT.md

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # validate.sh — syntax / structure checks for the packaging templates.
 #
-# Honest scope: this script verifies SYNTAX (POSIX sh, PowerShell, JSON)
+# Scope: this script verifies SYNTAX (POSIX sh, PowerShell, JSON)
 # and STRUCTURE (required keys present in the winget YAML files). YAML is
 # NOT schema-validated here — no YAML parser is assumed; winget-pkgs /
 # winget-create perform full schema validation at submission time.

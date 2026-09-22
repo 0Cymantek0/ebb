@@ -17,7 +17,7 @@ Windows 11 and Linux. Go + [restic](https://restic.net) underneath. Zero telemet
 
 ## Why ebb
 
-Every developer knows the feeling. Fourteen projects, each with `node_modules`, `target`, `.venv`, `build`. Some untouched for two years. The disk is full and the honest options are bad:
+Every developer knows the feeling. Fourteen projects, each with `node_modules`, `target`, `.venv`, `build`. Some untouched for two years. The disk is full and the realistic options are bad:
 
 - Delete `node_modules` by hand. Repeat next week. Hope you never `rm -rf` the wrong window.
 - Nuke whole project folders. Lose the uncommitted fix, the `.env`, the note to self.
@@ -47,7 +47,7 @@ reclaim for workspace "api"
   achieved (estimated): 2.4 GiB; measured free-space delta: 2.4 GiB
 ```
 
-Reclaim plans against the measured workspace, removes only declared reconstructible output (`node_modules`, `target`, `.venv`, ...), and leaves the project live. Your `.env`, uncommitted changes, notes, and everything Git-ignored-but-irreplaceable stay exactly where they are. Every removal is preceded by a verified capture of the removal plan, so it can always be undone. If trim alone cannot reach your target, ebb offers escalation to a full park as a separate, explicit confirmation. `--yes` never answers that one. A shortfall is reported honestly (exit 8), never solved by deleting something undeclared.
+Reclaim plans against the measured workspace, removes only declared reconstructible output (`node_modules`, `target`, `.venv`, ...), and leaves the project live. Your `.env`, uncommitted changes, notes, and everything Git-ignored-but-irreplaceable stay exactly where they are. Every removal is preceded by a verified capture of the removal plan, so it can always be undone. If trim alone cannot reach your target, ebb offers escalation to a full park as a separate, explicit confirmation. `--yes` never answers that one. A shortfall is reported as a shortfall (exit 8), never solved by deleting something undeclared.
 
 Use `--dry-run` to see the staged plan with no effects.
 
@@ -115,7 +115,7 @@ Recommendations (copyable):
   [R] Reclaim stale projects (1 project(s), 1.8 GiB estimated): ebb analyse --reclaim-stale --yes
 ```
 
-Point ebb at your projects directory once (`ebb config add projects_dir <path>`) and it scans every immediate child: a shallow footprint probe of known output folders, git topology, and staleness classification. Categories: **bloated active** (touched within 14 days, more than 2 GiB of regenerable output), **stale** (untouched 30 to 90 days), **abandoned** (90+ days, park it), and **merged worktrees** (safe to remove natively). Every project gets one category or an honest "quiet"/"unknown".
+Point ebb at your projects directory once (`ebb config add projects_dir <path>`) and it scans every immediate child: a shallow footprint probe of known output folders, git topology, and staleness classification. Categories: **bloated active** (touched within 14 days, more than 2 GiB of regenerable output), **stale** (untouched 30 to 90 days), **abandoned** (90+ days, park it), and **merged worktrees** (safe to remove natively). Every project gets one category or a plain "quiet"/"unknown".
 
 Projects carry git safety shields, and shields block every batch action: `[UNPUSHED COMMITS]` (advise park or push, never deletion), `[DIRTY]` (uncommitted changes), `[CONFLICT]` (in-flight merge or rebase), `[LOCKED]` (a process holds file handles, reported with the holder). Recommendations are printed as copyable commands; you stay in control:
 
@@ -198,7 +198,7 @@ The trust core, each claim enforced in code:
 - **Secrets never on the command line.** Vault passwords live in the OS credential store or `EBB_VAULT_PASSWORD`, and reach restic only through an ephemeral passfile. Capsule passphrases come from `EBB_CAPSULE_PASSWORD` or a terminal prompt, never from argv. Secrets never enter logs or JSON output.
 - **Crash-safe by journal.** Every operation writes a durable journal. If ebb is killed mid-operation, nothing is silently lost: `ebb status` shows the operation, and `ebb recover <operation-id>` reconciles it from durable evidence. Interrupted removals resume where they stopped.
 - **Untrusted input is treated as hostile.** Inspection never runs project code (no hooks, no filters, no lifecycle scripts). Git observation uses a hardened, non-executing recipe. Capsule files are parsed with traversal, duplicate, and NTFS-alias defenses, and extraction respects a verified byte budget. Docker daemon identifiers are validated before they can appear in any copyable command.
-- **Honest failures.** Ebb would rather report a shortfall (exit 8) than manufacture a saving. Unknown failures are reported as blocked; nothing is removed on a maybe.
+- **Shortfalls are reported, not manufactured.** Ebb reports a shortfall (exit 8) rather than manufacture a saving. Unknown failures are reported as blocked; nothing is removed on a maybe.
 
 ## Install
 
