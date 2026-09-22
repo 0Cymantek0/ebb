@@ -1,8 +1,9 @@
 // server_test.go exercises the Control Center HTTP surface against a
 // fake Provider through the real handler: the security model (method
-// matrix, Host enforcement, snapshot-id validation, query strictness),
-// the embedded-asset guarantees (non-empty, zero external URLs), the
-// JSON shape contracts and the provider-error paths.
+// matrix, Host enforcement, the per-run token gate, snapshot-id
+// validation, query strictness), the embedded-asset guarantees
+// (non-empty, zero external URLs), the JSON shape contracts and the
+// provider-error paths.
 
 package web
 
@@ -150,7 +151,18 @@ func richProvider() *fakeProvider {
 
 const testPort = 18080
 
+// testToken is the fixed per-run token every direct-handler test uses
+// (64 lowercase hex chars, the same shape Run mints).
+const testToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+// tokened prefixes the per-run token onto a route path.
+func tokened(path string) string {
+	return "/" + testToken + path
+}
+
 // doReq drives the real handler synchronously with a controlled Host.
+// The target is used VERBATIM — token and all — so tests can probe both
+// the authenticated (tokened) and unauthenticated (bare) surface.
 func doReq(h http.Handler, method, target, host string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, target, nil)
 	if host != "" {
@@ -161,9 +173,10 @@ func doReq(h http.Handler, method, target, host string) *httptest.ResponseRecord
 	return rec
 }
 
-// doGet is doReq for GET with the canonical allowed host.
+// doGet is doReq for GET with the canonical allowed host and the test
+// token prepended: the authenticated reader's view.
 func doGet(h http.Handler, target string) *httptest.ResponseRecorder {
-	return doReq(h, http.MethodGet, target, "127.0.0.1:"+itoa(testPort))
+	return doReq(h, http.MethodGet, tokened(target), "127.0.0.1:"+itoa(testPort))
 }
 
 func itoa(n int) string { return fmt.Sprintf("%d", n) }
@@ -188,7 +201,7 @@ func decodeError(t *testing.T, rec *httptest.ResponseRecorder) string {
 // ---- security model #1: method matrix -------------------------------------------
 
 func TestMethodMatrix(t *testing.T) {
-	h := newServer(richProvider(), testPort, nil)
+	h := newServer(richProvider(), testPort, testToken, nil)
 	paths := []string{
 		"/",
 		"/static/styles.css",
@@ -198,7 +211,7 @@ func TestMethodMatrix(t *testing.T) {
 	}
 	for _, path := range paths {
 		for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions} {
-			rec := doReq(h, method, path, "localhost:"+itoa(testPort))
+			rec := doReq(h, method, tokened(path), "localhost:"+itoa(testPort))
 			if rec.Code != http.StatusMethodNotAllowed {
 				t.Errorf("%s %s: got status %d, want 405", method, path, rec.Code)
 			}
@@ -211,7 +224,7 @@ func TestMethodMatrix(t *testing.T) {
 	// GET and HEAD answer with data everywhere.
 	for _, path := range paths {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
-			rec := doReq(h, method, path, "localhost:"+itoa(testPort))
+			rec := doReq(h, method, tokened(path), "localhost:"+itoa(testPort))
 			if rec.Code != http.StatusOK {
 				t.Errorf("%s %s: got status %d, want 200", method, path, rec.Code)
 			}
@@ -222,9 +235,9 @@ func TestMethodMatrix(t *testing.T) {
 // HEAD must carry the same headers as GET but no body (the handler
 // wraps itself in the same body-discard net/http applies).
 func TestHeadCarriesHeadersNoBody(t *testing.T) {
-	h := newServer(richProvider(), testPort, nil)
+	h := newServer(richProvider(), testPort, testToken, nil)
 	get := doGet(h, "/api/overview")
-	head := doReq(h, http.MethodHead, "/api/overview", "127.0.0.1:"+itoa(testPort))
+	head := doReq(h, http.MethodHead, tokened("/api/overview"), "127.0.0.1:"+itoa(testPort))
 	if head.Code != http.StatusOK {
 		t.Fatalf("HEAD /api/overview: got status %d, want 200", head.Code)
 	}
@@ -239,7 +252,7 @@ func TestHeadCarriesHeadersNoBody(t *testing.T) {
 // ---- security model #3: Host enforcement -------------------------------------------
 
 func TestHostEnforcement(t *testing.T) {
-	h := newServer(richProvider(), testPort, nil)
+	h := newServer(richProvider(), testPort, testToken, nil)
 	cases := []struct {
 		host string
 		want int
@@ -268,7 +281,7 @@ func TestHostEnforcement(t *testing.T) {
 		{"127.0.0.1:8080:" + itoa(testPort), http.StatusForbidden},
 	}
 	for _, tc := range cases {
-		rec := doReq(h, http.MethodGet, "/api/overview", tc.host)
+		rec := doReq(h, http.MethodGet, tokened("/api/overview"), tc.host)
 		if rec.Code != tc.want {
 			t.Errorf("Host %q: got status %d, want %d", tc.host, rec.Code, tc.want)
 		}
@@ -288,12 +301,12 @@ func TestHostEnforcementOverRealListener(t *testing.T) {
 	}
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
-	ts := httptest.NewUnstartedServer(newServer(p, port, nil))
+	ts := httptest.NewUnstartedServer(newServer(p, port, testToken, nil))
 	ts.Listener = ln
 	ts.Start()
 	defer ts.Close()
 
-	evil, err := http.NewRequest(http.MethodGet, ts.URL+"/api/overview", nil)
+	evil, err := http.NewRequest(http.MethodGet, ts.URL+tokened("/api/overview"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +320,7 @@ func TestHostEnforcementOverRealListener(t *testing.T) {
 		t.Errorf("evil Host over real listener: got %d, want 403", resp.StatusCode)
 	}
 
-	otherPort, err := http.NewRequest(http.MethodGet, ts.URL+"/api/overview", nil)
+	otherPort, err := http.NewRequest(http.MethodGet, ts.URL+tokened("/api/overview"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +334,7 @@ func TestHostEnforcementOverRealListener(t *testing.T) {
 		t.Errorf("wrong-port Host over real listener: got %d, want 403", resp.StatusCode)
 	}
 
-	resp, err = ts.Client().Get(ts.URL + "/api/overview")
+	resp, err = ts.Client().Get(ts.URL + tokened("/api/overview"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,11 +344,110 @@ func TestHostEnforcementOverRealListener(t *testing.T) {
 	}
 }
 
+// ---- security model #2b: the per-run token gate ------------------------------------
+
+// TestTokenGate pins the local-reader authentication contract: without
+// the exact per-run token NOTHING is served — not the index, not the
+// API, not the static assets — and the refusal reveals no surface
+// details (no Allow header, fixed message). With the token the whole
+// read-only surface answers as before.
+func TestTokenGate(t *testing.T) {
+	p := richProvider()
+	h := newServer(p, testPort, testToken, nil)
+
+	// Every unauthenticated shape is a 403 with the fixed envelope.
+	wrongToken := strings.Repeat("deadbeef", 8) // right shape, wrong value
+	for _, target := range []string{
+		"/",              // bare root: the K1 scanner's request
+		"/api/overview",  // bare metadata endpoint
+		"/api/history",   // bare journal endpoint
+		"/static/app.js", // bare asset
+		"/" + wrongToken, // wrong token, exact
+		"/" + wrongToken + "/api/overview",
+		"/" + testToken + "x",              // token as a strict prefix, no boundary
+		"/" + strings.ToUpper(testToken),   // tokens are case-sensitive
+		"/" + testToken[:len(testToken)-1], // one char short
+	} {
+		rec := doReq(h, http.MethodGet, target, "127.0.0.1:"+itoa(testPort))
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("GET %s: got status %d, want 403", target, rec.Code)
+		}
+		msg := decodeError(t, rec)
+		if msg != "forbidden: this control center requires its per-run URL" {
+			t.Errorf("GET %s: error = %q, want the fixed per-run-URL message", target, msg)
+		}
+		// The refusal must not leak that a method check exists later in
+		// the pipeline (the gate fires before it).
+		if got := rec.Header().Get("Allow"); got != "" {
+			t.Errorf("GET %s: token-gate 403 carries Allow = %q, want none", target, got)
+		}
+	}
+	// The provider was never touched by the refused reads.
+	if n := len(p.recordedCmpCalls()); n != 0 {
+		t.Errorf("provider consulted %d times on refused requests, want 0", n)
+	}
+
+	// A mutating verb WITHOUT the token is a 403, not a 405: the method
+	// check sits behind the gate, so unauthenticated readers learn
+	// nothing about the surface.
+	rec := doReq(h, http.MethodPost, "/api/overview", "127.0.0.1:"+itoa(testPort))
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("POST without token: got status %d, want 403", rec.Code)
+	}
+	if got := rec.Header().Get("Allow"); got != "" {
+		t.Errorf("POST without token: Allow = %q, want none", got)
+	}
+
+	// The correct token serves the whole surface (GET and HEAD).
+	for _, target := range []string{"/", "/api/overview", "/api/history", "/static/app.js", "/static/styles.css", "/static/logo.svg"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			rec := doReq(h, method, tokened(target), "127.0.0.1:"+itoa(testPort))
+			if rec.Code != http.StatusOK {
+				t.Errorf("%s %s with token: got status %d, want 200", method, target, rec.Code)
+			}
+		}
+	}
+	// The index is the embedded HTML, and the API is real data.
+	if rec := doGet(h, "/"); !strings.Contains(rec.Body.String(), "<title>Ebb Control Center</title>") {
+		t.Errorf("tokened / did not serve the embedded index (body %q)", clipStr(rec.Body.String(), 80))
+	}
+	if rec := doGet(h, "/api/overview"); !strings.Contains(rec.Body.String(), `"workspaces"`) {
+		t.Errorf("tokened /api/overview did not serve the metadata payload (body %q)", clipStr(rec.Body.String(), 80))
+	}
+
+	// The exact no-slash form redirects to the canonical base so the
+	// page's relative references resolve correctly.
+	rec = doReq(h, http.MethodGet, "/"+testToken, "127.0.0.1:"+itoa(testPort))
+	if rec.Code != http.StatusMovedPermanently {
+		t.Errorf("GET /<token> exact: got status %d, want 301", rec.Code)
+	}
+	if got := rec.Header().Get("Location"); got != "/"+testToken+"/" {
+		t.Errorf("GET /<token> exact: Location = %q, want the canonical slashed base", got)
+	}
+
+	// A tokenless server construction fails closed: nothing at all is
+	// served, on any path.
+	empty := newServer(richProvider(), testPort, "", nil)
+	for _, target := range []string{"/", "/api/overview", "/" + testToken + "/api/overview"} {
+		rec := doReq(empty, http.MethodGet, target, "127.0.0.1:"+itoa(testPort))
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("empty-token server GET %s: got status %d, want 403", target, rec.Code)
+		}
+	}
+}
+
+func clipStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
 // ---- /api/tree id validation ---------------------------------------------------------
 
 func TestTreeIDValidation(t *testing.T) {
 	p := richProvider()
-	h := newServer(p, testPort, nil)
+	h := newServer(p, testPort, testToken, nil)
 	valid := []string{"deadbeef", "aabbccddeeff0011", strings.Repeat("ab", 32)} // 8, 16, 64 hex
 	for _, id := range valid {
 		rec := doGet(h, "/api/tree?id="+id)
@@ -373,7 +485,7 @@ func TestTreeIDValidation(t *testing.T) {
 // ---- query strictness ------------------------------------------------------------------
 
 func TestQueryValidation(t *testing.T) {
-	h := newServer(richProvider(), testPort, nil)
+	h := newServer(richProvider(), testPort, testToken, nil)
 	bad := []string{
 		"/?foo=1",
 		"/?refresh=1",
@@ -406,7 +518,7 @@ func TestQueryValidation(t *testing.T) {
 // ---- 404 + content types + security headers -----------------------------------------------
 
 func TestNotFoundIsJSON(t *testing.T) {
-	h := newServer(richProvider(), testPort, nil)
+	h := newServer(richProvider(), testPort, testToken, nil)
 	for _, path := range []string{"/nope", "/api/nope", "/static/nope.css", "/static/", "/static/../styles.css", "/index.html", "/api/"} {
 		rec := doGet(h, path)
 		if rec.Code != http.StatusNotFound {
@@ -420,7 +532,7 @@ func TestNotFoundIsJSON(t *testing.T) {
 }
 
 func TestContentTypesAndSecurityHeaders(t *testing.T) {
-	h := newServer(richProvider(), testPort, nil)
+	h := newServer(richProvider(), testPort, testToken, nil)
 	cases := []struct {
 		target      string
 		contentType string
@@ -512,7 +624,7 @@ func TestAssetsEmbeddedNonEmptyAndLocalhostOnly(t *testing.T) {
 
 	// The same scan over the bytes actually SERVED (index + every
 	// static route).
-	h := newServer(richProvider(), testPort, nil)
+	h := newServer(richProvider(), testPort, testToken, nil)
 	var served []byte
 	for _, target := range []string{"/", "/static/styles.css", "/static/app.js", "/static/logo.svg"} {
 		rec := doGet(h, target)
@@ -526,11 +638,21 @@ func TestAssetsEmbeddedNonEmptyAndLocalhostOnly(t *testing.T) {
 	}
 	scanExternalURLs(t, "served bytes", served)
 
-	// index.html must reference exactly the local static routes.
+	// index.html must reference exactly the local static routes — by
+	// RELATIVE reference, so the references resolve against the per-run
+	// document base /<token>/ rather than the server root (where the
+	// token gate would 403 them).
 	html := string(indexHTML)
-	for _, ref := range []string{`href="/static/logo.svg"`, `href="/static/styles.css"`, `src="/static/app.js"`} {
+	for _, ref := range []string{`href="static/logo.svg"`, `href="static/styles.css"`, `src="static/logo.svg"`, `src="static/app.js"`} {
 		if !strings.Contains(html, ref) {
 			t.Errorf("index.html missing local asset reference %q", ref)
+		}
+	}
+	// No absolute-path reference survives: the token would be dropped
+	// and the request refused.
+	for _, ref := range []string{`href="/static/`, `src="/static/`} {
+		if strings.Contains(html, ref) {
+			t.Errorf("index.html still carries an absolute asset reference %q", ref)
 		}
 	}
 }
@@ -564,7 +686,7 @@ func TestMetricsMirrorJSONTags(t *testing.T) {
 
 func TestOverviewJSONShape(t *testing.T) {
 	p := richProvider()
-	h := newServer(p, testPort, nil)
+	h := newServer(p, testPort, testToken, nil)
 	rec := doGet(h, "/api/overview")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d, want 200", rec.Code)
@@ -661,7 +783,7 @@ func TestOverviewJSONShape(t *testing.T) {
 func TestOverviewRotationClampsNegativeInvocations(t *testing.T) {
 	p := richProvider()
 	p.metrics.TotalInvocations = -3
-	h := newServer(p, testPort, nil)
+	h := newServer(p, testPort, testToken, nil)
 	rec := doGet(h, "/api/overview")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d, want 200", rec.Code)
@@ -675,7 +797,7 @@ func TestOverviewRotationClampsNegativeInvocations(t *testing.T) {
 
 func TestHistoryJSONShapeAndLimitClamping(t *testing.T) {
 	p := richProvider()
-	h := newServer(p, testPort, nil)
+	h := newServer(p, testPort, testToken, nil)
 
 	// Shape: {"events":[...]} with the frozen event fields.
 	rec := doGet(h, "/api/history?limit=10")
@@ -745,7 +867,7 @@ func TestHistoryJSONShapeAndLimitClamping(t *testing.T) {
 
 	// An empty ledger marshals as [], never null.
 	empty := &fakeProvider{}
-	rec = doGet(newServer(empty, testPort, nil), "/api/history")
+	rec = doGet(newServer(empty, testPort, testToken, nil), "/api/history")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d, want 200", rec.Code)
 	}
@@ -755,7 +877,7 @@ func TestHistoryJSONShapeAndLimitClamping(t *testing.T) {
 }
 
 func TestTreeJSONShape(t *testing.T) {
-	h := newServer(richProvider(), testPort, nil)
+	h := newServer(richProvider(), testPort, testToken, nil)
 	rec := doGet(h, "/api/tree?id=deadbeefdeadbeef")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d, want 200", rec.Code)
@@ -811,7 +933,7 @@ func TestProviderErrorsAreJSON500(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := doGet(newServer(tc.prov, testPort, nil), tc.target)
+			rec := doGet(newServer(tc.prov, testPort, testToken, nil), tc.target)
 			if rec.Code != http.StatusInternalServerError {
 				t.Fatalf("status %d, want 500", rec.Code)
 			}
@@ -830,12 +952,13 @@ func TestProviderErrorsAreJSON500(t *testing.T) {
 
 func TestRequestLoggingNeverBodies(t *testing.T) {
 	var log strings.Builder
-	h := newServer(richProvider(), testPort, func(format string, args ...any) {
+	h := newServer(richProvider(), testPort, testToken, func(format string, args ...any) {
 		fmt.Fprintf(&log, format+"\n", args...)
 	})
 	doGet(h, "/api/overview")
 	doGet(h, "/api/nope")
-	doReq(h, http.MethodPost, "/api/overview", "127.0.0.1:"+itoa(testPort))
+	doReq(h, http.MethodPost, tokened("/api/overview"), "127.0.0.1:"+itoa(testPort))
+	doReq(h, http.MethodGet, "/api/overview", "127.0.0.1:"+itoa(testPort)) // token gate 403
 	out := log.String()
 	for _, want := range []string{"GET /api/overview 200\n", "GET /api/nope 404\n", "POST /api/overview 405\n"} {
 		if !strings.Contains(out, want) {
@@ -845,6 +968,12 @@ func TestRequestLoggingNeverBodies(t *testing.T) {
 	// The sentinel metric value must never appear — bodies are not logged.
 	if strings.Contains(out, "casual collector") {
 		t.Errorf("request log leaked a response body value: %q", out)
+	}
+	// The per-run token must never appear either: request lines carry
+	// the TOKEN-STRIPPED path (the token is printed once, in the
+	// serving-at line, and nowhere else).
+	if strings.Contains(out, testToken) {
+		t.Errorf("request log leaked the per-run token: %q", out)
 	}
 }
 

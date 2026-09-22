@@ -174,9 +174,9 @@ A local dashboard over your own catalog: lifetime reclaimed and restored bytes, 
 
 ### `ebb stats --web`: a control center that cannot mutate
 
-`ebb stats --web` serves a strictly read-only control center on localhost: command palette, deep search across workspaces and operations, full history, and a snapshot content explorer that browses exactly what each vault snapshot preserved. Actions in the web UI are **copy-to-terminal**: every button copies the equivalent ebb CLI command instead of executing it.
+`ebb stats --web` serves a strictly read-only control center on localhost at a fresh unguessable per-run URL: command palette, deep search across workspaces and operations, full history, and a snapshot content explorer that browses exactly what each vault snapshot preserved. Actions in the web UI are **copy-to-terminal**: every button copies the equivalent ebb CLI command instead of executing it.
 
-That is deliberate. The server exposes zero mutation endpoints. There is no endpoint to delete, unpark, forget, or prune anything, so there is nothing for a CSRF attack or a DNS-rebinding page to trigger. A malicious webpage can stare at your local ebb server and find nothing to command it to do. Mutation stays where the audit trail, the confirmations, and the typed assertions live: your terminal.
+That is deliberate. The server exposes zero mutation endpoints. There is no endpoint to delete, unpark, forget, or prune anything, so there is nothing for a CSRF attack or a DNS-rebinding page to trigger. A malicious webpage can stare at your local ebb server and find nothing to command it to do, and because every run serves under a random per-run URL, other local processes cannot read your dashboard without the URL `ebb` prints. Mutation stays where the audit trail, the confirmations, and the typed assertions live: your terminal.
 
 ### `ebb stats --share`: a PNG card
 

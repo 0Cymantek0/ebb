@@ -13,8 +13,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +26,9 @@ import (
 	"ebb/internal/stats"
 	"ebb/internal/web"
 )
+
+// hexToken matches the per-run 64-lowercase-hex web token shape.
+var hexToken = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // ---- flag matrix --------------------------------------------------------------
 
@@ -436,7 +441,9 @@ func TestStatsWebEndToEndRun(t *testing.T) {
 		done <- Main([]string{"stats", "--web"}, Streams{Out: io.Discard, Err: &errb}, h.deps)
 	}()
 
-	// Wait for the serving line, then talk to the server.
+	// Wait for the serving line, then talk to the server. The URL now
+	// carries the per-run token in its path (/<64 hex>/) — pin that the
+	// end-to-end flow serves under it.
 	baseURL := ""
 	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) {
@@ -449,6 +456,16 @@ func TestStatsWebEndToEndRun(t *testing.T) {
 	if baseURL == "" {
 		h.cancelSig()
 		t.Fatalf("server never announced its URL:\n%s", errb.String())
+	}
+	servingURL, err := url.Parse(baseURL)
+	if err != nil {
+		h.cancelSig()
+		t.Fatalf("serving line is not a URL: %q: %v", baseURL, err)
+	}
+	if !strings.HasPrefix(servingURL.Path, "/") || !strings.HasSuffix(servingURL.Path, "/") ||
+		!hexToken.MatchString(strings.Trim(servingURL.Path, "/")) {
+		h.cancelSig()
+		t.Fatalf("serving URL path = %q, want /<64 lowercase hex token>/", servingURL.Path)
 	}
 
 	resp, err := http.Get(baseURL + "api/overview")
