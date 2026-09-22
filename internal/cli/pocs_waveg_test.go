@@ -23,8 +23,8 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/restore"
 )
 
 func TestPoCApprovalPromptOmitsEnvAllowlistAndWorkingRoot(t *testing.T) {

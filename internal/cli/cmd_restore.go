@@ -29,9 +29,9 @@ import (
 	"fmt"
 	"strings"
 
-	"ebb/internal/catalog"
-	"ebb/internal/platform"
-	"ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/restore"
 )
 
 // restoreGroupDetails is one group's slice of the --json payload.

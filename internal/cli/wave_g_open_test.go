@@ -17,11 +17,11 @@ import (
 	"sync"
 	"testing"
 
-	"ebb/internal/actions"
-	"ebb/internal/actions/approvalstore"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/actions/approvalstore"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/restore"
 )
 
 // gRunner is the fake actions runner: it records calls, defers to an

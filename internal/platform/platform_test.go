@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"testing"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Cross-platform contract tests. Windows-specific capability tests

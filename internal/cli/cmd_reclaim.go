@@ -38,10 +38,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ebb/internal/catalog"
-	"ebb/internal/lifecycle"
-	"ebb/internal/planner"
-	"ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/planner"
+	"github.com/0Cymantek0/ebb/internal/policy"
 )
 
 // reclaimTrimStep is one planned trim group's execution outcome.

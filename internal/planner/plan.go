@@ -28,8 +28,8 @@ import (
 	"fmt"
 	"sort"
 
-	"ebb/internal/domain"
-	"ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/policy"
 )
 
 // StepKind identifies one class of reclaim action.

@@ -46,9 +46,9 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Strategy names a drift-reconciliation strategy (D033 §5). The zero

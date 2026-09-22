@@ -7,7 +7,7 @@ import (
 	"os"
 	"syscall"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // linuxProbe implements domain.PlatformProbe for Linux (ext4-family).

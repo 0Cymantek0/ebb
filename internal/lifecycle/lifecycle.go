@@ -42,12 +42,12 @@ import (
 
 	toml "github.com/pelletier/go-toml/v2"
 
-	"ebb/internal/actions"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/pathcanon"
-	"ebb/internal/policy"
-	"ebb/internal/version"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/pathcanon"
+	"github.com/0Cymantek0/ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/version"
 )
 
 // Store is the storage seam this package drives. It is satisfied by

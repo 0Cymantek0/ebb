@@ -22,12 +22,12 @@ import (
 	"os/exec"
 	"strings"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/freezer"
-	"ebb/internal/lifecycle"
-	resticstore "ebb/internal/storage/restic"
-	"ebb/internal/version"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/freezer"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
+	resticstore "github.com/0Cymantek0/ebb/internal/storage/restic"
+	"github.com/0Cymantek0/ebb/internal/version"
 )
 
 // Freeze-flow blocker codes (§5.5 shape; local to this command family).

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/version"
+	"github.com/0Cymantek0/ebb/internal/version"
 )
 
 // run executes Main against buffers with the stub deps. Stats-event

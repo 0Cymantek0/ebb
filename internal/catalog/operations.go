@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // BeginOperation opens a new journaled operation in phase PLANNED at

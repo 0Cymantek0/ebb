@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Stdin capture and single-blob readback (D040 tier 3, the Freeze-to-Vault

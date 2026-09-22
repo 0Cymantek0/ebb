@@ -37,8 +37,8 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // probeTimeout bounds the `docker version` connectivity check (and every

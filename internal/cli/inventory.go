@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // InventoryFile is the saved-inventory interchange format consumed by

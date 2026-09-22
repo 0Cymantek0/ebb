@@ -49,8 +49,8 @@ import (
 	"fmt"
 	"strings"
 
-	"ebb/internal/domain"
-	"ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
 )
 
 // recoverDetails is the --json payload: the RecoveryReport verbatim.

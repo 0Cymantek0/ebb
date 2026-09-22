@@ -35,8 +35,8 @@ import (
 	"runtime"
 	"syscall"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // LinkCreator recreates one link of the given inventory kind (symlink /

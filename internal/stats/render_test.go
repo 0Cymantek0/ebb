@@ -5,7 +5,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/catalog"
 )
 
 // sampleMetrics is a fully-populated dashboard model.

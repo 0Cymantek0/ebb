@@ -3,7 +3,7 @@ package planner
 import (
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // sumEntries conservatively sums the physical footprint of entries:

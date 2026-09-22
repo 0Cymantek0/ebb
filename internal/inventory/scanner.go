@@ -24,7 +24,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Default bounds (Foundation §8.3: exceeding a bound is a reported

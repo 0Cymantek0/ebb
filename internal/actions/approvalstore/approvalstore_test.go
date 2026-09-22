@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/actions/approvalstore"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/actions/approvalstore"
 )
 
 func validDef(id string) actions.Definition {

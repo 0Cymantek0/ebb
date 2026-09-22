@@ -40,7 +40,7 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // maxStaleBranches caps the stale merged branch list; beyond it the

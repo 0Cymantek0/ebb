@@ -13,8 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/domain"
-	"ebb/internal/inventory"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/inventory"
 )
 
 // isMismatch mirrors the scanner's structural detection of

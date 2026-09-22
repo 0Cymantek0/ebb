@@ -17,11 +17,11 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/actions/approvalstore"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/actions/approvalstore"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/platform"
 )
 
 // fakeRunner implements ActionRunner: it records call order and defers

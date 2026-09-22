@@ -7,7 +7,7 @@ import (
 	"os"
 	"syscall"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Test-only Windows enrichment: (volume serial, file index) and link

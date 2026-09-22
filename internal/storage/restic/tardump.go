@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Whole-tree tar dump transport (Foundation §11.4 "Readback", §14.3

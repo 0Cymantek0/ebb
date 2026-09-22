@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 func mustAdd(t *testing.T, c *Config, path string) {

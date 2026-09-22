@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/analyse"
+	"github.com/0Cymantek0/ebb/internal/analyse"
 )
 
 // cliFakeSurvey is the CLI-side injectable git survey seam.

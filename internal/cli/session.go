@@ -16,11 +16,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/lifecycle"
-	"ebb/internal/policy"
-	"ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 // session is one command's opened durable state.

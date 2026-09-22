@@ -40,12 +40,12 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/platform"
-	"ebb/internal/policy"
-	"ebb/internal/restore"
-	resticstore "ebb/internal/storage/restic"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/restore"
+	resticstore "github.com/0Cymantek0/ebb/internal/storage/restic"
 )
 
 // ---- skip guard + real-stack harness ----------------------------------

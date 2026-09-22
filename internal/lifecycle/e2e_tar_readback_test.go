@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/domain"
-	"ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/policy"
 )
 
 // buildTarEquivalenceWorkspace builds the §14.3-flavored fixture: ~20

@@ -11,7 +11,7 @@
 //
 // Release builds stamp the variable at link time:
 //
-//	-X ebb/internal/version.Version=<ver>
+//	-X github.com/0Cymantek0/ebb/internal/version.Version=<ver>
 //
 // This spelling works on go1.27 (and earlier) precisely because the
 // variable does NOT live in package main: the linker resolves package
@@ -25,7 +25,7 @@ package version
 
 // Version is the Ebb build version. The default marks a non-release
 // build ("0.1.0-dev"); release builds override it at link time via
-// scripts/release.sh (-X ebb/internal/version.Version=<ver>). All
+// scripts/release.sh (-X github.com/0Cymantek0/ebb/internal/version.Version=<ver>). All
 // version-reporting surfaces must read this variable rather than
 // keeping their own copy.
 var Version = "0.1.0-dev"

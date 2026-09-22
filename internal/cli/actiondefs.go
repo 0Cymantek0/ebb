@@ -21,9 +21,9 @@ import (
 	"fmt"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/adapters/ecosystem"
-	"ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/adapters/ecosystem"
+	"github.com/0Cymantek0/ebb/internal/policy"
 )
 
 // customActionTimeout bounds a policy-declared custom command. Ecosystem

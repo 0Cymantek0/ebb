@@ -27,7 +27,7 @@ import (
 	"strconv"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // maxListOutput bounds outputs that are only counted (ls-files --stage).

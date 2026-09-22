@@ -18,9 +18,9 @@ import (
 	"sync"
 	"testing"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 // ---- fake binary management (mirrors internal/freezer/freeze_test.go) ----
@@ -39,7 +39,7 @@ func buildCLIFakes(t *testing.T) string {
 			cliFakeBin.err = err
 			return
 		}
-		src := "ebb/internal/freezer/testdata"
+		src := "github.com/0Cymantek0/ebb/internal/freezer/testdata"
 		for _, name := range []string{"fakedocker", "fakerestic"} {
 			suffix := ""
 			if os.PathSeparator == '\\' {

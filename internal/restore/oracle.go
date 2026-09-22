@@ -14,8 +14,8 @@ import (
 	"context"
 	"fmt"
 
-	"ebb/internal/domain"
-	"ebb/internal/inventory"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/inventory"
 )
 
 // verifyStaged scans the staged workspace tree with hashing and

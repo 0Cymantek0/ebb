@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Ls lists one snapshot's tree. Paths are restic tree paths

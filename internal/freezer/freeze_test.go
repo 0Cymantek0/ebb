@@ -25,9 +25,9 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	resticstore "ebb/internal/storage/restic"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	resticstore "github.com/0Cymantek0/ebb/internal/storage/restic"
 )
 
 // ---- fake binary management ----------------------------------------------
@@ -47,7 +47,7 @@ func buildFakes(t *testing.T) (binDir string) {
 			fakeBin.err = err
 			return
 		}
-		src := "ebb/internal/freezer/testdata"
+		src := "github.com/0Cymantek0/ebb/internal/freezer/testdata"
 		for _, name := range []string{"fakedocker", "fakerestic"} {
 			out := filepath.Join(dir, name+exeSuffix())
 			build := exec.Command("go", "build", "-o", out, src+"/"+name)

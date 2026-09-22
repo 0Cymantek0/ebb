@@ -35,11 +35,11 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/analyse"
-	"ebb/internal/config"
-	"ebb/internal/stats"
-	"ebb/internal/stats/card"
-	"ebb/internal/web"
+	"github.com/0Cymantek0/ebb/internal/analyse"
+	"github.com/0Cymantek0/ebb/internal/config"
+	"github.com/0Cymantek0/ebb/internal/stats"
+	"github.com/0Cymantek0/ebb/internal/stats/card"
+	"github.com/0Cymantek0/ebb/internal/web"
 )
 
 // statsScanBudget bounds the shallow clutter scan (~2s): the dashboard

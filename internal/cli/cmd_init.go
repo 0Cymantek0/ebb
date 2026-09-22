@@ -18,7 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 // initVault is the registered-vault view of the init result.

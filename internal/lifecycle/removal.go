@@ -32,7 +32,7 @@ import (
 	"strings"
 	"syscall"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // removalPermit is the operation-scoped removal authorization. It is

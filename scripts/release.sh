@@ -137,14 +137,14 @@ make_tgz() { # make_tgz <dir> <file-to-embed> <output.tar.gz>
 # configured target that fails to build fails the release.
 targets=${EBB_RELEASE_TARGETS:-windows/amd64 linux/amd64}
 outroot="dist/$version"
-ldflags="-s -w -X ebb/internal/version.Version=$version"
+ldflags="-s -w -X github.com/0Cymantek0/ebb/internal/version.Version=$version"
 
 # Version stamping is single-sourced: internal/version is an ordinary
 # (non-main) package, so go1.27's linker resolves its import path
 # normally and the -X above reliably stamps the build version every
 # surface reads (`ebb version` output, lifecycle manifests/receipts,
 # capsule metadata threaded through the CLI). The former dual
-# "-X main.Version -X ebb/cmd/ebb.Version" spelling is gone: cmd/ebb no
+# "-X main.Version -X github.com/0Cymantek0/ebb/cmd/ebb.Version" spelling is gone: cmd/ebb no
 # longer carries a version variable.
 
 echo "==> ebb release $version"

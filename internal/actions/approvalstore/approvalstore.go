@@ -46,8 +46,8 @@ import (
 	"syscall"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // docVersion is the approvals document schema version.

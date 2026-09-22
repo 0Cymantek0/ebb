@@ -29,7 +29,7 @@ import (
 	"fmt"
 	"strings"
 
-	"ebb/internal/config"
+	"github.com/0Cymantek0/ebb/internal/config"
 )
 
 // Stable CLI blocker codes for the config surface (§5.5). The

@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Action run status vocabulary (closed set enforced at the API edge).

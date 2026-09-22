@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/policy"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/policy"
 )
 
 // ErrPipPreserveDefault is returned by Recipe for the pip adapter:

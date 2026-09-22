@@ -18,7 +18,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // requireTool skips the test when bin is not on PATH.

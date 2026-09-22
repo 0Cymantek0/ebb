@@ -21,13 +21,13 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/capsule"
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
-	"ebb/internal/lifecycle"
-	"ebb/internal/platform"
-	"ebb/internal/restore"
-	"ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/capsule"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/platform"
+	"github.com/0Cymantek0/ebb/internal/restore"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 // ---- the import world ------------------------------------------------

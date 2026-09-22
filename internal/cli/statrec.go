@@ -35,7 +35,7 @@ import (
 	"fmt"
 	"strings"
 
-	"ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/catalog"
 )
 
 // envelopeSink receives the envelope of each emit() call made by the

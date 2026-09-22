@@ -10,7 +10,7 @@ import (
 	"sort"
 	"time"
 
-	"ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/catalog"
 )
 
 // Compute derives the dashboard metrics at the current wall clock. Use

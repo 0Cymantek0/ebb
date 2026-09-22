@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Prune asks the backend to reclaim storage that is no longer referenced

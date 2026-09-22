@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Verified-descent seam tests (SCAN-RACE-1). These exercise the

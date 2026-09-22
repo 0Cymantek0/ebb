@@ -4,7 +4,7 @@ import (
 	"os"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // ValidateRelPaths enforces the D003 capture-list contract client-side,

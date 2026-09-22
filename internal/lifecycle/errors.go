@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Typed errors of the lifecycle coordinator. Every failure that decides

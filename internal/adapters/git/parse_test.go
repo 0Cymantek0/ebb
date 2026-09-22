@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 func TestParsePorcelainV2Counts(t *testing.T) {

@@ -42,7 +42,7 @@ import (
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
 
-	"ebb/internal/stats"
+	"github.com/0Cymantek0/ebb/internal/stats"
 )
 
 // Canvas geometry in FINAL pixels. All drawing happens on a 2x

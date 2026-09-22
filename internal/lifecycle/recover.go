@@ -28,8 +28,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // RecoveryReport is the outcome of one reconciliation: what the operation

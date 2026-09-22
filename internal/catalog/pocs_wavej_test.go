@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // J4 — post-fix contract (wave C/F/G convention: the PoC flips to assert

@@ -25,7 +25,7 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/catalog"
 )
 
 func TestSealedQuarantineBlockedByCwdThenResumeDoor(t *testing.T) {

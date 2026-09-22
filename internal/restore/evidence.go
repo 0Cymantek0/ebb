@@ -14,8 +14,8 @@ import (
 	"fmt"
 	"time"
 
-	"ebb/internal/catalog"
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/catalog"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // ReceiptFacts is the §16.4 seal receipt's verification evidence.

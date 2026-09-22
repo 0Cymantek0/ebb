@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // copy.go implements cross-repository snapshot copying for portable

@@ -34,7 +34,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"ebb/internal/pathcanon"
+	"github.com/0Cymantek0/ebb/internal/pathcanon"
 )
 
 // releaseWorkspaceCwd moves the process working directory out of the

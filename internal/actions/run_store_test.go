@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/actions"
-	"ebb/internal/actions/approvalstore"
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/actions/approvalstore"
 )
 
 // These tests wire the Runner to the real JSON FileApprover store to

@@ -3,7 +3,7 @@ package gitadapter
 import (
 	"strings"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // Parsers for the allowlisted commands' machine-readable outputs. They

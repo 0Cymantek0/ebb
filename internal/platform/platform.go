@@ -24,7 +24,7 @@ package platform
 import (
 	"errors"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // ErrUnsupported reports that the running platform (or its filesystem)

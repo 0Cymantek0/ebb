@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/actions"
 )
 
 // baseAction is the resolved triple (definition, tool, digests) the drift

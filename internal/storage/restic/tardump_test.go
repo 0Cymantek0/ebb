@@ -38,7 +38,7 @@ import (
 	"testing"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // ---- fake producer helper ----------------------------------------------

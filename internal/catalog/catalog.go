@@ -29,7 +29,7 @@ import (
 	// mechanism.
 	_ "modernc.org/sqlite"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // dsnSuffix carries the per-connection pragmas mandated by Foundation

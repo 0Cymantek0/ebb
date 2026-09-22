@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"ebb/internal/config"
-	"ebb/internal/vault"
+	"github.com/0Cymantek0/ebb/internal/config"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 func configFileOf(t *testing.T, dir string) string {

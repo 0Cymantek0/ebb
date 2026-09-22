@@ -26,10 +26,10 @@ import (
 	"os"
 	"strings"
 
-	"ebb/internal/capsule"
-	"ebb/internal/domain"
-	"ebb/internal/planner"
-	"ebb/internal/version"
+	"github.com/0Cymantek0/ebb/internal/capsule"
+	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/planner"
+	"github.com/0Cymantek0/ebb/internal/version"
 )
 
 func cmdInspect(args []string, streams Streams, deps Deps) int {

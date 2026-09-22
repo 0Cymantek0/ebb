@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/domain"
 )
 
 // replicas.go records VERIFIED independent recovery copies (Foundation
