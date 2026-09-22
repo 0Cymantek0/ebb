@@ -17,12 +17,14 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 	"ebb/internal/stats"
+	"ebb/internal/vault"
 	"ebb/internal/web"
 )
 
@@ -110,12 +112,18 @@ func (p *statsWebProvider) History(limit int) ([]web.HistoryEvent, error) {
 	return out, nil
 }
 
-// SnapshotTree lists one snapshot's payload tree through the SAME
-// hardened vault passfile machinery every store read uses (the password
-// reaches the backend only via the ephemeral passfile; Foundation
-// §13.1). The web server has already validated the id's shape
-// server-side; here it must still resolve against the catalog — an id
-// that is well-formed but unknown is an honest error, not empty data.
+// SnapshotTree lists one snapshot's payload tree through the hardened
+// vault passfile machinery every store read uses (the password reaches
+// the backend only via the ephemeral passfile; Foundation §13.1) — but
+// resolved NON-interactively: a request handler must never block on
+// terminal I/O, so the credential comes from env or the OS keyring
+// only (wave-4 K3; withVaultPassfileNonInteractive). When no such
+// source holds the secret the facet refuses honestly with the §5.5
+// vault-locked wording instead of hanging the handler on a prompt the
+// browser user never sees. The web server has already validated the
+// id's shape server-side; here it must still resolve against the
+// catalog — an id that is well-formed but unknown is an honest error,
+// not empty data.
 func (p *statsWebProvider) SnapshotTree(id string) ([]web.TreeEntryView, error) {
 	snapID, perr := domain.ParseID(id)
 	if perr != nil {
@@ -132,11 +140,19 @@ func (p *statsWebProvider) SnapshotTree(id string) ([]web.TreeEntryView, error) 
 		return nil, fmt.Errorf("snapshot %s: no payload was captured under this id", id)
 	}
 	var entries []domain.TreeEntry
-	if verr := p.sess.withVaultPassfile(p.ctx, func(repoDir, passfile string) error {
+	if verr := p.sess.withVaultPassfileNonInteractive(p.ctx, func(repoDir, passfile string) error {
 		var err error
 		entries, err = p.sess.store.Ls(p.ctx, repoDir, passfile, snap.PayloadBackendID)
 		return err
 	}); verr != nil {
+		var locked *vault.NoSourceError
+		if errors.As(verr, &locked) {
+			// The vault-locked refusal already carries the §5.5 guidance
+			// (set EBB_VAULT_PASSWORD / store the password in the OS
+			// keyring) and the vault id; the facet names its own
+			// unavailability rather than burying it under "listing".
+			return nil, fmt.Errorf("snapshot tree unavailable: vault locked — %v", verr)
+		}
 		return nil, fmt.Errorf("listing snapshot %s: %v", id, verr)
 	}
 	out := make([]web.TreeEntryView, 0, len(entries))

@@ -22,6 +22,7 @@ import (
 	"ebb/internal/catalog"
 	"ebb/internal/domain"
 	"ebb/internal/stats"
+	"ebb/internal/vault"
 	"ebb/internal/web"
 )
 
@@ -352,6 +353,72 @@ func TestStatsWebProviderSnapshotTree(t *testing.T) {
 	// Malformed ids are refused before the catalog.
 	if _, err := newProvider(t, h).SnapshotTree("deadbeef;rm"); err == nil {
 		t.Error("malformed snapshot id returned no error")
+	}
+}
+
+// TestStatsWebProviderSnapshotTreeVaultLockedRefusal is the wave-4 K3
+// regression: with NO credential source available (env unset, no
+// OS-keyring entry for the harness's randomly-id'd vault),
+// SnapshotTree must refuse QUICKLY with the honest vault-locked wording
+// naming both background fixes (EBB_VAULT_PASSWORD / OS keyring) and
+// the vault id — never block a request handler on the terminal prompt
+// rung that Password would open on a TTY stdin. The vault-level tests
+// (TestPasswordNonInteractiveRefusesEvenOnTTY) pin the no-prompt
+// structurally; this pins the provider seam and the message.
+func TestStatsWebProviderSnapshotTreeVaultLockedRefusal(t *testing.T) {
+	h := newEHarness(t)
+	snapID, _ := seedWebWorld(t, h)
+	def, err := vault.New(filepath.Join(h.stateDir, vault.RegistryFile)).Default()
+	if err != nil {
+		t.Fatalf("read default vault: %v", err)
+	}
+	p := newProvider(t, h)
+
+	// Happy path first, with the harness's env credential in place: the
+	// same provider lists entries normally.
+	if entries, err := p.SnapshotTree(string(snapID)); err != nil || len(entries) == 0 {
+		t.Fatalf("happy path with env credential: entries=%d err=%v (must list)", len(entries), err)
+	}
+
+	// Neutralize the env source the harness seeded. t.Setenv cannot
+	// reliably UNSET on every platform, so the chain's documented
+	// contract is used instead: an EMPTY EBB_VAULT_PASSWORD means unset
+	// (envPassword in internal/vault — the same technique as the vault
+	// package's own tests). The keyring rung finds no entry for the
+	// random vault id (the vault seams are package-private by design,
+	// so this lookup hits the real store read-only; nothing is written).
+	t.Setenv(vault.EnvPassword, "")
+
+	type treeResult struct {
+		entries []web.TreeEntryView
+		err     error
+	}
+	done := make(chan treeResult, 1)
+	go func() {
+		entries, err := p.SnapshotTree(string(snapID))
+		done <- treeResult{entries: entries, err: err}
+	}()
+	select {
+	case res := <-done:
+		if res.err == nil {
+			t.Fatalf("no credential source must refuse, got %d entries", len(res.entries))
+		}
+		if len(res.entries) != 0 {
+			t.Errorf("refusal must carry no partial entries: %v", res.entries)
+		}
+		msg := res.err.Error()
+		for _, want := range []string{
+			"snapshot tree unavailable: vault locked",
+			vault.EnvPassword,
+			"keyring",
+			def.ID,
+		} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("refusal %q lacks %q", msg, want)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SnapshotTree blocked on credential resolution — the prompt rung must be absent from the web facet's chain")
 	}
 }
 

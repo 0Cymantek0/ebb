@@ -126,6 +126,41 @@ func (s *session) withVaultPassfile(ctx context.Context, fn func(repoDir, passfi
 	return s.withVaultPassfileOf(ctx, v, fn)
 }
 
+// withVaultPassfileNonInteractive mirrors withVaultPassfile for
+// request-handler contexts (the web control center's facets): the same
+// default-vault resolution and the same ephemeral passfile contract,
+// but the unlock secret is resolved through
+// vault.WithPassfileNonInteractive — env or OS keyring ONLY — so a
+// handler can never block on the invisible terminal prompt that
+// Password's last rung would open on a TTY stdin (wave-4 K3: a lazy
+// prompt inside /api/tree froze the first request). When no
+// non-interactive source holds the secret, the failure is the §5.5
+// vault blocker (exit-7 family) naming the two fixes a background read
+// can use: set EBB_VAULT_PASSWORD or store the vault password in the
+// OS keyring. It deliberately does NOT replace withVaultPassfile:
+// interactive commands keep their prompt.
+func (s *session) withVaultPassfileNonInteractive(ctx context.Context, fn func(repoDir, passfile string) error) error {
+	v, err := s.defaultVault()
+	if err != nil {
+		return err
+	}
+	err = vault.WithPassfileNonInteractive(v.ID, func(passfilePath string) error {
+		return fn(v.RepoDir, passfilePath)
+	})
+	if err != nil {
+		var noSource *vault.NoSourceError
+		if errors.As(err, &noSource) {
+			// %w (not %v) keeps the typed cause reachable through the
+			// §5.5 wrap, so callers can distinguish this refusal from
+			// store failures without matching message text.
+			return vaultError(fmt.Errorf("%s: vault %s (%s) is locked and a background read cannot unlock it: %w. Safe action: set %s or store the vault password in the OS keyring (via `ebb init`) — the web control center never prompts a terminal",
+				CodeUnlockRejected, v.Name, v.ID, noSource, vault.EnvPassword))
+		}
+		return err
+	}
+	return nil
+}
+
 // resolveVault resolves a vault by registry id or name (the same
 // resolution `ebb forget`'s session machinery uses for the default; gc
 // takes an explicit <vault> argument). An unknown name is a usage-class
