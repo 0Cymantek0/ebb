@@ -3,12 +3,14 @@
 #
 # Target of:  curl -fsSL https://get.ebb.dev | sh
 #
-# Downloads the ebb-<version>-linux-amd64.tar.gz release archive AND the
-# release SHA256SUMS.txt, verifies the archive SHA256 against the matching
-# SHA256SUMS line (always — no unverified download is ever executed or
-# installed), installs the binary to ~/.local/bin, prints exact PATH fix
-# instructions if that directory is not on PATH, and prints the installed
-# version.
+# Downloads the ebb-v<version>-linux-amd64.tar.gz release archive AND the
+# release SHA256SUMS.txt (the archive FILENAME carries the full tag with
+# the leading v, exactly as scripts/release.sh names it; the URL's
+# download/<tag>/ directory also keeps the v), verifies the archive SHA256
+# against the matching SHA256SUMS line (always — no unverified download is
+# ever executed or installed), installs the binary to ~/.local/bin, prints
+# exact PATH fix instructions if that directory is not on PATH, and prints
+# the installed version.
 #
 # The tar member is ebb-linux-amd64 (archive-member name defined by
 # scripts/release.sh); it is installed as ~/.local/bin/ebb.
@@ -93,14 +95,17 @@ else
 	[ -n "$tag" ] || die 'could not determine the latest release tag'
 fi
 
-case $tag in
-	v[0-9]*.[0-9]*.[0-9]*) ;;
-	*) die "invalid release tag '$tag'" ;;
-esac
-plain=${tag#v}
+# Anchored release-tag gate (the same regex family scripts/release.sh and
+# install.ps1 use). A shell `case` GLOB must not be used here: a glob '*'
+# matches '/' too, so a traversal tag like 'v0.1.0/../../attacker' would
+# pass and flow into the download URL and the local output filename.
+printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$' \
+	|| die "invalid release tag '$tag' (want vMAJOR.MINOR.PATCH[-suffix], e.g. v0.1.0)"
 
 download_base=${EBB_DOWNLOAD_BASE:-$REPO_URL/releases/download}
-archive="ebb-$plain-$plat.tar.gz"
+# The archive FILENAME carries the full tag with the leading v
+# (ebb-v0.1.0-linux-amd64.tar.gz), exactly as scripts/release.sh names it.
+archive="ebb-$tag-$plat.tar.gz"
 
 # ---- download + verify + install --------------------------------------------
 
@@ -116,8 +121,13 @@ fetch "$download_base/$tag/SHA256SUMS.txt" SHA256SUMS.txt
 
 step 'verifying SHA256 against SHA256SUMS.txt'
 # Tolerate both "hash  file" (GNU/Linux) and "hash *file" (binary-mode
-# marker, e.g. Git Bash sha256sum/shasum) line spellings.
-expected=$(sed -n "s/^\([0-9A-Fa-f]\{64\}\)[[:space:]]*\*\?[[:space:]]*\($archive\)\$/\1/p" SHA256SUMS.txt)
+# marker, e.g. Git Bash sha256sum/shasum) line spellings. The archive name
+# is regex-escaped before interpolation so the pattern below can only match
+# a SUMS line naming EXACTLY this file — a tag carrying regex
+# metacharacters (belt-and-braces with the anchored gate above) must never
+# widen the match to a different archive's line.
+arch_pat=$(printf '%s' "$archive" | sed 's/[^0-9A-Za-z_-]/\\&/g')
+expected=$(sed -n "s/^\([0-9A-Fa-f]\{64\}\)[[:space:]]*\*\?[[:space:]]*\($arch_pat\)\$/\1/p" SHA256SUMS.txt)
 if [ -z "$expected" ]; then
 	die "no SHA256SUMS line matches '$archive'; refusing"
 fi
