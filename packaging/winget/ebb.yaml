@@ -15,9 +15,9 @@
 #   3. `Ebb.Ebb` is unique in winget-pkgs as of authoring; verify with
 #      `winget search --id Ebb.Ebb` before submitting.
 #
-# File name in the winget-pkgs PR: manifests/e/Ebb/Ebb/0.1.0/Ebb.Ebb.yaml
+# File name in the winget-pkgs PR: manifests/e/Ebb/Ebb/0.1.0-alpha/Ebb.Ebb.yaml
 PackageIdentifier: Ebb.Ebb
-PackageVersion: 0.1.0
+PackageVersion: 0.1.0-alpha
 DefaultLocale: en-US
 ManifestType: version
 ManifestVersion: 1.12.0

@@ -22,9 +22,9 @@
 #      consistent with the PackageIdentifier in ebb.yaml.
 #   4. PackageVersion must match ebb.yaml / ebb.installer.yaml exactly.
 #
-# File name in the winget-pkgs PR: manifests/e/Ebb/Ebb/0.1.0/Ebb.Ebb.locale.en-US.yaml
+# File name in the winget-pkgs PR: manifests/e/Ebb/Ebb/0.1.0-alpha/Ebb.Ebb.locale.en-US.yaml
 PackageIdentifier: Ebb.Ebb
-PackageVersion: 0.1.0
+PackageVersion: 0.1.0-alpha
 PackageLocale: en-US
 Publisher: Ebb
 PublisherUrl: https://github.com/OWNER/ebb
@@ -51,6 +51,6 @@ Tags:
   - backup
   - git
   - restic
-ReleaseNotesUrl: https://github.com/OWNER/ebb/releases/tag/v0.1.0
+ReleaseNotesUrl: https://github.com/OWNER/ebb/releases/tag/v0.1.0-alpha
 ManifestType: defaultLocale
 ManifestVersion: 1.12.0

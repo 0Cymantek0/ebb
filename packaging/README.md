@@ -48,7 +48,17 @@ Search for these markers; every occurrence is deliberate:
 | `OWNER` (in `github.com/OWNER/ebb`) | all files except install.sh comments; scoop JSON cannot carry comments, hence README | the real GitHub owner/org slug. The repo had **no git remote** when these templates were written — set one first (`git remote add origin https://github.com/<owner>/ebb.git`) |
 | `0000...0` (64 zeros) | winget installer `InstallerSha256`; scoop `url` hash | real SHA256 of the archive (from the release `SHA256SUMS.txt` line) |
 | `Ebb.Ebb` / `Publisher: Ebb` | winget manifests | keep, or change to the real publisher identity — must be consistent across all three files and unique in winget-pkgs |
-| `0.1.0` / `v0.1.0` | everywhere | the version being published |
+
+The first release version is DECIDED (2026-09-22): **v0.1.0-alpha** (tag)
+/ `0.1.0-alpha` (package version). The manifests already spell it. Later
+releases bump every occurrence together: the winget `PackageVersion` in
+all three manifests plus the PR-folder path in their header comments, the
+winget `InstallerUrl` and `ReleaseNotesUrl`, the scoop `version` and
+static `url`. The installers take the tag dynamically, so only these
+manifest spots and the release tag itself move. Prerelease suffixes are
+safe end to end: the version gates in `release.sh` and both installers
+accept `-suffix`, the scoop `checkver` regex captures it, and the rig's
+`TestD*` probes pin the whole chain.
 
 The license is DECIDED (2026-09-22): Apache-2.0 with the Commons Clause
 v1.0 condition — source-available, not OSI open source. The repo-root

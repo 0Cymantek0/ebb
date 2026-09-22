@@ -126,14 +126,12 @@ ykey() { # ykey <file> <label> <expected-key-line> (tolerates a leading "- " lis
 
 echo "[winget/ebb.yaml] (version manifest)"
 ykey ebb.yaml ebb.yaml 'PackageIdentifier: Ebb.Ebb'
-ykey ebb.yaml ebb.yaml 'PackageVersion: 0\.1\.0'
 ykey ebb.yaml ebb.yaml 'DefaultLocale: en-US'
 ykey ebb.yaml ebb.yaml 'ManifestType: version'
 ykey ebb.yaml ebb.yaml 'ManifestVersion: 1\.12\.0'
 
 echo "[winget/ebb.installer.yaml] (installer manifest)"
 ykey ebb.installer.yaml ebb.installer.yaml 'PackageIdentifier: Ebb.Ebb'
-ykey ebb.installer.yaml ebb.installer.yaml 'PackageVersion: 0\.1\.0'
 ykey ebb.installer.yaml ebb.installer.yaml 'Architecture: x64'
 ykey ebb.installer.yaml ebb.installer.yaml 'InstallerType: zip'
 ykey ebb.installer.yaml ebb.installer.yaml 'NestedInstallerType: portable'
@@ -150,14 +148,45 @@ fi
 
 echo "[winget/ebb.locale.en-US.yaml] (defaultLocale manifest)"
 ykey ebb.locale.en-US.yaml locale 'PackageIdentifier: Ebb.Ebb'
-ykey ebb.locale.en-US.yaml locale 'PackageVersion: 0\.1\.0'
 ykey ebb.locale.en-US.yaml locale 'PackageLocale: en-US'
 ykey ebb.locale.en-US.yaml locale 'Publisher: Ebb'
 ykey ebb.locale.en-US.yaml locale 'PackageName: Ebb'
-ykey ebb.locale.en-US.yaml locale 'License: __PENDING__'
+ykey ebb.locale.en-US.yaml locale 'License: Apache-2\.0 with Commons Clause'
+ykey ebb.locale.en-US.yaml locale 'LicenseUrl: .*'
 ykey ebb.locale.en-US.yaml locale 'ShortDescription: .*'
 ykey ebb.locale.en-US.yaml locale 'ManifestType: defaultLocale'
 ykey ebb.locale.en-US.yaml locale 'ManifestVersion: 1\.12\.0'
+
+# ---- version agreement across every consumer (the D1 discipline) -----------
+# No version literal is hardcoded here: the three winget manifests, the
+# winget InstallerUrl, the scoop version and its static url must all spell
+# THE SAME version, whatever it is (including prerelease suffixes like
+# 0.1.0-alpha). A release bumps the manifests; this check never moves.
+wver() { sed -n 's/^[[:space:]]*PackageVersion:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' "$here/winget/$1" | head -1; }
+v_ver=$(wver ebb.yaml)
+i_ver=$(wver ebb.installer.yaml)
+l_ver=$(wver ebb.locale.en-US.yaml)
+if [ -n "$v_ver" ] && [ "$v_ver" = "$i_ver" ] && [ "$v_ver" = "$l_ver" ]; then
+	pass "winget PackageVersion agrees across all three manifests ($v_ver)"
+else
+	fail "winget PackageVersion disagrees (version=$v_ver installer=$i_ver locale=$l_ver)"
+fi
+if grep -Eq "^[[:space:]]*InstallerUrl: .*download/v$v_ver/ebb-v$v_ver-windows-amd64\.zip\$" "$here/winget/ebb.installer.yaml"; then
+	pass "InstallerUrl spells the manifest version in dir and filename"
+else
+	fail "InstallerUrl does not match PackageVersion $v_ver (dir and/or filename)"
+fi
+s_ver=$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*$/\1/p' "$here/scoop/ebb.json" | head -1)
+if [ -n "$s_ver" ] && [ "$s_ver" = "$v_ver" ]; then
+	pass "scoop version matches winget PackageVersion ($s_ver)"
+else
+	fail "scoop version '$s_ver' != winget PackageVersion '$v_ver'"
+fi
+if grep -q "download/v$s_ver/ebb-v$s_ver-windows-amd64\.zip" "$here/scoop/ebb.json"; then
+	pass "scoop static url spells the manifest version in dir and filename"
+else
+	fail "scoop static url does not match its own version $s_ver"
+fi
 
 # ---- placeholder inventory (expected UNFILLED before a release) -------------
 

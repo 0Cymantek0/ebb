@@ -32,9 +32,9 @@
 #      winget-pkgs validation; it must never be submitted as-is.
 #   3. PackageVersion and PackageIdentifier must match ebb.yaml exactly.
 #
-# File name in the winget-pkgs PR: manifests/e/Ebb/Ebb/0.1.0/Ebb.Ebb.installer.yaml
+# File name in the winget-pkgs PR: manifests/e/Ebb/Ebb/0.1.0-alpha/Ebb.Ebb.installer.yaml
 PackageIdentifier: Ebb.Ebb
-PackageVersion: 0.1.0
+PackageVersion: 0.1.0-alpha
 InstallerLocale: en-US
 Platform:
   - Windows.Desktop
@@ -45,7 +45,7 @@ Installers:
     NestedInstallerFiles:
       - RelativeFilePath: ebb-windows-amd64.exe
         PortableCommandAlias: ebb
-    InstallerUrl: https://github.com/OWNER/ebb/releases/download/v0.1.0/ebb-v0.1.0-windows-amd64.zip
+    InstallerUrl: https://github.com/OWNER/ebb/releases/download/v0.1.0-alpha/ebb-v0.1.0-alpha-windows-amd64.zip
     InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
     Commands:
       - ebb
