@@ -55,6 +55,12 @@ type eFakeStore struct {
 	// bound vault, not the default".
 	listRepoDirs   []string
 	forgetRepoDirs []string
+
+	// repoIDFn, when set, replaces the reported backend repository
+	// identity (the replaced-repository regression seam): it receives
+	// the repoDir of the vault being probed. Nil keeps the fixture's
+	// constant "ecli-fake-repo".
+	repoIDFn func(repoDir string) (string, error)
 }
 
 func newEFakeStore() *eFakeStore {
@@ -64,6 +70,11 @@ func newEFakeStore() *eFakeStore {
 func (s *eFakeStore) Init(ctx context.Context, dir, passfile string) error { return nil }
 
 func (s *eFakeStore) RepoID(ctx context.Context, repoDir, passfile string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.repoIDFn != nil {
+		return s.repoIDFn(repoDir)
+	}
 	return "ecli-fake-repo", nil
 }
 

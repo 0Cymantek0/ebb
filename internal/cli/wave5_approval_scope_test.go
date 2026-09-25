@@ -153,7 +153,8 @@ func TestLegacyApproveStillAuthorizesLegacyPending(t *testing.T) {
 			return "", fmt.Errorf("headless consent must not read stdin")
 		},
 	}
-	base := openApprovalResolver(deps, Streams{Err: errb}, false, false, store)
+	base := openApprovalResolver(deps, Streams{Err: errb}, false, false, store,
+		"rerun with --yes to record the approval, or run in a terminal to review the actions first")
 	resolver := restoreLegacyApprovalResolver(deps, Streams{Err: errb}, true, false, store, base)
 
 	if err := resolver(context.Background(), []restore.PendingApproval{legacyPendingWithIdentity()}); err != nil {
@@ -264,6 +265,62 @@ func TestOpenJSONOnTTYMissingApprovalNeverPrompts(t *testing.T) {
 	}
 	if reads := *reads; reads != 0 {
 		t.Errorf("machine mode read stdin %d time(s); zero reads are required", reads)
+	}
+	if runner.count() != 0 {
+		t.Errorf("nothing may run without a resolved approval; runner calls = %d", runner.count())
+	}
+}
+
+// TestRestoreHeadlessMissingApprovalNamesRealAction (the small-B
+// regression): restore has NO --yes flag, but its headless
+// missing-approval guidance (inherited verbatim from open's grouped
+// resolver) said "rerun with --yes" — a flag that does not exist on
+// `ebb restore`. The message must name a REAL remediation (approve
+// interactively in a terminal) and must never mention --yes.
+func TestRestoreHeadlessMissingApprovalNamesRealAction(t *testing.T) {
+	h, runner := newRestoreHarness(t)
+	trimCliws(t, h)
+	dropTrimApprovals(t, h)
+	h.tty = false
+
+	code, _, stderr := h.run("restore", h.wsRoot)
+	if code != ExitBlocked {
+		t.Fatalf("restore headless with a missing approval code = %d, want blocked (3); stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stderr, CodeApprovalRequired) {
+		t.Errorf("stderr must carry the approval-required code:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "--yes") {
+		t.Errorf("restore's guidance recommends --yes, a flag `ebb restore` does not have:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "terminal") {
+		t.Errorf("guidance must name the real remediation (interactive approval in a terminal):\n%s", stderr)
+	}
+	if runner.count() != 0 {
+		t.Errorf("nothing may run without a resolved approval; runner calls = %d", runner.count())
+	}
+}
+
+// TestOpenHeadlessMissingApprovalStillNamesItsYesFlag (small-B's other
+// half): `ebb open` HAS --yes, and its headless missing-approval
+// guidance must keep recommending it — parameterizing the guidance must
+// not lose open's honest wording.
+func TestOpenHeadlessMissingApprovalStillNamesItsYesFlag(t *testing.T) {
+	h := newGHarness(t)
+	parkG(t, h)
+	runner := &gRunner{}
+	withRunner(h, runner)
+	h.tty = false
+
+	code, _, stderr := h.run("open", "cliws", "--to", gDest(t))
+	if code != ExitRebuildFailed {
+		t.Fatalf("open headless with a missing approval code = %d, want rebuild-blocked (6); stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stderr, CodeApprovalRequired) {
+		t.Errorf("stderr must carry the approval-required code:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "rerun with --yes") {
+		t.Errorf("open's guidance must keep recommending its real --yes flag:\n%s", stderr)
 	}
 	if runner.count() != 0 {
 		t.Errorf("nothing may run without a resolved approval; runner calls = %d", runner.count())

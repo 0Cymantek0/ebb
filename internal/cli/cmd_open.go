@@ -371,7 +371,8 @@ func newOpenOpener(deps Deps, sess *session, streams Streams, withRebuild, yes, 
 		store := approvalstore.New(sess.approvalsPath())
 		d.Runner = runner
 		d.Approver = store
-		d.Approve = openApprovalResolver(deps, streams, yes, jsonOut, store)
+		d.Approve = openApprovalResolver(deps, streams, yes, jsonOut, store,
+			"rerun with --yes to record the approval, or run in a terminal to review the actions first")
 	}
 	opener, err := deps.NewRestoreOp(d)
 	if err != nil {
@@ -402,7 +403,13 @@ func newActionRunner(deps Deps) restore.ActionRunner {
 // machine mode behaves exactly like a missing terminal — missing
 // approvals and drift refuse with their typed errors and no line is
 // ever read. Explicit --yes is unaffected (flag consent is not a prompt).
-func openApprovalResolver(deps Deps, streams Streams, yes, machine bool, store *approvalstore.FileApprover) restore.ApprovalResolver {
+// freshApprovalSafeAction is the remediation clause for the
+// missing-fresh-approval refusal, owned by the CALLER because the
+// honest advice differs by command: open HAS --yes and recommends it;
+// restore has no --yes, so its clause names only the real remediation
+// (approve interactively in a terminal) — a guidance string must never
+// recommend a flag the command does not have.
+func openApprovalResolver(deps Deps, streams Streams, yes, machine bool, store *approvalstore.FileApprover, freshApprovalSafeAction string) restore.ApprovalResolver {
 	return func(ctx context.Context, pending []restore.PendingApproval) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -423,10 +430,12 @@ func openApprovalResolver(deps Deps, streams Streams, yes, machine bool, store *
 			return fmt.Errorf("%s: %d recorded approval(s) no longer match the action (drift) and stdin is not a terminal, so the required re-approval cannot be asked. Safe action: rerun in a terminal and re-approve after reviewing the drift",
 				CodeApprovalDrift, len(stale))
 		}
-		// Fresh approvals need --yes or a terminal.
+		// Fresh approvals need --yes or a terminal; the safe action names
+		// the CALLER's real consent path (open's --yes; restore's
+		// interactive approval — never a nonexistent flag).
 		if len(required) > 0 && !yes && !interactive {
-			return fmt.Errorf("%s: %d action(s) have no recorded approval and stdin is not a terminal. Safe action: rerun with --yes to record the approval, or run in a terminal to review the actions first",
-				CodeApprovalRequired, len(required))
+			return fmt.Errorf("%s: %d action(s) have no recorded approval and stdin is not a terminal. Safe action: %s",
+				CodeApprovalRequired, len(required), freshApprovalSafeAction)
 		}
 
 		// What is confirmed interactively? With --yes the never-approved

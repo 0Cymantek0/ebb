@@ -48,8 +48,10 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/0Cymantek0/ebb/internal/catalog"
@@ -64,6 +66,7 @@ const (
 	CodeDeleteUnknownTarget   = "EBB_E_DELETE_UNKNOWN_TARGET"
 	CodeDeleteUnconfirmed     = "EBB_E_DELETE_UNCONFIRM"
 	CodeDeleteActiveOperation = "EBB_E_DELETE_ACTIVE_OPERATION"
+	CodeDeleteForeignVault    = "EBB_E_DELETE_FOREIGN_VAULT"
 )
 
 // deleteSnapshotDetails is one snapshot's outcome inside the --json
@@ -77,6 +80,10 @@ type deleteSnapshotDetails struct {
 	IntentID          string `json:"intent_id,omitempty"`
 	PairAlreadyAbsent bool   `json:"pair_already_absent,omitempty"`
 	StateReached      string `json:"state_reached"`
+	// RetainedSharedIDs: backend ids of THIS snapshot that were KEPT in
+	// the vault because other retained snapshot rows still share them
+	// (reference-aware deletion; forget's P0-1 honesty, per target).
+	RetainedSharedIDs []string `json:"retained_shared_ids,omitempty"`
 }
 
 // deletePruneDetails is the prune stage's outcome: ran, or skipped
@@ -110,6 +117,13 @@ type deleteDetails struct {
 
 	Snapshots []deleteSnapshotDetails `json:"snapshots"`
 	Prune     deletePruneDetails      `json:"prune"`
+
+	// RetainedSharedIDs aggregates, across the run's snapshots, every
+	// backend id KEPT in the vault because other retained snapshot rows
+	// still share it (reference-aware deletion). Non-empty means the
+	// deletion released the targets' obligations WITHOUT physically
+	// removing every id — the receipts say so.
+	RetainedSharedIDs []string `json:"retained_shared_ids,omitempty"`
 
 	// StateReached names the last durable forget step completed across
 	// the run ("" until a mutation lands; "completed" on success).
@@ -223,6 +237,30 @@ func cmdDelete(args []string, streams Streams, deps Deps) int {
 		return emitFailure(env, *jsonOut, streams, classifyExitCode(verr), verr.Error())
 	}
 
+	// P0 (wrong-vault false success): every target below would run
+	// against THIS default vault. A snapshot bound (import --vault) to a
+	// non-default vault would be "already absent" here — unpinned, its
+	// retention intent completed, exit 0 — while its bytes sit untouched
+	// in their own vault. Refuse any target set that is not ENTIRELY
+	// default-vault-bound (all-default proceeds; mixed refuses whole)
+	// and name the vault-safe per-snapshot path instead. (The minimal
+	// wave-5 fix; a vault-aware delete state machine is a later wave.)
+	foreign, ferr := foreignVaultTargets(sess, v, snaps)
+	if ferr != nil {
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(ferr),
+			fmt.Sprintf("delete %s: resolving the targets' bound vaults: %v", target, ferr))
+	}
+	if len(foreign) > 0 {
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s [delete %s]: %d of %d target snapshot(s) live in a NON-DEFAULT vault, so a delete against the default vault %q would find nothing to forget and still report success while their bytes stay in their own vault:",
+			CodeDeleteForeignVault, target, len(foreign), len(snaps), v.Name)
+		for _, f := range foreign {
+			fmt.Fprintf(&b, "\n  snapshot %s", f)
+		}
+		fmt.Fprintf(&b, ". Safe action: forget each snapshot against its own bound vault — `ebb forget <snapshot-id>` (forget resolves the SNAPSHOT'S bound vault and verifies the repository identity); a vault-aware delete may arrive in a later wave")
+		return emitFailure(env, *jsonOut, streams, ExitBlocked, b.String())
+	}
+
 	var pruneErr error
 	forgotAny := false // this run actually removed at least one backend pair
 	cErr := sess.withVaultPassfileOf(ctx, v, func(repoDir, passfile string) error {
@@ -281,6 +319,8 @@ func cmdDelete(args []string, streams Streams, deps Deps) int {
 				details.Snapshots[i].IntentID = fd.IntentID
 				details.Snapshots[i].PairAlreadyAbsent = fd.PairAlreadyAbsent
 				details.Snapshots[i].StateReached = fd.StateReached
+				details.Snapshots[i].RetainedSharedIDs = fd.RetainedSharedIDs
+				details.RetainedSharedIDs = append(details.RetainedSharedIDs, fd.RetainedSharedIDs...)
 				if !fd.PairAlreadyAbsent {
 					forgotAny = true
 				}
@@ -312,11 +352,25 @@ func cmdDelete(args []string, streams Streams, deps Deps) int {
 	if pruneErr != nil {
 		// Every forget completed: the deletion IS logically complete; the
 		// prune failure keeps its own class (gc's contract: 4 integrity,
-		// 7 vault) with the honest completion path named.
+		// 7 vault) with the honest completion path named. The state line
+		// stays truthful when reference-aware deletion kept shared ids.
+		stateLine := "the snapshots are forgotten and verified gone"
+		if len(details.RetainedSharedIDs) > 0 {
+			stateLine = "the snapshots are unpinned and their obligations released (shared backend ids kept; see the report)"
+		}
 		env.Details = details
 		return emitFailure(env, *jsonOut, streams, classifyExitCode(pruneErr), fmt.Sprintf(
-			"delete %s: the snapshots are forgotten and verified gone, but the prune stage failed: %s. Safe action: the deletion is logically complete; run `ebb gc %s` to reclaim the storage (it re-checks every gate and is idempotent)",
-			target, codedWithSafeAction(pruneErr), v.Name))
+			"delete %s: %s, but the prune stage failed: %s. Safe action: the deletion is logically complete; run `ebb gc %s` to reclaim the storage (it re-checks every gate and is idempotent)",
+			target, stateLine, codedWithSafeAction(pruneErr), v.Name))
+	}
+
+	// Reference-aware honesty (P0-1): name every id that was deliberately
+	// KEPT in the vault — the machine payload and the human receipt must
+	// never read as a full physical deletion when a retained row still
+	// shares ids with the forgotten targets.
+	for _, id := range details.RetainedSharedIDs {
+		env.Warnings = append(env.Warnings, fmt.Sprintf(
+			"backend snapshot %s was kept in the vault: other retained snapshot row(s) still share it (reference-aware delete; their recovery bytes are intact)", id))
 	}
 
 	env.Outcome = "ok"
@@ -331,6 +385,9 @@ func cmdDelete(args []string, streams Streams, deps Deps) int {
 		env.Conditions = []string{"dry-run"}
 	default:
 		env.Conditions = []string{"unpinned", "forgotten"}
+		if len(details.RetainedSharedIDs) > 0 {
+			env.Conditions = append(env.Conditions, "shared-ids-kept")
+		}
 		if details.Prune.Ran {
 			env.Conditions = append(env.Conditions, "pruned", "snapshots-verified-unchanged")
 		} else {
@@ -394,6 +451,34 @@ func resolveDeleteTarget(sess *session, target string) (catalog.Workspace, []cat
 		return catalog.Workspace{}, nil, blockedError(fmt.Errorf("delete %s: listing the workspace's snapshots: %v", target, serr))
 	}
 	return ws, snaps, nil
+}
+
+// foreignVaultTargets names the target snapshots whose vault binding
+// does not resolve to the default vault: bound to a non-default vault
+// row, or bound to a row that no longer exists (delete cannot prove
+// such a snapshot default-bound, so it refuses rather than guess).
+// Empty bindings are legacy default-vault rows and stay delete-eligible
+// (forget runs them against the default with the full identity
+// verification).
+func foreignVaultTargets(sess *session, def *vault.Vault, snaps []catalog.Snapshot) ([]string, error) {
+	var foreign []string
+	for _, s := range snaps {
+		if s.VaultID == "" {
+			continue
+		}
+		row, err := sess.cat.GetVault(s.VaultID)
+		if err != nil {
+			if errors.Is(err, catalog.ErrNotFound) {
+				foreign = append(foreign, fmt.Sprintf("%s is bound to vault %s, which has no catalog vault row", s.ID, s.VaultID))
+				continue
+			}
+			return nil, err
+		}
+		if filepath.Clean(row.Path) != filepath.Clean(def.RepoDir) {
+			foreign = append(foreign, fmt.Sprintf("%s is bound to vault %s at %s", s.ID, row.ID, row.Path))
+		}
+	}
+	return foreign, nil
 }
 
 // runDeletePrune runs gc's D022-gated prune for the vault, as a
@@ -517,6 +602,10 @@ func renderDeleteHuman(d deleteDetails, ws catalog.Workspace, vaultName string) 
 	}
 	if d.DryRun {
 		line("  dry run: no changes were made; %d snapshot(s) would be forgotten and pruned:\n", len(d.Snapshots))
+	} else if len(d.RetainedSharedIDs) > 0 {
+		// Reference-aware honesty (P0-1): shared ids were KEPT, so the
+		// batch was NOT "forgotten and verified gone" — say what happened.
+		line("  %d snapshot(s) unpinned and their retention obligations released:\n", len(d.Snapshots))
 	} else {
 		line("  %d snapshot(s) unpinned, forgotten and verified gone:\n", len(d.Snapshots))
 	}
@@ -526,6 +615,9 @@ func renderDeleteHuman(d deleteDetails, ws catalog.Workspace, vaultName string) 
 		} else {
 			line("    %s kind %s created %s\n", s.SnapshotID, s.Kind, s.CreatedAt)
 		}
+	}
+	for _, id := range d.RetainedSharedIDs {
+		line("  backend snapshot %s was KEPT in the vault: other retained snapshot(s) still share it; their recovery bytes are intact\n", id)
 	}
 	if d.ImpactKnown && d.PreservedBytes > 0 {
 		line("  released retained material: %s\n", HumanBytes(d.PreservedBytes))

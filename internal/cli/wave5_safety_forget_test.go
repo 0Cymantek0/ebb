@@ -24,7 +24,9 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -573,7 +575,9 @@ func TestForgetSharedPairDoesNotDeleteOthersBytes(t *testing.T) {
 
 // TestForgetPartiallySharedID: A→P1/S1, B→P1/S2. Forgetting A must
 // delete the unshared S1 but keep the shared P1 — the reference check
-// is per backend id, not per pair.
+// is per backend id, not per pair. The receipt must label the SLOTS
+// truthfully (small-A regression): the forgotten id is the SEAL, so the
+// line reads "S=<seal>" and never mislabels it "P=<seal>".
 func TestForgetPartiallySharedID(t *testing.T) {
 	h := newEHarness(t)
 	a := parkedOnlySnapshot(t, h)
@@ -588,6 +592,16 @@ func TestForgetPartiallySharedID(t *testing.T) {
 	}
 	if !backendPresent(h, a.PayloadBackendID) {
 		t.Fatal("shared payload P1 was deleted although another retained row still references it")
+	}
+	// The receipt names the forgotten SLOT correctly.
+	if !strings.Contains(stderr, "forgotten and verified gone: S="+a.SealBackendID+"\n") {
+		t.Errorf("receipt must label the forgotten seal id as S=:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "P="+a.SealBackendID) {
+		t.Errorf("receipt mislabels the forgotten seal id as P= (small-A):\n%s", stderr)
+	}
+	if !strings.Contains(stderr, a.PayloadBackendID+" was KEPT") {
+		t.Errorf("receipt must name the kept shared payload id:\n%s", stderr)
 	}
 }
 
@@ -706,4 +720,318 @@ func TestForgetCryptoVaultUnresolvableFailsClosed(t *testing.T) {
 	if pending, _ := h.cat().PendingRetentionIntents(); len(pending) != 0 {
 		t.Errorf("retention intents recorded despite the fail-closed refusal: %v", pending)
 	}
+}
+
+// ---- P0 (replaced-repo identity): authenticate the REPOSITORY, not the
+// path ---------------------------------------------------------------
+//
+// The catalog VaultID derives from repoID + path, and registry vaults
+// carry RepoID — but forgetVaultFor matched registry entries by PATH
+// only. A repository REPLACED at the same path (identity B where the
+// binding says A) passed the match; the forget then found nothing in B,
+// recorded "already absent", unpinned and completed the intent — a false
+// success while A's bytes sit wherever A went. The destructive path must
+// verify the ACTUAL backend identity (store.RepoID) against the binding
+// before any durable act.
+
+// TestForgetReplacedRepoAtSamePathRefuses (the money regression): the
+// catalog vault row records RepoA at path P; the backend NOW answering
+// at P reports RepoB. Forget must refuse blocked (EBB_E_NO_VAULT
+// family), leave the snapshot pinned, record no intent, and issue ZERO
+// Forget calls — and a later run with the honest backend succeeds.
+func TestForgetReplacedRepoAtSamePathRefuses(t *testing.T) {
+	h := newEHarness(t)
+	snap := forgettableSnapshot(t, h) // LIVE workspace keeps the parked guard out of play
+	base := filepath.Dir(h.stateDir)
+	_, v2Row := registerVaultAt(t, h, "vault2", filepath.Join(base, "vault2"))
+	bound := seedSealedRowInVault(t, h, snap.WorkspaceID, staleHex("aa"), staleHex("bb"), v2Row)
+
+	// The repository at the registered path was REPLACED: the backend
+	// now reports a different identity than the vault row recorded.
+	h.store.repoIDFn = func(repoDir string) (string, error) {
+		return "ecli-repo-B", nil
+	}
+
+	code, _, stderr := h.run("forget", string(bound.ID), "--yes")
+	if code != ExitBlocked {
+		t.Fatalf("code = %d, want %d — a replaced repository at the same path must not pass the path match (stderr %s)", code, ExitBlocked, stderr)
+	}
+	if !strings.Contains(stderr, CodeNoVault) || !strings.Contains(stderr, "ecli-repo-B") {
+		t.Errorf("refusal must carry the vault code and name the actual backend identity:\n%s", stderr)
+	}
+	// Zero Forget invocations anywhere; the pair is untouched.
+	if len(h.store.forgetRepoDirs) != 0 {
+		t.Fatalf("Forget ran against %v; a replaced-repo refusal must never reach the backend", h.store.forgetRepoDirs)
+	}
+	if !backendPresent(h, bound.PayloadBackendID) || !backendPresent(h, bound.SealBackendID) {
+		t.Fatal("the replaced-repo vault's pair was forgotten despite the refusal")
+	}
+	// The snapshot row stays pinned, no retention intent, no leftover
+	// active operation blocking the workspace.
+	if got, err := h.cat().GetSnapshot(bound.ID); err != nil || !got.Pinned {
+		t.Fatalf("snapshot row disturbed: %+v (%v)", got, err)
+	}
+	if pending, _ := h.cat().PendingRetentionIntents(); len(pending) != 0 {
+		t.Errorf("retention intents recorded despite the refusal: %v", pending)
+	}
+	ops, _ := h.cat().ListOperations(snap.WorkspaceID)
+	for _, op := range ops {
+		if op.Kind != catalog.OpKindForget {
+			continue
+		}
+		if op.Phase != catalog.PhaseCanceled && op.Phase != catalog.PhaseForgetDone {
+			t.Errorf("forget operation %s left active at %s after the refusal", op.ID, op.Phase)
+		}
+	}
+
+	// With the honest backend identity back, the same forget completes.
+	h.store.repoIDFn = nil
+	if code, _, stderr := h.run("forget", string(bound.ID), "--yes"); code != ExitOK {
+		t.Fatalf("post-fix rerun code = %d, want %d (stderr %s)", code, ExitOK, stderr)
+	}
+	if backendPresent(h, bound.PayloadBackendID) || backendPresent(h, bound.SealBackendID) {
+		t.Error("pair still present after the honest forget")
+	}
+}
+
+// TestForgetRepoIDUnreadableRefuses: the destructive path needs the
+// actual backend identity; when the store cannot report one, forget
+// refuses instead of acting on an unidentified repository.
+func TestForgetRepoIDUnreadableRefuses(t *testing.T) {
+	h := newEHarness(t)
+	snap := forgettableSnapshot(t, h)
+	base := filepath.Dir(h.stateDir)
+	_, v2Row := registerVaultAt(t, h, "vault2", filepath.Join(base, "vault2"))
+	bound := seedSealedRowInVault(t, h, snap.WorkspaceID, staleHex("cc"), staleHex("dd"), v2Row)
+
+	h.store.repoIDFn = func(repoDir string) (string, error) {
+		return "", fmt.Errorf("cat config: repository config file not found")
+	}
+
+	code, _, stderr := h.run("forget", string(bound.ID), "--yes")
+	if code != ExitBlocked {
+		t.Fatalf("code = %d, want %d (stderr %s)", code, ExitBlocked, stderr)
+	}
+	if !strings.Contains(stderr, CodeNoVault) {
+		t.Errorf("refusal must carry the vault code:\n%s", stderr)
+	}
+	if len(h.store.forgetRepoDirs) != 0 {
+		t.Fatalf("Forget ran against %v; an unidentified repository must not be forgotten to", h.store.forgetRepoDirs)
+	}
+	if got, err := h.cat().GetSnapshot(bound.ID); err != nil || !got.Pinned {
+		t.Fatalf("snapshot row disturbed: %+v (%v)", got, err)
+	}
+	if pending, _ := h.cat().PendingRetentionIntents(); len(pending) != 0 {
+		t.Errorf("retention intents recorded despite the refusal: %v", pending)
+	}
+}
+
+// ---- P0 (legacy empty binding): the resume is pinned to the CONCRETE
+// vault ----------------------------------------------------------------
+//
+// Rows predating vault binding carry VaultID=""; forget resolved them to
+// the CURRENT default but recorded vault_id="" on the operation row, so
+// a crash + a default-vault switch made the resumed forget adopt its row
+// ("" == "") and complete against a DIFFERENT repository. The first
+// resolution must stamp the concrete vault identity on the row, and
+// adoption must require the same concrete vault again.
+
+// mainVaultDir is the eHarness default vault's repo directory.
+func mainVaultDir(h *eHarness) string {
+	return filepath.Join(filepath.Dir(h.stateDir), "vault")
+}
+
+// legacyForgetTarget seeds a sealed pair with an EMPTY VaultID (the
+// legacy shape rows predating vault binding carry) on the harness's LIVE
+// workspace, and returns the row.
+func legacyForgetTarget(t *testing.T, h *eHarness) catalog.Snapshot {
+	t.Helper()
+	live := forgettableSnapshot(t, h) // keeps the workspace LIVE (guard quiet)
+	row := catalog.Snapshot{
+		ID:               domain.SnapshotID(domain.NewID()),
+		WorkspaceID:      live.WorkspaceID,
+		PayloadBackendID: staleHex("1a"),
+		SealBackendID:    staleHex("2b"),
+		VaultID:          "", // the legacy empty binding
+		Kind:             catalog.SnapshotKindSnapshot,
+		Pinned:           true,
+	}
+	if _, err := h.cat().RecordSnapshot(row); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	for _, id := range []string{row.PayloadBackendID, row.SealBackendID} {
+		h.store.snaps[id] = &eFakeSnap{
+			files: map[string][]byte{}, dirs: map[string]bool{}, links: map[string]string{},
+		}
+	}
+	return row
+}
+
+// seedLegacyForgetCrashAtIntent reconstructs, through the same public
+// catalog API the command uses, a forget of the legacy row crashed at
+// INTENT_RECORDED — stamped (per the fix) with the CONCRETE vault
+// identity the first run resolved, or with "" for the pre-fix row shape.
+func seedLegacyForgetCrashAtIntent(t *testing.T, h *eHarness, row catalog.Snapshot, stampedVaultID domain.VaultID) domain.OperationID {
+	t.Helper()
+	op, err := h.cat().BeginOperationIfNoActive(row.WorkspaceID, catalog.OpKindForget, catalog.PhaseForgetPlanned)
+	if err != nil {
+		t.Fatalf("seed: begin forget op: %v", err)
+	}
+	if err := h.cat().SetForgetTarget(op.ID, string(row.ID), row.PayloadBackendID, row.SealBackendID, string(stampedVaultID)); err != nil {
+		t.Fatalf("seed: forget target: %v", err)
+	}
+	if _, err := h.cat().CreateRetentionIntent(row.ID, "user:forget"); err != nil {
+		t.Fatalf("seed: retention intent: %v", err)
+	}
+	if err := h.cat().AdvanceOperation(op.ID, catalog.PhaseForgetPlanned, catalog.PhaseForgetIntentRecorded); err != nil {
+		t.Fatalf("seed: advance to intent-recorded: %v", err)
+	}
+	return op.ID
+}
+
+// switchDefaultVault rewrites the registry document so vault2 becomes
+// the "main" (explicit-default) entry and the old main is renamed aside;
+// restore=true inverts it exactly (main→vault2, old-main→main). The
+// round-trip preserves every registry field — a stamped concrete vault
+// id must survive the fixture itself. (The "user switched the default
+// vault between the crash and the rerun" fixture; vaults.json is a
+// plain JSON document, edited the way the approval-tamper fixtures edit
+// approvals.json.)
+func switchDefaultVault(t *testing.T, h *eHarness, restore bool) {
+	t.Helper()
+	path := filepath.Join(h.stateDir, vault.RegistryFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the registry: %v", err)
+	}
+	var doc struct {
+		Version int `json:"version"`
+		Vaults  []struct {
+			ID        string `json:"id"`
+			Name      string `json:"name"`
+			RepoDir   string `json:"repo_dir"`
+			RepoID    string `json:"repo_id,omitempty"`
+			CreatedAt string `json:"created_at,omitempty"`
+		} `json:"vaults"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parsing the registry: %v", err)
+	}
+	for i := range doc.Vaults {
+		if !restore {
+			switch doc.Vaults[i].Name {
+			case "main":
+				doc.Vaults[i].Name = "old-main"
+			case "vault2":
+				doc.Vaults[i].Name = "main"
+			}
+		} else {
+			switch doc.Vaults[i].Name {
+			case "old-main":
+				doc.Vaults[i].Name = "main"
+			case "main":
+				doc.Vaults[i].Name = "vault2"
+			}
+		}
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatalf("rewriting the registry: %v", err)
+	}
+}
+
+func TestForgetLegacyEmptyVaultResumePinnedToConcreteVault(t *testing.T) {
+	t.Run("the unchanged default resumes the stamped row against V1", func(t *testing.T) {
+		h := newEHarness(t)
+		row := legacyForgetTarget(t, h)
+		v1Concrete := lifecycle.VaultIDFor("ecli-fake-repo", mainVaultDir(h))
+		opID := seedLegacyForgetCrashAtIntent(t, h, row, v1Concrete)
+
+		code, _, stderr := h.run("forget", string(row.ID), "--yes")
+		if code != ExitOK {
+			t.Fatalf("rerun code = %d, want %d — the concrete-stamped row must be adoptable (stderr %s)", code, ExitOK, stderr)
+		}
+		// The resumed forget ran ONLY against V1 (the concrete vault the
+		// row recorded), never against anything else.
+		if len(h.store.forgetRepoDirs) != 1 || h.store.forgetRepoDirs[0] != mainVaultDir(h) {
+			t.Fatalf("forget ran against %v, want exactly the stamped vault %s", h.store.forgetRepoDirs, mainVaultDir(h))
+		}
+		if backendPresent(h, row.PayloadBackendID) || backendPresent(h, row.SealBackendID) {
+			t.Error("backend pair still present after the resumed forget")
+		}
+		assertForgetOpPhase(t, h, opID, catalog.PhaseForgetDone)
+		if pending, _ := h.cat().PendingRetentionIntents(); len(pending) != 0 {
+			t.Errorf("pending intents after resume: %v", pending)
+		}
+	})
+
+	t.Run("a switched default refuses and never touches V2", func(t *testing.T) {
+		h := newEHarness(t)
+		row := legacyForgetTarget(t, h)
+		base := filepath.Dir(h.stateDir)
+		v2, _ := registerVaultAt(t, h, "vault2", filepath.Join(base, "vault2"))
+		v1Concrete := lifecycle.VaultIDFor("ecli-fake-repo", mainVaultDir(h))
+		opID := seedLegacyForgetCrashAtIntent(t, h, row, v1Concrete)
+
+		// The user switched the default vault between the crash and the
+		// rerun: Default() now resolves vault2.
+		switchDefaultVault(t, h, false)
+		if dv, derr := vault.New(filepath.Join(h.stateDir, vault.RegistryFile)).Default(); derr != nil || dv.ID != v2.ID {
+			t.Fatalf("fixture: default = %+v (%v), want vault2 %s", dv, derr, v2.ID)
+		}
+
+		code, _, stderr := h.run("forget", string(row.ID), "--yes")
+		if code != ExitBlocked {
+			t.Fatalf("rerun code = %d, want %d — the resumed forget must never complete against a different vault (stderr %s)", code, ExitBlocked, stderr)
+		}
+		if !strings.Contains(stderr, CodeNoVault) || !strings.Contains(stderr, string(opID)) {
+			t.Errorf("refusal must carry the vault code and name the held operation:\n%s", stderr)
+		}
+		// V2 (and V1) were never touched; the durable state is exactly as
+		// the crash left it.
+		if len(h.store.forgetRepoDirs) != 0 {
+			t.Fatalf("Forget ran against %v; the refused rerun must not reach any backend", h.store.forgetRepoDirs)
+		}
+		if !backendPresent(h, row.PayloadBackendID) || !backendPresent(h, row.SealBackendID) {
+			t.Error("pair forgotten through the switched default")
+		}
+		if got, err := h.cat().GetSnapshot(row.ID); err != nil || !got.Pinned {
+			t.Fatalf("snapshot row disturbed: %+v (%v)", got, err)
+		}
+		assertForgetOpPhase(t, h, opID, catalog.PhaseForgetIntentRecorded)
+		if pending, _ := h.cat().PendingRetentionIntents(); len(pending) != 1 {
+			t.Errorf("pending intents after the refusal = %v, want the seeded one", pending)
+		}
+
+		// Restoring the original default lets the rerun resume on V1.
+		switchDefaultVault(t, h, true)
+		if dv, derr := vault.New(filepath.Join(h.stateDir, vault.RegistryFile)).Default(); derr != nil || dv.RepoDir != mainVaultDir(h) || dv.RepoID != "ecli-fake-repo" {
+			t.Fatalf("fixture: default after restore = %+v (%v), want the V1 repo %s with its repo id", dv, derr, mainVaultDir(h))
+		}
+		if code, _, stderr := h.run("forget", string(row.ID), "--yes"); code != ExitOK {
+			t.Fatalf("rerun on the restored default code = %d, want %d (stderr %s)", code, ExitOK, stderr)
+		}
+		if len(h.store.forgetRepoDirs) != 1 || h.store.forgetRepoDirs[0] != mainVaultDir(h) {
+			t.Fatalf("resumed forget ran against %v, want the stamped V1 %s", h.store.forgetRepoDirs, mainVaultDir(h))
+		}
+		assertForgetOpPhase(t, h, opID, catalog.PhaseForgetDone)
+	})
+
+	t.Run("an unstamped legacy row refuses (fail closed)", func(t *testing.T) {
+		h := newEHarness(t)
+		row := legacyForgetTarget(t, h)
+		opID := seedLegacyForgetCrashAtIntent(t, h, row, "")
+
+		code, _, stderr := h.run("forget", string(row.ID), "--yes")
+		if code != ExitBlocked {
+			t.Fatalf("rerun code = %d, want %d — an empty stamp cannot prove the same vault and must refuse (stderr %s)", code, ExitBlocked, stderr)
+		}
+		if len(h.store.forgetRepoDirs) != 0 {
+			t.Fatalf("Forget ran against %v", h.store.forgetRepoDirs)
+		}
+		assertForgetOpPhase(t, h, opID, catalog.PhaseForgetIntentRecorded)
+	})
 }

@@ -124,7 +124,11 @@ func cmdRestore(args []string, streams Streams, deps Deps) int {
 	// the wrapper below). The resolver is wrapped with the legacy
 	// disclosure: actions synthesized from a manifest without frozen
 	// definitions are presented as what they are (freshly approved
-	// legacy recovery attempts).
+	// legacy recovery attempts). The fresh-approval guidance names
+	// restore's REAL remediation — restore has no --yes, so the clause
+	// must never recommend one (small-B review fix); the interactive
+	// approval in a terminal is the only consent path for a non-legacy
+	// pending.
 	approvalStore := approvalstore.New(sess.approvalsPath())
 	lr, err := restore.NewLiveRestorer(restore.LiveDependencies{
 		Store:      sess.store,
@@ -134,7 +138,8 @@ func cmdRestore(args []string, streams Streams, deps Deps) int {
 		Runner:     runner,
 		Approver:   approvalStore,
 		Approve: restoreLegacyApprovalResolver(deps, streams, *legacyApprove, *jsonOut,
-			approvalStore, openApprovalResolver(deps, streams, false, *jsonOut, approvalStore)),
+			approvalStore, openApprovalResolver(deps, streams, false, *jsonOut, approvalStore,
+				"run in a terminal to review the actions and confirm the approval there")),
 		ObserveGit: deps.ObserveGit,
 		Prompt:     newRestorePrompter(deps, streams, *jsonOut),
 	})

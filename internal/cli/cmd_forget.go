@@ -17,7 +17,21 @@
 //	    operation per workspace. External mutation of the vault (restic
 //	    run by hand, another tool) was never inside Ebb's coordination
 //	    contract and remains outside it.
-//	(0b) surviving-custody check: ONE backend List at forget time
+//	(0a) journaled target stamp (P0): the operation row records the
+//	    CONCRETE vault identity this run resolved (lifecycle.VaultIDFor
+//	    over the resolved registry vault), not merely the snapshot's
+//	    (possibly empty) binding — a legacy empty-bound row's resumed
+//	    forget must complete against the SAME concrete vault, or refuse.
+//	    (Stamped right after (0), before the vault is unlocked.)
+//	(0b) repository identity check (P0, BEFORE any durable act): the
+//	    vault resolution above authenticates a PATH, not a REPOSITORY —
+//	    the repository at the registered path may have been REPLACED
+//	    (same path, different repoID). So once the vault is unlocked,
+//	    the ACTUAL backend identity (store.RepoID) is verified against
+//	    the binding's derivation (lifecycle.VaultIDFor) and the recorded
+//	    repository identity; a mismatch — or an unreadable identity — is
+//	    a blocked refusal. No intent, no unpin, no Forget call.
+//	(0c) surviving-custody check: ONE backend List at forget time
 //	    decides what still exists (E11: catalog rows are not custody);
 //	    the last-recovery-copy guard counts only pairs the list returns.
 //	    The List runs against the SNAPSHOT'S BOUND VAULT (snapshots
@@ -77,6 +91,7 @@ import (
 
 	"github.com/0Cymantek0/ebb/internal/catalog"
 	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
 	"github.com/0Cymantek0/ebb/internal/restore"
 	"github.com/0Cymantek0/ebb/internal/vault"
 )
@@ -203,7 +218,7 @@ func cmdForget(args []string, streams Streams, deps Deps) int {
 		Workspace: ws.Name, WorkspaceID: string(ws.ID),
 		SnapshotID: idArg, Kind: snap.Kind, CreatedAt: snap.CreatedAt,
 		BackendIDs: [2]string{snap.PayloadBackendID, snap.SealBackendID},
-		VaultName:  v.Name, VaultID: v.ID,
+		VaultName:  v.reg.Name, VaultID: v.reg.ID,
 	}
 	for _, s := range all {
 		if s.CreatedAt > snap.CreatedAt && s.ID != snap.ID {
@@ -233,10 +248,16 @@ func cmdForget(args []string, streams Streams, deps Deps) int {
 	}
 
 	// ---- (0) begin (or adopt) the journaled operation -------------------
-	op, berr := beginOrAdoptForget(sess.cat, ws.ID, snap)
+	op, berr := beginOrAdoptForget(sess.cat, ws.ID, snap, v.concreteID)
 	if berr != nil {
 		var active *catalog.ActiveOperationError
 		if errors.As(berr, &active) {
+			// A pinned-to-a-different-concrete-vault row of the SAME target
+			// gets its own refusal: the resumed forget must never complete
+			// against a different repository than the row began against.
+			if msg, changed := forgetVaultChangedMessage(active.Operation, snap, v.concreteID); changed {
+				return emitFailure(env, *jsonOut, streams, ExitBlocked, msg)
+			}
 			// An operation this forget cannot adopt holds the workspace:
 			// the atomic primitive's mutual exclusion doing its job.
 			return emitFailure(env, *jsonOut, streams, ExitBlocked, fmt.Sprintf(
@@ -293,27 +314,39 @@ func cmdForget(args []string, streams Streams, deps Deps) int {
 		closeOpCanceled(failErr.Error())
 	}
 
-	// Record the target's LOGICAL identity (snapshot id + bound vault)
-	// and backend pair on the row: this is the durable fingerprint by
-	// which a later rerun recognizes its own operation. The snapshot id
-	// is load-bearing: backend ids identify physical objects, and two
-	// logical snapshot rows can share one pair (catalog reconstruction,
-	// imports, corruption repair) — adoption must never cross logical
-	// targets. The vault id is equally load-bearing (schemaV6): a
-	// resumed forget must complete against the SAME repository the row
-	// began against, even if the default vault changed in between.
-	// A crash between the begin and this write leaves an unidentifiable
-	// FORGET_PLANNED row (empty refs) that a rerun refuses — closing it
-	// with `ebb recover <op> --cancel` is valid there (nothing
-	// destructive happened yet).
-	if serr := sess.cat.SetForgetTarget(op.ID, string(snap.ID), snap.PayloadBackendID, snap.SealBackendID, string(snap.VaultID)); serr != nil {
+	// Record the target's LOGICAL identity (snapshot id + CONCRETE vault
+	// identity) and backend pair on the row: this is the durable
+	// fingerprint by which a later rerun recognizes its own operation.
+	// The snapshot id is load-bearing: backend ids identify physical
+	// objects, and two logical snapshot rows can share one pair (catalog
+	// reconstruction, imports, corruption repair) — adoption must never
+	// cross logical targets. The vault stamp is equally load-bearing
+	// (schemaV6) and records the CONCRETE resolved vault
+	// (lifecycle.VaultIDFor over the resolved registry vault — equal to
+	// the snapshots.vault_id binding for natively captured vaults, and a
+	// real identity for legacy empty-bound rows): a resumed forget must
+	// complete against the SAME repository the row began against, even
+	// if the default vault changed in between. A crash between the begin
+	// and this write leaves an unidentifiable FORGET_PLANNED row (empty
+	// refs) that a rerun refuses — closing it with `ebb recover <op>
+	// --cancel` is valid there (nothing destructive happened yet).
+	if serr := sess.cat.SetForgetTarget(op.ID, string(snap.ID), snap.PayloadBackendID, snap.SealBackendID, string(v.concreteID)); serr != nil {
 		failOp(serr)
 		return emitFailure(env, *jsonOut, streams, classifyExitCode(serr),
 			fmt.Sprintf("forget %s: recording the target pair on operation %s: %s", idArg, op.ID, codedWithSafeAction(serr)))
 	}
 
 	// ---- the vault-bound half -------------------------------------------
-	cErr := sess.withVaultPassfileOf(ctx, v, func(repoDir, passfile string) error {
+	cErr := sess.withVaultPassfileOf(ctx, v.reg, func(repoDir, passfile string) error {
+		// (0b) Repository identity check (P0): authenticate the REPOSITORY,
+		// not the path — before any durable act. A replaced repository at
+		// the registered path would otherwise pass the path-based vault
+		// match, find nothing here, and complete the release as a false
+		// success while the real bytes sit wherever the original went.
+		if ierr := verifyForgetVaultIdentity(ctx, sess, repoDir, passfile, v, snap); ierr != nil {
+			return ierr
+		}
+
 		// Reference-aware deletion preview (P0-1): which of the target's
 		// backend ids other retained snapshot rows still share. The
 		// prompt and the durable flow must both tell the truth about
@@ -323,7 +356,7 @@ func cmdForget(args []string, streams Streams, deps Deps) int {
 			return fmt.Errorf("forget: enumerate the vault's retained references: %w", sherr)
 		}
 
-		// (0b) Surviving custody — ONE List at forget time (E11): the
+		// (0c) Surviving custody — ONE List at forget time (E11): the
 		// guard below counts only pairs this list still returns.
 		surviving, serr := domain.SurvivingBackendIDs(ctx, sess.store, repoDir, passfile)
 		if serr != nil {
@@ -424,11 +457,13 @@ func cmdForget(args []string, streams Streams, deps Deps) int {
 // when no operation is active, or by ADOPTING the active row when it is
 // this forget's own interrupted run — kind forget AND the same recorded
 // fingerprint (the durable identity a crash leaves behind): the logical
-// snapshot id, the BOUND VAULT (schemaV6: a resumed forget must complete
-// against the same repository it began against), and the target pair.
-// Anything else is refused: the *ActiveOperationError travels to the
-// caller.
-func beginOrAdoptForget(cat *catalog.Catalog, ws domain.WorkspaceID, snap catalog.Snapshot) (catalog.Operation, error) {
+// snapshot id, the CONCRETE vault stamp (schemaV6: equal to the
+// snapshots.vault_id binding for natively captured vaults; a real
+// resolved identity for legacy empty-bound rows, so a resumed forget
+// must complete against the same repository it began against — an empty
+// stamp proves nothing and refuses), and the target pair. Anything else
+// is refused: the *ActiveOperationError travels to the caller.
+func beginOrAdoptForget(cat *catalog.Catalog, ws domain.WorkspaceID, snap catalog.Snapshot, concreteVaultID domain.VaultID) (catalog.Operation, error) {
 	op, err := cat.BeginOperationIfNoActive(ws, catalog.OpKindForget, catalog.PhaseForgetPlanned)
 	if err == nil {
 		return op, nil
@@ -440,12 +475,47 @@ func beginOrAdoptForget(cat *catalog.Catalog, ws domain.WorkspaceID, snap catalo
 	holder := active.Operation
 	if holder.Kind != catalog.OpKindForget ||
 		holder.SnapID != string(snap.ID) ||
-		holder.VaultID != string(snap.VaultID) ||
+		holder.VaultID != string(concreteVaultID) ||
 		holder.PayloadSnap != snap.PayloadBackendID ||
 		holder.SealSnap != snap.SealBackendID {
 		return catalog.Operation{}, active
 	}
 	return holder, nil
+}
+
+// forgetVaultChangedMessage renders the targeted refusal for an active
+// forget row of the SAME logical target whose recorded concrete vault
+// differs from this run's resolution (P0: the empty-binding row whose
+// default vault changed between the crash and the rerun; equally, any
+// row whose vault resolution drifted). ok is false for every other
+// active-operation shape, which keeps the generic mutual-exclusion
+// refusal.
+func forgetVaultChangedMessage(holder catalog.Operation, snap catalog.Snapshot, concreteID domain.VaultID) (string, bool) {
+	if holder.Kind != catalog.OpKindForget ||
+		holder.SnapID != string(snap.ID) ||
+		holder.PayloadSnap != snap.PayloadBackendID ||
+		holder.SealSnap != snap.SealBackendID ||
+		holder.VaultID == string(concreteID) {
+		return "", false
+	}
+	recorded := holder.VaultID
+	if recorded == "" {
+		recorded = "(empty — a forget row from an older Ebb, pinned to no concrete vault)"
+	}
+	return blockerMessage(CodeNoVault, "forget "+string(snap.ID),
+		fmt.Sprintf("the interrupted forget operation %s is pinned to vault %s, but this run resolved vault %s: the vault resolution changed between the crash and the rerun, and completing the release against a DIFFERENT repository is refused — it would find nothing there and still mark the obligation released while the bytes sit in the original vault",
+			holder.ID, recorded, concreteID),
+		fmt.Sprintf("Safe action: restore the original vault resolution and rerun `ebb forget %s`; or — only while nothing destructive has happened — close the row with `ebb recover %s --cancel` and decide again", snap.ID, holder.ID)), true
+}
+
+// forgetVault is forgetVaultFor's outcome: the registry vault whose
+// unlock secret opens the repository, the catalog vault row that
+// anchored a non-empty binding (zero when the binding is empty), and
+// the CONCRETE vault identity the journaled operation is stamped with.
+type forgetVault struct {
+	reg        *vault.Vault
+	row        catalog.Vault
+	concreteID domain.VaultID
 }
 
 // forgetVaultFor resolves the vault a forget must run against: the
@@ -458,33 +528,106 @@ func beginOrAdoptForget(cat *catalog.Catalog, ws domain.WorkspaceID, snap catalo
 // entry is a FAIL-CLOSED refusal naming the vault (P0-2): running the
 // forget against some other repository would find nothing to forget and
 // still complete the release intent while the material sits untouched.
-func forgetVaultFor(sess *session, snap catalog.Snapshot) (*vault.Vault, error) {
+//
+// concreteID is the CONCRETE identity of the resolved vault:
+// lifecycle.VaultIDFor over the resolved REGISTRY entry's repository
+// identity and directory — the same derivation capture records, so for
+// a natively captured vault it equals the snapshots.vault_id binding,
+// and a legacy empty-bound row is stamped with the identity its vault
+// carries as a binding. (Why the registry-derived form: the stamp must
+// be computable BEFORE the unlock — the operation row is written before
+// the passfile closure — and reproducible identically on the resume;
+// the actual backend is verified against the binding afterwards by
+// verifyForgetVaultIdentity, so a stale registry identity cannot slip a
+// replaced repository through.) The path match here authenticates a
+// PATH, not a REPOSITORY; the destructive half re-verifies the actual
+// backend identity inside the unlocked vault.
+func forgetVaultFor(sess *session, snap catalog.Snapshot) (forgetVault, error) {
 	if snap.VaultID == "" {
-		return sess.defaultVault()
+		v, err := sess.defaultVault()
+		if err != nil {
+			return forgetVault{}, err
+		}
+		return forgetVault{
+			reg:        v,
+			concreteID: lifecycle.VaultIDFor(v.RepoID, v.RepoDir),
+		}, nil
 	}
 	row, err := sess.cat.GetVault(snap.VaultID)
 	if err != nil {
 		if errors.Is(err, catalog.ErrNotFound) {
-			return nil, blockedError(fmt.Errorf(
+			return forgetVault{}, blockedError(fmt.Errorf(
 				"%s: snapshot %s is bound to vault %s, which has no catalog vault row; forget refuses rather than running against a different vault. Safe action: inspect the vault rows with `ebb doctor` and re-register the vault at its recorded path",
 				CodeNoVault, snap.ID, snap.VaultID))
 		}
-		return nil, blockedError(fmt.Errorf(
+		return forgetVault{}, blockedError(fmt.Errorf(
 			"forget: reading the snapshot's bound vault row %s: %v", snap.VaultID, err))
 	}
 	list, err := sess.registry().List()
 	if err != nil {
-		return nil, blockedError(fmt.Errorf(
+		return forgetVault{}, blockedError(fmt.Errorf(
 			"forget: resolving the snapshot's bound vault %s: %v", snap.VaultID, err))
 	}
 	for i := range list {
 		if filepath.Clean(list[i].RepoDir) == filepath.Clean(row.Path) {
-			return &list[i], nil
+			return forgetVault{
+				reg:        &list[i],
+				row:        row,
+				concreteID: lifecycle.VaultIDFor(list[i].RepoID, list[i].RepoDir),
+			}, nil
 		}
 	}
-	return nil, blockedError(fmt.Errorf(
+	return forgetVault{}, blockedError(fmt.Errorf(
 		"%s: snapshot %s is bound to vault %s at %s, which is not a registered vault; forget refuses rather than running against a different vault. Safe action: re-register that vault (`ebb init`), or inspect `ebb doctor` to compare the registry with the catalog",
 		CodeNoVault, snap.ID, row.ID, row.Path))
+}
+
+// verifyForgetVaultIdentity authenticates the ACTUAL backend repository
+// a forget is about to act on (P0, run inside the unlocked vault before
+// any durable act): store.RepoID's answer must reproduce the snapshot's
+// binding derivation (lifecycle.VaultIDFor — the authoritative check:
+// the binding was sealed against a specific repository) and agree with
+// the catalog vault row's recorded repository identity; for a legacy
+// empty-bound row (no binding to derive) the registry's recorded
+// identity is the gate — when one is recorded at all. A replaced
+// repository at the registered path, or an identity that cannot be read
+// at all, is a blocked refusal: forget never acts on an unidentified
+// repository.
+func verifyForgetVaultIdentity(ctx context.Context, sess *session, repoDir, passfile string, v forgetVault, snap catalog.Snapshot) error {
+	actual, err := sess.store.RepoID(ctx, repoDir, passfile)
+	if err != nil {
+		return blockedError(fmt.Errorf(
+			"%s: forget %s: the backend identity of vault %q (%s) at %s could not be read (%v); forget refuses rather than acting on an unidentified repository — a replaced repository at the same path must not pass the vault match. Safe action: inspect the vault (`ebb doctor`, `ebb verify`) and re-register the repository if it was replaced",
+			CodeNoVault, snap.ID, v.reg.Name, v.reg.ID, repoDir, err))
+	}
+	if snap.VaultID != "" {
+		// Recorded-identity gate: the catalog vault row is what capture
+		// sealed against (rows predating identity stamping carry "" — the
+		// derivation below still decides).
+		if v.row.RepoID != "" && actual != v.row.RepoID {
+			return blockedError(fmt.Errorf(
+				"%s: forget %s: vault %q (%s) records repository identity %s, but the backend at %s reports %s — the repository at the registered path was replaced after the capture. Safe action: locate the original repository (`ebb doctor`) and re-register it at its recorded path before forgetting",
+				CodeNoVault, snap.ID, v.reg.Name, v.reg.ID, v.row.RepoID, repoDir, actual))
+		}
+		// Authoritative derivation check against the ACTUAL backend.
+		if got := lifecycle.VaultIDFor(actual, repoDir); got != snap.VaultID {
+			return blockedError(fmt.Errorf(
+				"%s: forget %s: the repository at %s reports identity %s, which does not derive the snapshot's bound vault %s — the snapshot's bytes live in a different repository, and forgetting here would find nothing and still release the obligation. Safe action: locate the original repository (`ebb doctor`) and re-register it at its recorded path before forgetting",
+				CodeNoVault, snap.ID, repoDir, actual, snap.VaultID))
+		}
+		return nil
+	}
+	// Legacy empty binding: the concrete stamp this run pins the forget
+	// with must describe THIS repository, so a replaced backend is
+	// refused here too (no recorded identity — a vault registered before
+	// its repoID was known — cannot be cross-checked and proceeds on the
+	// derivation-less stamp).
+	if v.reg.RepoID != "" && actual != v.reg.RepoID {
+		return blockedError(fmt.Errorf(
+			"%s: forget %s: vault %q (%s) records repository identity %s, but the backend at %s reports %s — the repository at the registered path appears replaced. Safe action: inspect the vault (`ebb doctor`) and re-register the repository before forgetting",
+			CodeNoVault, snap.ID, v.reg.Name, v.reg.ID, v.reg.RepoID, repoDir, actual))
+	}
+	return nil
 }
 
 // otherRetainedBackendRefs maps each backend id that OTHER retained
@@ -796,21 +939,28 @@ func renderForgetHuman(d forgetDetails, ws catalog.Workspace) string {
 	return b.String()
 }
 
-// forgottenBackendLine names which of the target's pair were forgotten:
-// both, one (the other was kept for a sharing row), or neither.
+// forgottenBackendLine names which of the target's pair were forgotten,
+// with an INDEPENDENT label per position (small-A: joining one list
+// under alternating "P="/"S=" prefixes mislabeled the slot whenever
+// only one id was forgotten — a forgotten seal rendered as "P=<seal>").
+// Both → "P=<payload> S=<seal>"; only the payload → "P=<payload>"; only
+// the seal → "S=<seal>"; neither (both shared and kept) → the explicit
+// none-form.
 func forgottenBackendLine(ids [2]string, kept []string) string {
 	keptSet := map[string]bool{}
 	for _, id := range kept {
 		keptSet[id] = true
 	}
-	var forgotten []string
-	for _, id := range ids {
-		if !keptSet[id] {
-			forgotten = append(forgotten, id)
+	labels := [2]string{"P", "S"}
+	var parts []string
+	for i, id := range ids {
+		if keptSet[id] {
+			continue
 		}
+		parts = append(parts, labels[i]+"="+id)
 	}
-	if len(forgotten) == 0 {
+	if len(parts) == 0 {
 		return "(none — both ids are shared and were kept)"
 	}
-	return "P=" + strings.Join(forgotten, " S=")
+	return strings.Join(parts, " ")
 }
