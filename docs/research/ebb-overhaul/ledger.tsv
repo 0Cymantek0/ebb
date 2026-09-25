@@ -18,6 +18,7 @@ R16	FALSIFIED	Real fixture and decision reduction	Verified backup preceded newer
 R17	FALSIFIED	Failure-domain model	Two locations shared one disk	D11 independent domains	evidence.json round2 R17
 R18	FALSIFIED	Batch interruption model	One component evicted while another stayed live	D12 resumable per-component partial outcomes	evidence.json round2 R18
 R19	FALSIFIED	Trust-anchor logical model	Mutually replaced descriptions agreed after witness loss	D13 authenticity versus consistency; assumes compromised descriptions or provider/key	evidence.json round2 R19
+R20	FALSIFIED	Real Linux venv and subprocess	Identical console script worked before relocation but failed afterward	D14 path-sensitive rebuilding differs from byte materialization	round3.json
 G01	UNRESOLVED	Native Windows and Linux Ebb integration	No production runtime qualification in this run	Release gate required	plan.md
 G02	UNRESOLVED	Power-loss and concurrent actor testing	Atomic model does not exercise torn writes or real coordination	Release gate required	plan.md
 G03	UNRESOLVED	User study	Time savings and low-effort adoption not measured	Product-value gate required	plan.md
