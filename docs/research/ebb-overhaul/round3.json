@@ -1,0 +1,12 @@
+{
+  "id": "R20",
+  "boundary": "real Linux venv and subprocess, no package installation",
+  "hypothesis": "A successfully rebuilt environment can always be staged then renamed",
+  "verdict": "FALSIFIED",
+  "before_stdout": "ready",
+  "after_errno": 2,
+  "script_bytes_unchanged": true,
+  "revision": "Separate byte materialization from reconstruction. Rebuild path-sensitive outputs at their intended logical path inside a qualified isolation provider, use a proven relocatable recipe, or require explicit host-trusted repair with retained checkpoints. Do not claim generic stage-and-rename makes all rebuilt environments runnable.",
+  "limits": "A generated fixture console script exercises the documented shebang rule; it is not a test of all Python packages or Windows venvs.",
+  "script_git_blob": "452c1714467516c9cabe79aa9df07060974608c1"
+}
