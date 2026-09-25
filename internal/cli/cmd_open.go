@@ -243,7 +243,7 @@ func cmdOpen(args []string, streams Streams, deps Deps) int {
 			fmt.Sprintf("--to %s: %v", dest, aerr))
 	}
 
-	opener, err := newOpenOpener(deps, sess, streams, !*filesOnly, *yes)
+	opener, err := newOpenOpener(deps, sess, streams, !*filesOnly, *yes, *jsonOut)
 	if err != nil {
 		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
 			fmt.Sprintf("open %s: %v", target, err))
@@ -308,7 +308,7 @@ func runOpenRecovery(env Envelope, jsonOut bool, streams Streams, deps Deps, ses
 		return ExitOK
 	}
 
-	opener, err := newOpenOpener(deps, sess, streams, true, yes)
+	opener, err := newOpenOpener(deps, sess, streams, true, yes, jsonOut)
 	if err != nil {
 		return emitFailure(env, jsonOut, streams, classifyExitCode(err),
 			fmt.Sprintf("open --resume %s: %v", target, err))
@@ -344,7 +344,9 @@ func runOpenRecovery(env Envelope, jsonOut bool, streams Streams, deps Deps, ses
 // the real actions runner (or the Deps test seam), the approvalstore in
 // the state dir, and the CLI-owned grouped approval resolver. withRebuild
 // false (a --files-only open) wires nothing — no approvals are needed.
-func newOpenOpener(deps Deps, sess *session, streams Streams, withRebuild, yes bool) (*restore.Opener, error) {
+// jsonOut threads machine mode into the resolver (--json never prompts,
+// on a terminal or off one).
+func newOpenOpener(deps Deps, sess *session, streams Streams, withRebuild, yes, jsonOut bool) (*restore.Opener, error) {
 	if deps.NewRestoreOp == nil {
 		return nil, usageError(fmt.Errorf("restore opener %w", ErrNotIntegrated))
 	}
@@ -369,7 +371,7 @@ func newOpenOpener(deps Deps, sess *session, streams Streams, withRebuild, yes b
 		store := approvalstore.New(sess.approvalsPath())
 		d.Runner = runner
 		d.Approver = store
-		d.Approve = openApprovalResolver(deps, streams, yes, store)
+		d.Approve = openApprovalResolver(deps, streams, yes, jsonOut, store)
 	}
 	opener, err := deps.NewRestoreOp(d)
 	if err != nil {
@@ -394,12 +396,18 @@ func newActionRunner(deps Deps) restore.ActionRunner {
 // prompt. Recorded approvals that match exactly never prompt (§5.2).
 // Drift ALWAYS re-prompts interactively and blocks in non-interactive
 // mode — --yes never silently covers a changed action.
-func openApprovalResolver(deps Deps, streams Streams, yes bool, store *approvalstore.FileApprover) restore.ApprovalResolver {
+//
+// machine is the --json mode (the same rule the restore prompter
+// follows): a scripted consumer must never wait on hidden input, so
+// machine mode behaves exactly like a missing terminal — missing
+// approvals and drift refuse with their typed errors and no line is
+// ever read. Explicit --yes is unaffected (flag consent is not a prompt).
+func openApprovalResolver(deps Deps, streams Streams, yes, machine bool, store *approvalstore.FileApprover) restore.ApprovalResolver {
 	return func(ctx context.Context, pending []restore.PendingApproval) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		interactive := deps.StdinIsTerminal != nil && deps.StdinIsTerminal()
+		interactive := !machine && deps.StdinIsTerminal != nil && deps.StdinIsTerminal()
 		var required, stale []restore.PendingApproval
 		for _, p := range pending {
 			var staleErr *actions.ErrApprovalStale

@@ -109,15 +109,19 @@ func (c *Catalog) FailOperation(id domain.OperationID, phase, errMsg string) err
 }
 
 // SetForgetTarget records the LOGICAL identity of a forget operation's
-// target (snapshot id) alongside the backend pair (schemaV5): backend
-// ids identify physical objects; the snapshot id identifies the logical
-// recovery obligation whose unpin/retention this operation releases.
-// Rerun adoption compares all three.
-func (c *Catalog) SetForgetTarget(id domain.OperationID, snapID, payload, seal string) error {
+// target — the snapshot id AND the vault its pair lives in (schemaV5 +
+// schemaV6) — alongside the backend pair: backend ids identify physical
+// objects; the snapshot id identifies the logical recovery obligation
+// whose unpin/retention this operation releases, and the vault id pins
+// WHICH repository the destructive half must run against (a resumed
+// forget against a different vault would find nothing and complete the
+// intent while the material sits untouched). Rerun adoption compares
+// all four.
+func (c *Catalog) SetForgetTarget(id domain.OperationID, snapID, payload, seal, vaultID string) error {
 	return withTx(c.db, func(tx *sql.Tx) error {
 		res, err := tx.Exec(`UPDATE operations
-			SET snap_id = ?, payload_snap = ?, seal_snap = ?, updated_at = ?
-			WHERE id = ?`, nullStr(snapID), nullStr(payload), nullStr(seal), domain.FormatTime(time.Now()), string(id))
+			SET snap_id = ?, payload_snap = ?, seal_snap = ?, vault_id = ?, updated_at = ?
+			WHERE id = ?`, nullStr(snapID), nullStr(payload), nullStr(seal), nullStr(vaultID), domain.FormatTime(time.Now()), string(id))
 		if err != nil {
 			return fmt.Errorf("catalog: set forget target of %s: %w", id, err)
 		}
@@ -233,19 +237,20 @@ func (c *Catalog) ListOperations(ws domain.WorkspaceID) ([]Operation, error) {
 }
 
 const operationSelect = `SELECT id, workspace_id, kind, phase, generation, source_root, source_identity,
-	dest_path, payload_snap, seal_snap, snap_id, intent_digest, last_error, next_action, started_at, updated_at
+	dest_path, payload_snap, seal_snap, snap_id, vault_id, intent_digest, last_error, next_action, started_at, updated_at
 	FROM operations`
 
 func scanOperation(r rowScanner) (Operation, error) {
 	var op Operation
 	var workspaceID, sourceRoot, sourceIdentity, destPath, payloadSnap, sealSnap,
-		snapID, intentDigest, lastError, nextAction sql.NullString
+		snapID, vaultID, intentDigest, lastError, nextAction sql.NullString
 	if err := r.Scan(&op.ID, &workspaceID, &op.Kind, &op.Phase, &op.Generation,
 		&sourceRoot, &sourceIdentity, &destPath, &payloadSnap, &sealSnap, &snapID,
-		&intentDigest, &lastError, &nextAction, &op.StartedAt, &op.UpdatedAt); err != nil {
+		&vaultID, &intentDigest, &lastError, &nextAction, &op.StartedAt, &op.UpdatedAt); err != nil {
 		return Operation{}, err
 	}
 	op.SnapID = snapID.String
+	op.VaultID = vaultID.String
 	op.WorkspaceID = domain.WorkspaceID(workspaceID.String)
 	op.SourceRoot = sourceRoot.String
 	op.SourceIdentity = sourceIdentity.String

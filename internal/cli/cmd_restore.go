@@ -12,9 +12,10 @@
 // state dir's approvalstore and verified verbatim — wave-5 D4), and the
 // only decisions are the branch-mismatch and drift menus —
 // terminal-only, NEVER auto-decided, and opted out entirely by --json
-// (machine mode refuses with the typed error instead of prompting).
-// A legacy trim manifest (one without frozen action definitions) needs
-// fresh explicit approval: --legacy-approve records it headless, an
+// (machine mode refuses with the typed error instead of prompting; the
+// approval resolver obeys the same rule). A legacy trim manifest (one
+// without frozen action definitions) needs fresh explicit approval:
+// --legacy-approve records it headless — for LEGACY pendings only — an
 // interactive terminal confirms it instead (wave-5 D5).
 //
 // Exit contract: 0 restored (or previewed, with --dry-run); 2 usage
@@ -117,14 +118,13 @@ func cmdRestore(args []string, streams Streams, deps Deps) int {
 	// grouped approval resolver — the same machinery `ebb open`'s
 	// rebuild uses. Exact matches never reach the resolver (silent
 	// replay, D033 preserved); missing/stale/drifted approvals resolve
-	// through it (prompted on a terminal, blocked headless) and the
-	// legacy-consent flag (D5) takes the --yes role for fresh legacy
-	// approvals only — drift still refuses headless. The resolver is
-	// wrapped with the legacy disclosure: actions synthesized from a
-	// manifest without frozen definitions are presented as what they are
-	// (freshly approved legacy recovery attempts), and a non-terminal
-	// refuses them with the --legacy-approve guidance (restore has no
-	// --yes flag, so open's headless advice would misdirect).
+	// through it (prompted on a terminal, blocked headless OR in --json
+	// machine mode) — restore has no --yes, so nothing else auto-records
+	// (wave-5 review P1-A: --legacy-approve is NOT a generic yes; see
+	// the wrapper below). The resolver is wrapped with the legacy
+	// disclosure: actions synthesized from a manifest without frozen
+	// definitions are presented as what they are (freshly approved
+	// legacy recovery attempts).
 	approvalStore := approvalstore.New(sess.approvalsPath())
 	lr, err := restore.NewLiveRestorer(restore.LiveDependencies{
 		Store:      sess.store,
@@ -133,8 +133,8 @@ func cmdRestore(args []string, streams Streams, deps Deps) int {
 		CreateLink: platform.CreateLink,
 		Runner:     runner,
 		Approver:   approvalStore,
-		Approve: restoreLegacyApprovalResolver(deps, streams, *legacyApprove,
-			openApprovalResolver(deps, streams, *legacyApprove, approvalStore)),
+		Approve: restoreLegacyApprovalResolver(deps, streams, *legacyApprove, *jsonOut,
+			approvalStore, openApprovalResolver(deps, streams, false, *jsonOut, approvalStore)),
 		ObserveGit: deps.ObserveGit,
 		Prompt:     newRestorePrompter(deps, streams, *jsonOut),
 	})
@@ -254,16 +254,28 @@ func restoreIsLegacy(res restore.LiveRestoreResult) bool {
 }
 
 // restoreLegacyApprovalResolver wraps open's grouped approval resolver
-// with the wave-5 D5 legacy disclosure. Pendings synthesized from a
-// trim manifest WITHOUT frozen action definitions are never the
-// previously-approved actions, so: a non-terminal refuses them with the
-// --legacy-approve guidance (open's headless advice names --yes, a flag
-// restore does not have — the misdirection would strand headless users);
-// otherwise the legacy-recovery-attempt disclosure prints before open's
-// grouped listing and typed confirm. Exact matches never reach either
-// resolver (the driver's pre-pass swallows them — D033 preserved).
-func restoreLegacyApprovalResolver(deps Deps, streams Streams, legacyApprove bool, base restore.ApprovalResolver) restore.ApprovalResolver {
+// with the wave-5 D5 legacy disclosure — and scopes the --legacy-approve
+// consent to its advertised subject (wave-5 review P1-A): the flag
+// authorizes ONLY pendings marked Legacy, actions synthesized from a
+// trim manifest WITHOUT frozen action definitions whose historical
+// approval identity is unavailable. Everything else resolves through the
+// grouped resolver with yes=false (restore has no --yes): prompted on a
+// terminal, blocked with the approval-required error otherwise — the
+// flag can never stand in for a missing regular approval.
+//
+// machine is the --json mode: like a missing terminal for every prompt
+// path (zero terminal reads), while an explicit --legacy-approve still
+// records genuinely-legacy approvals headless — flag consent is not a
+// prompt. The consented legacy approvals are recorded HERE (labeled
+// flag:--legacy-approve), not by delegating to the grouped resolver:
+// that resolver runs with yes=false, so a headless delegation would
+// refuse the very replay the user just consented to.
+func restoreLegacyApprovalResolver(deps Deps, streams Streams, legacyApprove, machine bool, store *approvalstore.FileApprover, base restore.ApprovalResolver) restore.ApprovalResolver {
 	return func(ctx context.Context, pending []restore.PendingApproval) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		interactive := !machine && deps.StdinIsTerminal != nil && deps.StdinIsTerminal()
 		var legacy []restore.PendingApproval
 		for _, p := range pending {
 			if p.Legacy {
@@ -273,13 +285,39 @@ func restoreLegacyApprovalResolver(deps Deps, streams Streams, legacyApprove boo
 		if len(legacy) == 0 {
 			return base(ctx, pending)
 		}
-		interactive := deps.StdinIsTerminal != nil && deps.StdinIsTerminal()
 		if !legacyApprove && !interactive {
 			return blockedError(fmt.Errorf("%s: %d action(s) of this trim manifest have no frozen action definition, so the exact previously-approved action is not on record and its historical approval identity is unavailable; normal replay is refused.%s Safe action: rerun with --legacy-approve to record the fresh explicit approval headless (a legacy replay is labeled a 'legacy recovery attempt' and is never claimed to be the previously-approved action), or rerun in a terminal to review the recorded recipes and confirm",
 				restore.CodeLegacyManifest, len(legacy), legacyRecipeDisclosure(legacy)))
 		}
 		fmt.Fprint(streams.Err, legacyRecoveryBanner(legacy))
-		return base(ctx, pending)
+		if legacyApprove {
+			if store == nil {
+				return blockedError(fmt.Errorf("%s: no approval store is wired, so the explicit --legacy-approve consent cannot be recorded; nothing ran",
+					restore.CodeLegacyManifest))
+			}
+			for _, p := range legacy {
+				if _, err := store.Approve(p.Def, p.Tool, p.InputDigests, "flag:--legacy-approve"); err != nil {
+					return fmt.Errorf("recording the legacy approval for action %s: %w", p.Def.ID, err)
+				}
+			}
+		}
+		// The remainder resolves normally: with the flag absent the
+		// legacy pendings rejoin the grouped listing (one interactive
+		// decision, banner already disclosed); with the flag they are
+		// settled above. Non-legacy pendings were never touched by the
+		// flag — missing approvals still need a terminal, stale ones
+		// still refuse until re-approved interactively.
+		rest := make([]restore.PendingApproval, 0, len(pending))
+		for _, p := range pending {
+			if legacyApprove && p.Legacy {
+				continue
+			}
+			rest = append(rest, p)
+		}
+		if len(rest) == 0 {
+			return nil
+		}
+		return base(ctx, rest)
 	}
 }
 

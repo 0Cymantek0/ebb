@@ -249,6 +249,10 @@ func TestParkDifferentRootSameNameDoesNotRebindRow(t *testing.T) {
 
 // TestResolveWorkspaceIDSameRootAllowed: the legitimate recapture — the
 // same root under the same name still rebinds the SAME workspace id.
+// (The row here predates identity stamping — RootIdentity empty — so the
+// back-compat adopt applies for any discovered identity; the
+// identified-row same-identity case is TestSameIdentityRecaptureAllowed
+// in wave5_identity_test.go.)
 func TestResolveWorkspaceIDSameRootAllowed(t *testing.T) {
 	h := newEHarness(t)
 	id := domain.WorkspaceID(domain.NewID())
@@ -256,7 +260,7 @@ func TestResolveWorkspaceIDSameRootAllowed(t *testing.T) {
 	seedNamedWorkspace(t, h, id, "cliws", root, catalog.WorkspaceLive)
 	sess := newSelectionSession(t, h)
 
-	got, err := sess.resolveWorkspaceIDRefusing("cliws", root)
+	got, err := sess.resolveWorkspaceIDRefusing("cliws", root, identA)
 	if err != nil {
 		t.Fatalf("same-root recapture must be allowed: %v", err)
 	}
@@ -268,7 +272,7 @@ func TestResolveWorkspaceIDSameRootAllowed(t *testing.T) {
 	}
 	// A spelling that cleans to the same path is still the same root.
 	dotted := filepath.Clean(filepath.Join(root, "sub", ".."))
-	got2, err := sess.resolveWorkspaceIDRefusing("cliws", dotted)
+	got2, err := sess.resolveWorkspaceIDRefusing("cliws", dotted, identA)
 	if err != nil || got2 != id {
 		t.Fatalf("cleaned same-root match: id = %s, err = %v, want %s, nil", got2, err, id)
 	}
@@ -287,7 +291,7 @@ func TestResolveWorkspaceIDRootMismatchRefuses(t *testing.T) {
 	sess := newSelectionSession(t, h)
 	moved := filepath.Clean(filepath.Join(h.wsRoot, "..", "moved-elsewhere"))
 
-	got, err := sess.resolveWorkspaceIDRefusing("cliws", moved)
+	got, err := sess.resolveWorkspaceIDRefusing("cliws", moved, identA)
 	if err == nil {
 		t.Fatalf("root mismatch must refuse, got id %s", got)
 	}

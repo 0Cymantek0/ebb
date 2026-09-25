@@ -391,11 +391,29 @@ func buildTrimPlan(st *captureState, groupIDs []string) (plan []trimGroupPlan, s
 		return nil, nil, &ErrDestructiveBlocked{Reasons: blocked}
 	}
 
+	// E05 single source of truth: a group WITH a frozen action
+	// definition reports the DEFINITION's argv as its recreate command —
+	// the exact contract the approval covered and restore replays.
+	// Lifecycle's separate adapter-switch derivation (reclaimCommand)
+	// had drifted from the approved recipe (uv: --frozen vs the approved
+	// --locked), instructing the user to run a command they were never
+	// approved for. The switch derivation stays ONLY for genuinely
+	// legacy groups without a frozen definition (hint-only paths, D5),
+	// where it is the best available label.
+	defByID := make(map[string]actions.Definition, len(st.opts.ActionDefs))
+	for _, d := range st.opts.ActionDefs {
+		defByID[d.ID] = d
+	}
+
 	for _, id := range groupIDs {
 		g := policyGroupByID(st.opts.Policy, id)
+		reclaim := reclaimCommand(g)
+		if def, ok := defByID[id]; ok {
+			reclaim = def.Argv
+		}
 		gp := trimGroupPlan{
 			GroupID: id, Adapter: string(g.Adapter), Root: g.Root,
-			Outputs: g.Outputs, Inputs: g.Inputs, Reclaim: reclaimCommand(g),
+			Outputs: g.Outputs, Inputs: g.Inputs, Reclaim: reclaim,
 			LiveRecreate: liveRecreateCommand(g),
 		}
 		if decisions[id] {

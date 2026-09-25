@@ -47,6 +47,14 @@ type eFakeStore struct {
 	onForget   func(ids []string) error
 	onPrune    func(dryRun bool) error // Wave H gc seam
 	pruneCalls []bool                  // one entry per Prune call (dryRun flag)
+
+	// repoDir trails (P0-2 regression): which repo directories List and
+	// Forget actually ran against. The fake store is repository-blind by
+	// design (every dir behaves identically), so these trails are the
+	// only assertion surface for "the forget targeted the SNAPSHOT's
+	// bound vault, not the default".
+	listRepoDirs   []string
+	forgetRepoDirs []string
 }
 
 func newEFakeStore() *eFakeStore {
@@ -138,6 +146,7 @@ func eAddAncestors(snap *eFakeSnap, treePath string) {
 func (s *eFakeStore) List(ctx context.Context, repoDir, passfile string) ([]domain.SnapshotRef, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.listRepoDirs = append(s.listRepoDirs, repoDir)
 	ids := make([]string, 0, len(s.snaps))
 	for id := range s.snaps {
 		ids = append(ids, id)
@@ -255,6 +264,7 @@ func (s *eFakeStore) Restore(ctx context.Context, repoDir, passfile, snapID, sub
 
 func (s *eFakeStore) Forget(ctx context.Context, repoDir, passfile string, snapIDs []string) error {
 	s.mu.Lock()
+	s.forgetRepoDirs = append(s.forgetRepoDirs, repoDir)
 	if s.onForget != nil {
 		if err := s.onForget(snapIDs); err != nil {
 			s.mu.Unlock()

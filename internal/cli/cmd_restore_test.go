@@ -14,8 +14,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/actions/approvalstore"
 	"github.com/0Cymantek0/ebb/internal/catalog"
 	"github.com/0Cymantek0/ebb/internal/domain"
 	"github.com/0Cymantek0/ebb/internal/restore"
@@ -568,7 +570,8 @@ func TestReclaimTrimRecordsRestoreApproval(t *testing.T) {
 
 // legacyPending builds one legacy-marked pending approval (the shape the
 // driver's pre-pass emits for an action synthesized from a trim manifest
-// without frozen definitions).
+// without frozen definitions — including the derived network declaration
+// the legacy synthesis always sets).
 func legacyPending() restore.PendingApproval {
 	return restore.PendingApproval{
 		Def: actions.Definition{
@@ -577,6 +580,8 @@ func legacyPending() restore.PendingApproval {
 			WorkingRoot: ".",
 			Inputs:      []string{"package.json", "pnpm-lock.yaml"},
 			Outputs:     []string{"node_modules"},
+			Network:     actions.NetworkAllowed,
+			Timeout:     15 * time.Minute,
 		},
 		Cause:  &actions.ErrApprovalRequired{ActionID: "deps"},
 		Legacy: true,
@@ -595,7 +600,9 @@ func TestRestoreLegacyHeadlessRefusalNamesLegacyApprove(t *testing.T) {
 		return nil
 	}
 	deps := Deps{StdinIsTerminal: func() bool { return false }}
-	resolver := restoreLegacyApprovalResolver(deps, Streams{Err: &strings.Builder{}}, false, base)
+	// The store is unused on this path: without --legacy-approve the
+	// wrapper only refuses or delegates, it never records.
+	resolver := restoreLegacyApprovalResolver(deps, Streams{Err: &strings.Builder{}}, false, false, nil, base)
 
 	err := resolver(context.Background(), []restore.PendingApproval{legacyPending()})
 	if err == nil {
@@ -638,7 +645,7 @@ func TestRestoreLegacyResolverDisclosesBeforeConfirm(t *testing.T) {
 	called := false
 	errb := &strings.Builder{}
 	deps := Deps{StdinIsTerminal: func() bool { return true }}
-	resolver := restoreLegacyApprovalResolver(deps, Streams{Err: errb}, false, newBase(&called))
+	resolver := restoreLegacyApprovalResolver(deps, Streams{Err: errb}, false, false, nil, newBase(&called))
 	if err := resolver(context.Background(), []restore.PendingApproval{legacyPending()}); err != nil {
 		t.Fatalf("interactive legacy consent must reach the confirm: %v", err)
 	}
@@ -655,7 +662,7 @@ func TestRestoreLegacyResolverDisclosesBeforeConfirm(t *testing.T) {
 	// (b) Exact-shape pendings without the legacy marker bypass the
 	// banner entirely (open's resolver handles them untouched).
 	called2, errb2 := false, &strings.Builder{}
-	resolver2 := restoreLegacyApprovalResolver(deps, Streams{Err: errb2}, false, newBase(&called2))
+	resolver2 := restoreLegacyApprovalResolver(deps, Streams{Err: errb2}, false, false, nil, newBase(&called2))
 	fresh := legacyPending()
 	fresh.Legacy = false
 	if err := resolver2(context.Background(), []restore.PendingApproval{fresh}); err != nil {
@@ -665,15 +672,19 @@ func TestRestoreLegacyResolverDisclosesBeforeConfirm(t *testing.T) {
 		t.Errorf("non-legacy pendings must bypass the legacy banner (called=%v stderr=%q)", called2, errb2.String())
 	}
 
-	// (c) --legacy-approve headless: consent recorded, banner printed.
+	// (c) --legacy-approve headless: the banner prints and the wrapper
+	// records the consent ITSELF (P1-A: the grouped resolver runs with
+	// yes=false, so the consented legacy pendings must never be
+	// delegated to it) — with nothing left over, the base never runs.
 	called3, errb3 := false, &strings.Builder{}
 	depsHeadless := Deps{StdinIsTerminal: func() bool { return false }}
-	resolver3 := restoreLegacyApprovalResolver(depsHeadless, Streams{Err: errb3}, true, newBase(&called3))
+	resolver3 := restoreLegacyApprovalResolver(depsHeadless, Streams{Err: errb3}, true, false,
+		approvalstore.New(filepath.Join(t.TempDir(), "approvals.json")), newBase(&called3))
 	if err := resolver3(context.Background(), []restore.PendingApproval{legacyPending()}); err != nil {
 		t.Fatalf("consented headless legacy replay must resolve: %v", err)
 	}
-	if !called3 {
-		t.Fatal("the grouped resolver must record the consented legacy approval")
+	if called3 {
+		t.Fatal("consented legacy pendings are recorded by the wrapper, not the grouped resolver (yes=false)")
 	}
 	if msg := errb3.String(); !strings.Contains(msg, "legacy recovery attempt") {
 		t.Errorf("consented headless legacy replay must print the honest label:\n%s", msg)

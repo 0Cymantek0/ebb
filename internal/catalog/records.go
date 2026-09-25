@@ -228,6 +228,7 @@ type Operation struct {
 	PayloadSnap    string // backend id of committed payload P
 	SealSnap       string // backend id of committed seal S
 	SnapID         string // logical snapshot id of the target (schemaV5; forget adoption)
+	VaultID        string // vault the operation is bound to (schemaV6; forget adoption): the target snapshot's snapshots.vault_id value, "" = default vault
 	IntentDigest   string // policy intent digest (Foundation §7.1)
 	LastError      string // last recorded failure message
 	NextAction     string // next permitted reconciliation step, "" when none recorded

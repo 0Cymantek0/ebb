@@ -661,6 +661,14 @@ func buildReceipt(
 // output (§17.3: "the result names the groups removed and the commands
 // required to recreate them"). Custom adapters carry their declared
 // command; ecosystem adapters get the pinned per-adapter recipe.
+//
+// E05: this switch derivation is the LEGACY fallback only — a group
+// whose frozen actions.Definition exists (CaptureOptions.ActionDefs)
+// must report the definition's argv instead (buildTrimPlan sources it
+// from there), because the definition is what the approval covered and
+// restore replays. This switch's uv entry (`--frozen`) had drifted from
+// the approved recipe (`--locked`), duplicating the contract in two
+// places with different values.
 func reclaimCommand(g policy.Regenerate) []string {
 	if len(g.Command) > 0 {
 		return g.Command

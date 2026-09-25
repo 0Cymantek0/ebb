@@ -221,10 +221,12 @@ func (s *session) newLifecycle(probe domain.PlatformProbe) (*lifecycle.Coordinat
 // resolveWorkspaceID implements the CLI-owned workspace-name binding
 // documented on lifecycle.CaptureOptions: re-capturing the same root
 // under the same name rebinds the SAME workspace id (stable identity
-// across captures). Match order: exact name AND recorded root path; then
-// exact name AND live status — but only while the live row's recorded
-// root matches the capture root (see resolveWorkspaceIDRefusing);
-// otherwise a fresh workspace is created (empty id).
+// across captures). Match order: exact name AND recorded root path (the
+// strict resolver judges the recorded native identity against the
+// discovered one); then exact name AND live status — but only while the
+// live row's recorded root matches the capture root (see
+// resolveWorkspaceIDRefusing); otherwise a fresh workspace is created
+// (empty id).
 //
 // The signature cannot surface a refusal (every capture command feeds
 // the result straight into CaptureOptions), so a refused match degrades
@@ -234,9 +236,12 @@ func (s *session) newLifecycle(probe domain.PlatformProbe) (*lifecycle.Coordinat
 // itself (openCaptureCommand) resolves STRICTLY via
 // resolveWorkspaceIDRefusing and fails the command with the blocked
 // error; only the post-operation receipt lines still use this lenient
-// wrapper, where the row always resolves by name+root already.
+// wrapper, where the row always resolves by name+root already. It is
+// deliberately IDENTITY-BLIND (zero live identity): a receipt label of
+// an operation that already passed the strict resolution never needs to
+// re-judge identities, and it has no live observation to judge with.
 func (s *session) resolveWorkspaceID(name, rootAbs string) domain.WorkspaceID {
-	id, _ := s.resolveWorkspaceIDRefusing(name, rootAbs)
+	id, _ := s.resolveWorkspaceIDRefusing(name, rootAbs, domain.RootIdentity{})
 	return id
 }
 
@@ -249,7 +254,14 @@ func (s *session) resolveWorkspaceID(name, rootAbs string) domain.WorkspaceID {
 // allowed (the legitimate flow). The refusal is a blocked error naming
 // both paths and demanding either a new workspace for the new path or an
 // explicit workspace id.
-func (s *session) resolveWorkspaceIDRefusing(name, rootAbs string) (domain.WorkspaceID, error) {
+//
+// live is the DISCOVERED native root identity of the capture root
+// (disc.Ident from discovery): a same-name SAME-PATH match counts as the
+// same workspace only when the row's recorded native identity also
+// matches — a replaced directory at the same path must not adopt (see
+// the same-path branch). The zero value means no live observation is
+// available (the identity-blind receipt wrapper).
+func (s *session) resolveWorkspaceIDRefusing(name, rootAbs string, live domain.RootIdentity) (domain.WorkspaceID, error) {
 	list, err := s.cat.ListWorkspaces()
 	if err != nil {
 		return "", blockedError(fmt.Errorf("list workspaces: %v", err))
@@ -261,7 +273,32 @@ func (s *session) resolveWorkspaceIDRefusing(name, rootAbs string) (domain.Works
 			continue
 		}
 		if w.RootPath != "" && filepath.Clean(w.RootPath) == filepath.Clean(rootAbs) {
-			return w.ID, nil
+			// Same name AND path: the same workspace only while the
+			// directory at that path is still the SAME OBJECT (I13). The
+			// row's recorded native identity is the judge:
+			//   - empty recorded identity: a row enrolled before identity
+			//     stamping — back-compat adopt; this capture's
+			//     beginOperation stamps the discovered identity on it.
+			//   - equal identity: the legitimate recapture of the same
+			//     directory.
+			//   - different identity: the directory was DELETED and
+			//     REPLACED at the same path. Adopting would rewrite the
+			//     old row's identity onto a foreign directory — the same
+			//     identity-corruption class E12 stops for path movement,
+			//     arriving through path reuse instead. Refuse blocked.
+			recorded := w.RootIdentity
+			if recorded == "" || live == (domain.RootIdentity{}) {
+				// (The zero live identity is the identity-blind receipt
+				// wrapper; it runs only after a capture already passed
+				// the strict resolution, so the path match is trusted.)
+				return w.ID, nil
+			}
+			if recorded == live.String() {
+				return w.ID, nil
+			}
+			return "", blockedError(fmt.Errorf(
+				"%s: the directory at %s was replaced: workspace %q (%s) records native root identity %s, but the directory now at that path has identity %s; the old workspace's history belongs to the OLD directory, and recapturing here would rewrite the row's identity over that history. Safe action: enroll the new directory as a new workspace (a distinct workspace name), or pass the explicit workspace id only through an explicit rebinding flow (none exists in v1)",
+				CodeWorkspaceIdentityMismatch, rootAbs, name, w.ID, recorded, live.String()))
 		}
 		if w.Status == catalog.WorkspaceLive && byLiveName == "" {
 			byLiveName, liveRow = w.ID, w

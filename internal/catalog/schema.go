@@ -3,7 +3,7 @@ package catalog
 // Forward-only schema migrations. The slice index is the version
 // recorded in schema_migrations; migration N runs inside one transaction
 // together with its version insert (see Catalog.migrate).
-var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5}
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6}
 
 // schemaMigrationsDDL is created separately from any versioned
 // migration so a fresh database can record versions at all.
@@ -195,4 +195,19 @@ CREATE INDEX IF NOT EXISTS idx_stats_events_ts ON stats_events(ts);
 // must bind the logical snapshot id alongside the pair.
 const schemaV5 = `
 ALTER TABLE operations ADD COLUMN snap_id TEXT;
+`
+
+// schemaV6 (Wave 5 safety follow-up, P0-2) adds operations.vault_id: the
+// VAULT a forget operation must run against, recorded as the target
+// snapshot's own snapshots.vault_id value (the catalog vault-row id
+// capture and import both derive with lifecycle.VaultIDFor). Multi-vault
+// is real — `ebb import --vault` binds snapshots to non-default vaults —
+// and a forget's durable fingerprint must include the vault: a resumed
+// forget that opened a DIFFERENT repository would find nothing to
+// forget and complete the release intent while the material sits
+// untouched in its true vault. Rows predating the column (and rows of
+// the default-vault capture path, which bind no vault) carry NULL, read
+// as "": the default vault, exactly as forget behaved before.
+const schemaV6 = `
+ALTER TABLE operations ADD COLUMN vault_id TEXT;
 `

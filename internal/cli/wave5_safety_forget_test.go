@@ -24,12 +24,16 @@ package cli
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/0Cymantek0/ebb/internal/catalog"
 	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/lifecycle"
+	"github.com/0Cymantek0/ebb/internal/vault"
 )
 
 // staleHex returns a 64-hex backend id that the fake store does NOT hold
@@ -74,7 +78,7 @@ func seedForgetCrashState(t *testing.T, h *eHarness, snap catalog.Snapshot, phas
 	if err != nil {
 		t.Fatalf("seed: begin forget op: %v", err)
 	}
-	if err := h.cat().SetForgetTarget(op.ID, string(snap.ID), snap.PayloadBackendID, snap.SealBackendID); err != nil {
+	if err := h.cat().SetForgetTarget(op.ID, string(snap.ID), snap.PayloadBackendID, snap.SealBackendID, string(snap.VaultID)); err != nil {
 		t.Fatalf("seed: forget target: %v", err)
 	}
 	adv := func(from, to string) {
@@ -245,6 +249,12 @@ func TestForgetRerunAdoptsOnlyItsOwnTarget(t *testing.T) {
 	}
 	if !strings.Contains(stderr, string(op.ID)) || !strings.Contains(stderr, "ebb recover") {
 		t.Errorf("refusal must name the active operation and the recover verb:\n%s", stderr)
+	}
+	// T4 honesty, stated verbatim at the refusal too: only FORGETS
+	// serialize on the atomic primitive — the other verbs still use the
+	// old caller-side check — so the wording must not overclaim.
+	if !strings.Contains(stderr, "Concurrent ebb forgets are mutually exclusive at the catalog journal") {
+		t.Errorf("refusal must state the narrowed concurrency scope verbatim:\n%s", stderr)
 	}
 	if !backendPresent(h, snap.PayloadBackendID) || !backendPresent(h, snap.SealBackendID) {
 		t.Error("the refused forget mutated the backend")
@@ -502,4 +512,198 @@ func mustActiveForgetOp(t *testing.T, h *eHarness, ws domain.WorkspaceID) domain
 	}
 	t.Fatalf("no active forget operation for %s", ws)
 	return ""
+}
+
+// ---- P0-1: physical deletion is REFERENCE-AWARE (vault-wide) ------------
+//
+// The new model explicitly permits two logical snapshot rows to share
+// one payload/seal pair (catalog reconstruction, imports, corruption
+// repair). A backend id may therefore be physically forgotten only when
+// NO OTHER retained snapshot row of the vault still references it —
+// across ALL workspaces, not just the target's. When a row shares an
+// id, the forget releases the target's LOGICAL obligation (unpin,
+// completed intent, DONE) but leaves the shared bytes in the vault and
+// says so in the receipt.
+
+// TestForgetSharedPairDoesNotDeleteOthersBytes: two pinned rows share
+// the exact pair; forgetting A completes A's obligation while the
+// shared P AND S remain in the backend and B stays verifiable.
+func TestForgetSharedPairDoesNotDeleteOthersBytes(t *testing.T) {
+	h := newEHarness(t)
+	a := parkedOnlySnapshot(t, h)
+	// B: a DIFFERENT logical row sharing A's exact pair (the shape
+	// catalog reconstruction and imports create).
+	b := seedSealedForgetRow(t, h, a.WorkspaceID, a.PayloadBackendID, a.SealBackendID, true)
+
+	code, stdout, stderr := h.run("forget", "--json", string(a.ID), "--yes")
+	if code != ExitOK {
+		t.Fatalf("code = %d, want %d — forgetting A must release A's logical obligation (stderr %s)", code, ExitOK, stderr)
+	}
+	// The SHARED backend pair must survive: B's recovery bytes are still
+	// in the vault and still load.
+	if !backendPresent(h, a.PayloadBackendID) || !backendPresent(h, a.SealBackendID) {
+		t.Fatal("the shared backend pair was deleted although snapshot B still references it")
+	}
+	if _, lerr := h.store.Ls(context.Background(), "", "", a.PayloadBackendID); lerr != nil {
+		t.Fatalf("shared payload no longer verifiable for B: %v", lerr)
+	}
+	// A's logical obligation IS released; B's is untouched.
+	if got, err := h.cat().GetSnapshot(a.ID); err != nil || got.Pinned {
+		t.Fatalf("snapshot A still pinned after its forget: %+v (%v)", got, err)
+	}
+	if got, err := h.cat().GetSnapshot(b.ID); err != nil || !got.Pinned {
+		t.Fatalf("snapshot B row disturbed by A's forget: %+v (%v)", got, err)
+	}
+	// The receipt says the shared ids were kept, and the warnings say why.
+	det := envelopeOf(t, stdout)["details"].(map[string]any)
+	kept, _ := det["retained_shared_ids"].([]any)
+	if len(kept) != 2 {
+		t.Fatalf("details.retained_shared_ids = %v, want both shared ids", det["retained_shared_ids"])
+	}
+	env := envelopeOf(t, stdout)
+	warnings, _ := env["warnings"].([]any)
+	if len(warnings) == 0 {
+		t.Fatalf("envelope warnings = %v, want the kept-shared-ids warning", env["warnings"])
+	}
+	joined := fmt.Sprint(warnings...)
+	if !strings.Contains(joined, a.PayloadBackendID) || !strings.Contains(joined, "share") {
+		t.Errorf("warnings must name the kept ids and the sharing reason: %v", warnings)
+	}
+}
+
+// TestForgetPartiallySharedID: A→P1/S1, B→P1/S2. Forgetting A must
+// delete the unshared S1 but keep the shared P1 — the reference check
+// is per backend id, not per pair.
+func TestForgetPartiallySharedID(t *testing.T) {
+	h := newEHarness(t)
+	a := parkedOnlySnapshot(t, h)
+	seedSealedForgetRow(t, h, a.WorkspaceID, a.PayloadBackendID, staleHex("9a"), true)
+
+	code, _, stderr := h.run("forget", string(a.ID), "--yes")
+	if code != ExitOK {
+		t.Fatalf("code = %d, want %d (stderr %s)", code, ExitOK, stderr)
+	}
+	if backendPresent(h, a.SealBackendID) {
+		t.Error("A's own seal S1 is still present; unshared ids must be forgotten")
+	}
+	if !backendPresent(h, a.PayloadBackendID) {
+		t.Fatal("shared payload P1 was deleted although another retained row still references it")
+	}
+}
+
+// ---- P0-2: forget runs against the SNAPSHOT's bound vault ---------------
+//
+// Multi-vault is real (`ebb import --vault` binds Snapshot.VaultID to a
+// non-default vault). A forget must resolve that binding and List/Forget
+// THE BOUND vault; empty bindings (rows predating the column) keep the
+// default-vault behavior, and an unresolvable binding FAILS CLOSED
+// instead of silently running against the default repository.
+
+// registerVaultAt enrolls a second registry vault plus its catalog vault
+// row (the same digest derivation capture and import use) and returns
+// the registry record and the row id a snapshot binds.
+func registerVaultAt(t *testing.T, h *eHarness, name, repoDir string) (vault.Vault, domain.VaultID) {
+	t.Helper()
+	reg, err := vault.New(filepath.Join(h.stateDir, vault.RegistryFile)).Register(name, repoDir, "ecli-fake-repo")
+	if err != nil {
+		t.Fatalf("register %s: %v", name, err)
+	}
+	rowID := lifecycle.VaultIDFor("ecli-fake-repo", repoDir)
+	if err := h.cat().RegisterVault(catalog.Vault{ID: rowID, Path: repoDir, RepoID: "ecli-fake-repo"}); err != nil {
+		t.Fatalf("register %s catalog row: %v", name, err)
+	}
+	return reg, rowID
+}
+
+// seedSealedRowInVault registers the pair in the fake store and records
+// the snapshot row bound to the given catalog vault row id.
+func seedSealedRowInVault(t *testing.T, h *eHarness, ws domain.WorkspaceID, payload, seal string, vaultRowID domain.VaultID) catalog.Snapshot {
+	t.Helper()
+	for _, id := range []string{payload, seal} {
+		h.store.snaps[id] = &eFakeSnap{
+			files: map[string][]byte{}, dirs: map[string]bool{}, links: map[string]string{},
+		}
+	}
+	row := catalog.Snapshot{
+		ID:               domain.SnapshotID(domain.NewID()),
+		WorkspaceID:      ws,
+		PayloadBackendID: payload,
+		SealBackendID:    seal,
+		VaultID:          vaultRowID,
+		Kind:             catalog.SnapshotKindSnapshot,
+	}
+	if _, err := h.cat().RecordSnapshot(row); err != nil {
+		t.Fatalf("seed sealed row bound to %s: %v", vaultRowID, err)
+	}
+	return row
+}
+
+func TestForgetNonDefaultVaultTargetsItsVault(t *testing.T) {
+	h := newEHarness(t)
+	// A LIVE workspace with a real default-vault snapshot keeps the
+	// last-of-parked guard out of play.
+	snap := forgettableSnapshot(t, h)
+	base := filepath.Dir(h.stateDir)
+	v2, v2RowID := registerVaultAt(t, h, "vault2", filepath.Join(base, "vault2"))
+	v2snap := seedSealedRowInVault(t, h, snap.WorkspaceID, staleHex("c1"), staleHex("c2"), v2RowID)
+
+	code, stdout, stderr := h.run("forget", "--json", string(v2snap.ID), "--yes")
+	if code != ExitOK {
+		t.Fatalf("code = %d, want %d (stderr %s)", code, ExitOK, stderr)
+	}
+	// The List/Forget calls ran against vault TWO — never the default.
+	if len(h.store.forgetRepoDirs) != 1 || h.store.forgetRepoDirs[0] != v2.RepoDir {
+		t.Fatalf("forget ran against %v, want exactly the bound vault %s", h.store.forgetRepoDirs, v2.RepoDir)
+	}
+	if len(h.store.listRepoDirs) == 0 {
+		t.Fatal("no backend Lists recorded")
+	}
+	for _, dir := range h.store.listRepoDirs {
+		if dir != v2.RepoDir {
+			t.Fatalf("List ran against %q, want only the snapshot's bound vault %s", dir, v2.RepoDir)
+		}
+	}
+	if backendPresent(h, v2snap.PayloadBackendID) || backendPresent(h, v2snap.SealBackendID) {
+		t.Error("V2 pair still present after forget")
+	}
+	// The receipt names the vault the forget actually ran against.
+	det := envelopeOf(t, stdout)["details"].(map[string]any)
+	if id, _ := det["vault_id"].(string); id != v2.ID {
+		t.Errorf("details.vault_id = %v, want the bound registry vault %s", det["vault_id"], v2.ID)
+	}
+}
+
+func TestForgetCryptoVaultUnresolvableFailsClosed(t *testing.T) {
+	h := newEHarness(t)
+	snap := forgettableSnapshot(t, h)
+	base := filepath.Dir(h.stateDir)
+	ghostDir := filepath.Join(base, "ghost-vault")
+	ghostRowID := lifecycle.VaultIDFor("ecli-fake-repo", ghostDir)
+	// The CATALOG knows the vault row (the FK needs it), but NO
+	// registered vault backs it: the binding cannot be resolved.
+	if err := h.cat().RegisterVault(catalog.Vault{ID: ghostRowID, Path: ghostDir, RepoID: "ecli-fake-repo"}); err != nil {
+		t.Fatal(err)
+	}
+	ghost := seedSealedRowInVault(t, h, snap.WorkspaceID, staleHex("e1"), staleHex("e2"), ghostRowID)
+
+	code, _, stderr := h.run("forget", string(ghost.ID), "--yes")
+	if code != ExitBlocked {
+		t.Fatalf("code = %d, want %d — forget must FAIL CLOSED on an unresolvable vault, never fall back to the default (stderr %s)", code, ExitBlocked, stderr)
+	}
+	if !strings.Contains(stderr, ghostDir) && !strings.Contains(stderr, string(ghostRowID)) {
+		t.Errorf("refusal must name the unresolvable vault:\n%s", stderr)
+	}
+	// Nothing ran against ANY vault, and the bytes are untouched.
+	if len(h.store.forgetRepoDirs) != 0 {
+		t.Fatalf("forget calls ran against %v; an unresolvable binding must not reach the backend", h.store.forgetRepoDirs)
+	}
+	if !backendPresent(h, ghost.PayloadBackendID) || !backendPresent(h, ghost.SealBackendID) {
+		t.Fatal("the unresolvable vault's pair was forgotten through a fallback")
+	}
+	if got, err := h.cat().GetSnapshot(ghost.ID); err != nil || !got.Pinned {
+		t.Fatalf("ghost snapshot row disturbed: %+v (%v)", got, err)
+	}
+	if pending, _ := h.cat().PendingRetentionIntents(); len(pending) != 0 {
+		t.Errorf("retention intents recorded despite the fail-closed refusal: %v", pending)
+	}
 }

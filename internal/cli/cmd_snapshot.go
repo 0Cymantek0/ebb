@@ -61,7 +61,9 @@ func openCaptureCommand(deps Deps, streams Streams, root string) (*session, disc
 	// E12: the name-only fallback refuses instead of silently rebinding
 	// a same-named workspace recorded at a different root; the blocked
 	// error propagates through every capture command's classifyExitCode.
-	wsID, werr := sess.resolveWorkspaceIDRefusing(disc.Policy.Workspace.Name, disc.Root)
+	// The discovered native identity (disc.Ident) rides along so the
+	// same-path branch can also refuse a REPLACED directory.
+	wsID, werr := sess.resolveWorkspaceIDRefusing(disc.Policy.Workspace.Name, disc.Root, disc.Ident)
 	if werr != nil {
 		stop()
 		sess.close()
