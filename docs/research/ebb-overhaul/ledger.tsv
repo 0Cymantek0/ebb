@@ -1,0 +1,24 @@
+id	claim_status	boundary	finding	plan_decision	evidence
+R01	FALSIFIED	SQL and selection reduction	Ascending-first selected old rather than new	E10 explicit eligible recency	evidence.json results R01
+R02	FALSIFIED	Decision reduction	Latest trim omitted earlier outstanding group	E09 generation obligations	evidence.json results R02
+R03	FALSIFIED	SQL and custody reduction	Two history rows represented only one surviving copy	E11 custody not row count	evidence.json results R03
+R04	FALSIFIED	Real local filesystem	Package metadata stayed equal while implementation changed	D03 retain unknown output bytes	evidence.json results R04
+R05	FALSIFIED	Real local filesystem	Same inode size mtime had different bytes	D04 fresh content evidence inside stable epoch	evidence.json results R05
+R06	FALSIFIED	Real local filesystem	Live write changed hardlink backup but not independent copy	D02 independent custody	evidence.json results R06
+R07	FALSIFIED	Real Linux filesystem	Lexical containment followed ancestor link outside scope	D05 handle-based scope enforcement	evidence.json results R07
+R08	FALSIFIED	Real Linux filesystem	Open descriptor wrote after quarantine rename	D04 quiescence separate from rename	evidence.json results R08
+R09	FALSIFIED	Real local filesystem	Empty output passed existence without required content	D09 evidence-specific outcomes	evidence.json results R09
+R10	FALSIFIED	Fixture and decision reduction	Partial absence allowed replay despite new data in another group	D07 per-generation conflicts	evidence.json results R10
+R11	FALSIFIED	Zlib experiment not restic benchmark	High-entropy 1MiB retained representation grew 326 bytes	D08 per-volume net and transient accounting	evidence.json results R11
+R12	FALSIFIED	Logical counterexample	One trace omitted a future branch dependency	D01 observations not universal semantics	evidence.json results R12
+R13	SUPPORTED_WITHIN_MODEL	Finite state exploration	20 states 42 transitions no counterexample; three weakened variants fail	D02 D06 custody and leases	evidence.json results R13
+R14	SUPPORTED_WITHIN_MODEL	Intent reducer	16 mode cases and stale or duplicate accept checks met gates	D10 one typed interaction protocol	evidence.json results R14
+R15	SUPPORTED_WITHIN_MODEL	Outcome reducer	Installer success did not imply health checked	D09 separate readiness evidence	evidence.json results R15
+R16	FALSIFIED	Real fixture and decision reduction	Verified backup preceded newer live content	D04 stable capture/removal epoch	evidence.json round2 R16
+R17	FALSIFIED	Failure-domain model	Two locations shared one disk	D11 independent domains	evidence.json round2 R17
+R18	FALSIFIED	Batch interruption model	One component evicted while another stayed live	D12 resumable per-component partial outcomes	evidence.json round2 R18
+R19	FALSIFIED	Trust-anchor logical model	Mutually replaced descriptions agreed after witness loss	D13 authenticity versus consistency; assumes compromised descriptions or provider/key	evidence.json round2 R19
+G01	UNRESOLVED	Native Windows and Linux Ebb integration	No production runtime qualification in this run	Release gate required	plan.md
+G02	UNRESOLVED	Power-loss and concurrent actor testing	Atomic model does not exercise torn writes or real coordination	Release gate required	plan.md
+G03	UNRESOLVED	User study	Time savings and low-effort adoption not measured	Product-value gate required	plan.md
+G04	UNRESOLVED	Real restic workload benchmark	Net recovery-backed space and restore latency not measured	Storage-economics gate required	plan.md
