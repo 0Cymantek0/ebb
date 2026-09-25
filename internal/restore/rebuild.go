@@ -46,6 +46,14 @@ type PendingApproval struct {
 	Tool         actions.ToolIdentity
 	InputDigests map[string]string
 	Cause        error
+	// Legacy (wave-5 D5) marks an action synthesized from a trim
+	// manifest WITHOUT frozen action definitions: its historical
+	// approval identity is unavailable, so the approval the resolver
+	// records is a fresh explicit consent — never the previously
+	// approved action. Resolvers surface the legacy disclosure for such
+	// pendings; a non-interactive one refuses them unless consent was
+	// given out of band (--legacy-approve).
+	Legacy bool
 }
 
 // ApprovalResolver is the CLI-supplied seam that resolves pending

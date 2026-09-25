@@ -7,18 +7,23 @@
 // flags, prompts, the §17.2 envelope and the exit mapping).
 //
 // Restore is NOT destructive to preserved data, so it never needs
-// --yes: recipes carry no interactive re-approval (they were displayed
-// and approved at trim time and are sealed in the removal manifest),
-// and the only decisions are the branch-mismatch and drift menus —
+// --yes: recipes whose recorded approval matches the CURRENT tool and
+// input digests run silently (the trim-time approval is stored in the
+// state dir's approvalstore and verified verbatim — wave-5 D4), and the
+// only decisions are the branch-mismatch and drift menus —
 // terminal-only, NEVER auto-decided, and opted out entirely by --json
 // (machine mode refuses with the typed error instead of prompting).
+// A legacy trim manifest (one without frozen action definitions) needs
+// fresh explicit approval: --legacy-approve records it headless, an
+// interactive terminal confirms it instead (wave-5 D5).
 //
 // Exit contract: 0 restored (or previewed, with --dry-run); 2 usage
 // (bad flags); 3 blocked (nothing to restore, in-flight Git conflict,
-// unresolved branch mismatch, already restored, drift without a
-// strategy, declined menu); 6 recipe execution or protected-gate
-// failure (the op lands RESTORE_FAILED and rerunning resumes); 7
-// vault; 130 cancelled (signal).
+// unresolved branch mismatch, live outputs present, legacy manifest
+// without approval, approval drift without a terminal, already
+// restored, drift without a strategy, declined menu); 6 recipe
+// execution or protected-gate failure (the op lands RESTORE_FAILED and
+// rerunning resumes); 7 vault; 130 cancelled (signal).
 
 package cli
 
@@ -29,6 +34,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/0Cymantek0/ebb/internal/actions/approvalstore"
 	"github.com/0Cymantek0/ebb/internal/catalog"
 	"github.com/0Cymantek0/ebb/internal/platform"
 	"github.com/0Cymantek0/ebb/internal/restore"
@@ -40,6 +46,10 @@ type restoreGroupDetails struct {
 	Command  []string             `json:"command"`
 	Drift    []restore.DriftEntry `json:"drift,omitempty"`
 	Overlays []string             `json:"overlays,omitempty"`
+	// Legacy marks a group replayed through the legacy synthesis path
+	// (wave-5 D5): freshly approved at restore time, never claimed to
+	// be the previously-approved action.
+	Legacy bool `json:"legacy,omitempty"`
 }
 
 // restoreDetails is the --json payload of a restore (preview or result).
@@ -64,6 +74,8 @@ func cmdRestore(args []string, streams Streams, deps Deps) int {
 	jsonOut := fs.Bool("json", false, "emit JSON envelope on stdout")
 	strategyFlag := fs.String("strategy", "", "drift reconciliation: merge (union manifests, live wins) | current (run the live files) | baseline (revert inputs to the trim baseline)")
 	dryRun := fs.Bool("dry-run", false, "report the selected trim, commands, drift and overlays without effects")
+	legacyApprove := fs.Bool("legacy-approve", false,
+		"record the fresh explicit approval legacy trim manifests (without frozen action definitions) need, without a prompt; a legacy replay is labeled a 'legacy recovery attempt' and is never claimed to be the previously-approved action")
 	if err := fs.Parse(reorderFlags(args, "strategy")); err != nil {
 		return ExitUsage
 	}
@@ -101,12 +113,28 @@ func cmdRestore(args []string, streams Streams, deps Deps) int {
 		return emitFailure(env, *jsonOut, streams, ExitUsage,
 			fmt.Sprintf("restore %s: action runner %v", root, ErrNotIntegrated))
 	}
+	// Wave-5 (D4): the REAL local approval store and the CLI-owned
+	// grouped approval resolver — the same machinery `ebb open`'s
+	// rebuild uses. Exact matches never reach the resolver (silent
+	// replay, D033 preserved); missing/stale/drifted approvals resolve
+	// through it (prompted on a terminal, blocked headless) and the
+	// legacy-consent flag (D5) takes the --yes role for fresh legacy
+	// approvals only — drift still refuses headless. The resolver is
+	// wrapped with the legacy disclosure: actions synthesized from a
+	// manifest without frozen definitions are presented as what they are
+	// (freshly approved legacy recovery attempts), and a non-terminal
+	// refuses them with the --legacy-approve guidance (restore has no
+	// --yes flag, so open's headless advice would misdirect).
+	approvalStore := approvalstore.New(sess.approvalsPath())
 	lr, err := restore.NewLiveRestorer(restore.LiveDependencies{
 		Store:      sess.store,
 		Cat:        sess.cat,
 		Probe:      deps.NewProbe(),
 		CreateLink: platform.CreateLink,
 		Runner:     runner,
+		Approver:   approvalStore,
+		Approve: restoreLegacyApprovalResolver(deps, streams, *legacyApprove,
+			openApprovalResolver(deps, streams, *legacyApprove, approvalStore)),
 		ObserveGit: deps.ObserveGit,
 		Prompt:     newRestorePrompter(deps, streams, *jsonOut),
 	})
@@ -120,7 +148,7 @@ func cmdRestore(args []string, streams Streams, deps Deps) int {
 	cErr := sess.withVaultPassfile(ctx, func(repoDir, passfile string) error {
 		rerr = nil
 		res, rerr = lr.LiveRestore(ctx, restore.VaultRef{RepoDir: repoDir, Passfile: passfile},
-			root, restore.LiveRestoreOptions{Strategy: strategy, DryRun: *dryRun})
+			root, restore.LiveRestoreOptions{Strategy: strategy, DryRun: *dryRun, LegacyApprove: *legacyApprove})
 		return rerr
 	})
 	if cErr != nil {
@@ -185,6 +213,7 @@ func restoreResultDetails(sess *session, res restore.LiveRestoreResult, gate str
 	for _, g := range res.Groups {
 		details.Groups = append(details.Groups, restoreGroupDetails{
 			ID: g.GroupID, Command: g.Command, Drift: g.Drift, Overlays: g.Overlays,
+			Legacy: g.Legacy,
 		})
 	}
 	for _, a := range res.Actions {
@@ -206,7 +235,75 @@ func restoreConditions(res restore.LiveRestoreResult) []string {
 	if len(res.OverlaysApplied) > 0 {
 		conds = append(conds, fmt.Sprintf("overlays-applied:%d", len(res.OverlaysApplied)))
 	}
+	if restoreIsLegacy(res) {
+		conds = append(conds, "legacy-recovery-attempt")
+	}
 	return conds
+}
+
+// restoreIsLegacy reports whether any replayed group ran through the
+// legacy synthesis path (wave-5 D5): the envelope must label such a
+// run a "legacy recovery attempt", never a previously-approved replay.
+func restoreIsLegacy(res restore.LiveRestoreResult) bool {
+	for _, g := range res.Groups {
+		if g.Legacy {
+			return true
+		}
+	}
+	return false
+}
+
+// restoreLegacyApprovalResolver wraps open's grouped approval resolver
+// with the wave-5 D5 legacy disclosure. Pendings synthesized from a
+// trim manifest WITHOUT frozen action definitions are never the
+// previously-approved actions, so: a non-terminal refuses them with the
+// --legacy-approve guidance (open's headless advice names --yes, a flag
+// restore does not have — the misdirection would strand headless users);
+// otherwise the legacy-recovery-attempt disclosure prints before open's
+// grouped listing and typed confirm. Exact matches never reach either
+// resolver (the driver's pre-pass swallows them — D033 preserved).
+func restoreLegacyApprovalResolver(deps Deps, streams Streams, legacyApprove bool, base restore.ApprovalResolver) restore.ApprovalResolver {
+	return func(ctx context.Context, pending []restore.PendingApproval) error {
+		var legacy []restore.PendingApproval
+		for _, p := range pending {
+			if p.Legacy {
+				legacy = append(legacy, p)
+			}
+		}
+		if len(legacy) == 0 {
+			return base(ctx, pending)
+		}
+		interactive := deps.StdinIsTerminal != nil && deps.StdinIsTerminal()
+		if !legacyApprove && !interactive {
+			return blockedError(fmt.Errorf("%s: %d action(s) of this trim manifest have no frozen action definition, so the exact previously-approved action is not on record and its historical approval identity is unavailable; normal replay is refused.%s Safe action: rerun with --legacy-approve to record the fresh explicit approval headless (a legacy replay is labeled a 'legacy recovery attempt' and is never claimed to be the previously-approved action), or rerun in a terminal to review the recorded recipes and confirm",
+				restore.CodeLegacyManifest, len(legacy), legacyRecipeDisclosure(legacy)))
+		}
+		fmt.Fprint(streams.Err, legacyRecoveryBanner(legacy))
+		return base(ctx, pending)
+	}
+}
+
+// legacyRecoveryBanner is the pre-approval disclosure for a consented
+// (terminal or --legacy-approve) legacy replay: what is about to be
+// approved, and the honest label it carries.
+func legacyRecoveryBanner(pending []restore.PendingApproval) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "legacy recovery attempt: this trim manifest predates frozen action definitions, so its historical approval identity is unavailable; the recipes below were freshly approved NOW and are not the previously-approved actions\n")
+	fmt.Fprint(&b, strings.TrimPrefix(legacyRecipeDisclosure(pending), "\n"))
+	return b.String()
+}
+
+// legacyRecipeDisclosure renders every legacy pending action's recorded
+// recipe data (command, working root, inputs, outputs) — the same
+// disclosure shape the driver's refusal carries.
+func legacyRecipeDisclosure(pending []restore.PendingApproval) string {
+	var b strings.Builder
+	for _, p := range pending {
+		fmt.Fprintf(&b, "\n  action %s\n    command: %s\n    root: %s\n    inputs: %s\n    outputs: %s",
+			p.Def.ID, strings.Join(p.Def.Argv, " "), p.Def.WorkingRoot,
+			strings.Join(p.Def.Inputs, ", "), strings.Join(p.Def.Outputs, ", "))
+	}
+	return b.String()
 }
 
 // renderRestoreHuman renders the restore report (preview or result).
@@ -226,6 +323,9 @@ func renderRestoreHuman(d restoreDetails) string {
 	for _, g := range d.Groups {
 		cmdLine := strings.Join(g.Command, " ")
 		line("  group %s: %s\n", g.ID, cmdLine)
+		if g.Legacy {
+			line("    legacy recovery attempt: no frozen action definition; freshly approved now, not the previously-approved action\n")
+		}
 		for _, dr := range g.Drift {
 			line("    drift: %s\n", driftLine(dr))
 		}

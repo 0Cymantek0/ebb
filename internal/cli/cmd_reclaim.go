@@ -422,6 +422,26 @@ func runReclaimTrimStep(
 		return step, nil
 	}
 
+	// ---- wave-5 (D3): record the REAL approval behind the consent -------
+	// The confirmation above is the consent act; like `ebb trim`, it is
+	// persisted as local trust in the SAME approvalstore `ebb restore`
+	// verifies against (the exact frozen definition, the resolved tool
+	// identity, the live input digests). Without it a reclaim-performed
+	// trim would force every later restore through re-approval — the
+	// D033 no-re-prompt property would silently die for reclaim. A step
+	// whose approval cannot be recorded (tool unresolvable, unreadable
+	// input, store failure) routes around BEFORE any effect and is
+	// reported as skipped, like any other per-step blocker (§17.4 F10).
+	approvedBy := "flag:--yes"
+	if !yes {
+		approvedBy = "reclaim:interactive-confirm"
+	}
+	if aerr := recordTrimApprovals(sess, disc, []string{groupID}, approvedBy); aerr != nil {
+		step.Reason = codedMessage(aerr)
+		*warnings = append(*warnings, fmt.Sprintf("reclaim: trim group %s skipped: %v", groupID, aerr))
+		return step, nil
+	}
+
 	trimOpts := opts
 	trimOpts.DoTrim = []string{groupID}
 	// The recorded decision is the confirmation above (defense in depth:

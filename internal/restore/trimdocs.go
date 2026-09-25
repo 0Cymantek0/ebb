@@ -42,7 +42,8 @@ type trimPlanDocReader struct {
 }
 
 // removalGroupReader mirrors lifecycle's removalManifestDoc plus the
-// D033/D034 extension fields (recreate_live, overlay_patches).
+// D033/D034 extension fields (recreate_live, overlay_patches) and the
+// wave-5 frozen action `definition` (D1/D2).
 type removalGroupReader struct {
 	GroupID        string   `json:"group_id"`
 	Adapter        string   `json:"adapter"`
@@ -59,6 +60,12 @@ type removalGroupReader struct {
 	// OverlayPatches are the D034 carve-outs: preserved files inside the
 	// group's outputs, re-applied AFTER the recipe recreates the outputs.
 	OverlayPatches []overlayPatchReader `json:"overlay_patches,omitempty"`
+	// Definition (wave-5, D1/D2) is the EXACT frozen action contract the
+	// trim sealed: the restore driver replays it verbatim instead of
+	// synthesizing a fresh Definition. Nil on legacy manifests (written
+	// before the frozen contract existed) — the whole plan is then
+	// legacy and normal replay refuses (D5).
+	Definition *actionDefinitionDoc `json:"definition,omitempty"`
 }
 
 // recipeInputReader mirrors lifecycle's recipeInput.
@@ -190,6 +197,24 @@ func readTrimDocs(ctx context.Context, store domain.SnapshotStore, vault VaultRe
 	}
 	if err := validateTrimPlan(plan); err != nil {
 		return docs, &ErrVerification{Check: "trim-documents", Details: []string{err.Error()}}
+	}
+	// Wave-5 (D2): every frozen action definition must itself validate
+	// before anything trusts it — hostile paths, an unknown network
+	// spelling, an input/output overlap or a non-positive timeout
+	// refuse the document at read time (never mid-restore).
+	for _, g := range plan.Groups {
+		if g.Definition == nil {
+			continue
+		}
+		def, err := defrostDefinition(g.Definition)
+		if err != nil {
+			return docs, &ErrVerification{Check: "trim-documents", Details: []string{
+				fmt.Sprintf("trim group %s frozen definition: %v", g.GroupID, err)}}
+		}
+		if def.ID != g.GroupID {
+			return docs, &ErrVerification{Check: "trim-documents", Details: []string{
+				fmt.Sprintf("trim group %s frozen definition names action %q", g.GroupID, def.ID)}}
+		}
 	}
 
 	docs.opDir = opDir

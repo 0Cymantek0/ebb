@@ -77,12 +77,22 @@ func Recipe(g GroupSuggestion, wsRoot string) (actions.Definition, error) {
 
 // build assembles and validates the Definition; the validation contract
 // (path rules, input/output disjointness, env keys, timeout) is enforced
-// by the actions package so it cannot drift from here.
+// by the actions package so it cannot drift from here. The working root
+// is the suggestion's DECLARED logical root ("" or "." means the
+// workspace root): a frozen recipe must execute inside the group's own
+// directory exactly like a custom command does (wave-5 E04 — the
+// hardcoded "." made every nested-root built-in recipe run at the
+// workspace root and made restore synthesize the wrong working
+// directory).
 func build(g GroupSuggestion, argv, envAllow []string) (actions.Definition, error) {
+	workingRoot := g.WorkingRoot
+	if workingRoot == "" {
+		workingRoot = "."
+	}
 	d := actions.Definition{
 		ID:          g.GroupID,
 		Argv:        argv,
-		WorkingRoot: ".",
+		WorkingRoot: workingRoot,
 		Inputs:      append([]string(nil), g.Inputs...),
 		Outputs:     append([]string(nil), g.Outputs...),
 		EnvAllow:    append([]string(nil), envAllow...),

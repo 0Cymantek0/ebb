@@ -366,6 +366,33 @@ func runMklinkJ(link, target string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+// fakeEcliToolOnPath writes a resolvable+hashable fake executable named
+// name into a fresh PATH-front directory (pnpm.bat on Windows —
+// LookPath resolves it through PATHEXT — a +x script elsewhere). The
+// trim approval pins its identity; the fake action runner never execs
+// it, so arbitrary bytes are fine.
+func fakeEcliToolOnPath(t *testing.T, name string) {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	full := name
+	if runtime.GOOS == "windows" {
+		full = name + ".bat"
+	}
+	p := filepath.Join(bin, full)
+	if err := os.WriteFile(p, []byte("@echo off\r\nrem ecli fixture tool\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 // newEHarness builds a disposable world: state dir, fixture workspace
 // (Ebbfile declaring the deps group), registered vault, env password.
 func newEHarness(t *testing.T) *eHarness {
@@ -388,6 +415,11 @@ func newEHarness(t *testing.T) *eHarness {
 	// Register the default vault; the password comes from the env source
 	// (CI/tests never touch a real credential store).
 	t.Setenv(vault.EnvPassword, "ecli-test-secret")
+	// The wave-5 trim approval records the resolved tool identity, so the
+	// recipe's program must resolve deterministically on EVERY host: a
+	// fake pnpm sits at the front of PATH (hashable, never execed — the
+	// fake runner runs the recipes).
+	fakeEcliToolOnPath(t, "pnpm")
 	repoDir := filepath.Join(base, "vault")
 	if _, err := vault.New(filepath.Join(h.stateDir, vault.RegistryFile)).Register("main", repoDir, "ecli-fake-repo"); err != nil {
 		t.Fatal(err)

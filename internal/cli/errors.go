@@ -23,16 +23,23 @@ import (
 // errors carry their own EBB_E_* codes; these are the blockers the CLI
 // layer itself raises before a coordinator call.
 const (
-	CodeNoVault               = "EBB_E_NO_VAULT"
-	CodeUnlockRejected        = "EBB_E_UNLOCK_REJECTED"
-	CodeWritersUnasserted     = "EBB_E_WRITERS_UNASSERTED"
-	CodeOpenUnknownTarget     = "EBB_E_OPEN_UNKNOWN_TARGET"
-	CodeOpenNoDestination     = "EBB_E_OPEN_NO_DESTINATION"
-	CodeEscalationUnconfirmed = "EBB_E_ESCALATION_UNCONFIRMED"
-	CodeForgetLastOfParked    = "EBB_E_LAST_OF_PARKED"
-	CodeForgetUnconfirmed     = "EBB_E_FORGET_UNCONFIRM"
-	CodeForgetUnsealed        = "EBB_E_FORGET_UNSEALED"
-	CodeForgetNotForgettable  = "EBB_E_NOT_FORGETTABLE"
+	CodeNoVault           = "EBB_E_NO_VAULT"
+	CodeUnlockRejected    = "EBB_E_UNLOCK_REJECTED"
+	CodeWritersUnasserted = "EBB_E_WRITERS_UNASSERTED"
+	CodeOpenUnknownTarget = "EBB_E_OPEN_UNKNOWN_TARGET"
+	CodeOpenNoDestination = "EBB_E_OPEN_NO_DESTINATION"
+	// Wave 5 selection/custody ambiguity refusals (E10/E12): an open
+	// target that recency or the name alone cannot uniquely resolve, and
+	// a capture whose name-only workspace match would silently rebind a
+	// different recorded root.
+	CodeOpenAmbiguousTarget       = "EBB_E_OPEN_AMBIGUOUS_TARGET"
+	CodeOpenTimestampInvalid      = "EBB_E_OPEN_TIMESTAMP_INVALID"
+	CodeWorkspaceIdentityMismatch = "EBB_E_WORKSPACE_IDENTITY_MISMATCH"
+	CodeEscalationUnconfirmed     = "EBB_E_ESCALATION_UNCONFIRMED"
+	CodeForgetLastOfParked        = "EBB_E_LAST_OF_PARKED"
+	CodeForgetUnconfirmed         = "EBB_E_FORGET_UNCONFIRM"
+	CodeForgetUnsealed            = "EBB_E_FORGET_UNSEALED"
+	CodeForgetNotForgettable      = "EBB_E_NOT_FORGETTABLE"
 	// gc eligibility blockers (Foundation §11.6/§16.6: maintenance is
 	// serialized against captures/opens/forgets and runs only after
 	// retention is fully resolved — F38).

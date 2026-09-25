@@ -14,11 +14,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/actions/approvalstore"
 	"github.com/0Cymantek0/ebb/internal/catalog"
 	"github.com/0Cymantek0/ebb/internal/domain"
 	"github.com/0Cymantek0/ebb/internal/platform"
@@ -36,6 +38,19 @@ type trimFixtureSpec struct {
 	// recreateLive is the group's recreate_live argv (nil/empty omits
 	// the field entirely — the older-manifest shape).
 	recreateLive []string
+	// secondGroup adds a second removal-plan group ("py-reqs", pip,
+	// outputs ["vendor"], inputs ["requirements.txt"]) so multi-group
+	// gates (per-group output presence, per-group definitions) can be
+	// exercised.
+	secondGroup bool
+	// frozenDef attaches the wave-5 frozen action `definition` to the
+	// FIRST group (the shape a real wave-5 trim freezes) and records the
+	// matching trim-time approval for it. Nil = legacy manifest (no
+	// definition field — the pre-wave shape most tests exercise).
+	frozenDef *actionDefinitionDoc
+	// noTrimApproval skips recording the trim-time approval for the
+	// frozen definition (approval-missing refusals).
+	noTrimApproval bool
 	// overlayFiles maps root-relative patch paths → file content.
 	overlayFiles map[string]string
 	// overlayLinks maps root-relative patch paths → link target text.
@@ -82,6 +97,19 @@ type trimFixture struct {
 	liveGit domain.GitObservation
 	// prompt is the injected Prompter (nil = non-interactive).
 	prompt Prompter
+
+	// approver is the REAL approvalstore document backing the driver's
+	// approval pre-pass (wave-5 D4); the trim-time approval for a frozen
+	// definition is recorded into it at build time.
+	approver *approvalstore.FileApprover
+	// resolver is the injected ApprovalResolver. The default records
+	// every pending approval exactly as resolved (simulating user
+	// consent, like --legacy-approve / an interactive yes); tests
+	// override it (nil = non-interactive, or a fail-loud sentinel).
+	resolver ApprovalResolver
+	// toolPath is the fake recipe binary the fixture put on PATH
+	// (rewriting its bytes simulates tool drift for the approval gate).
+	toolPath string
 }
 
 const (
@@ -104,6 +132,24 @@ func buildTrimFixture(t *testing.T, spec trimFixtureSpec) *trimFixture {
 		liveGit:  spec.liveGit,
 	}
 	f.wsRoot = filepath.Join(f.parent, "livews")
+
+	// The recipe binary: a REAL resolvable+hashable executable on PATH
+	// so the driver's approval pre-pass pins a genuine tool identity
+	// (the fake runner never execs it). Rewriting its bytes after the
+	// fixture is built simulates tool drift (approval-stale refusals).
+	f.toolPath = fakeToolOnPath(t, lrGroupAdapter)
+
+	// The approval store + the default permissive resolver (records
+	// every pending approval exactly as resolved — simulated consent).
+	f.approver = approvalstore.New(filepath.Join(f.parent, "approvals.json"))
+	f.resolver = func(ctx context.Context, pending []PendingApproval) error {
+		for _, p := range pending {
+			if _, err := f.approver.Approve(p.Def, p.Tool, p.InputDigests, "fixture-consent"); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	// ---- catalog: workspace + trim operation row (the op id names the
 	// op dir, so it must exist before the frozen documents are minted).
@@ -197,20 +243,44 @@ func buildTrimFixture(t *testing.T, spec trimFixtureSpec) *trimFixture {
 	if spec.planSchemaVersion != 0 {
 		schemaVersion = spec.planSchemaVersion
 	}
+	groups := []removalGroupReader{{
+		GroupID: lrGroupName, Adapter: lrGroupAdapter, Root: ".",
+		Outputs:        []string{"node_modules"},
+		ReclaimCommand: []string{"pnpm", "install", "--frozen-lockfile"},
+		RecipeInputs:   inputs,
+		Members:        members,
+	}}
+	if spec.secondGroup {
+		reqs := []byte("left-pad==1.0.0\n")
+		writeFile(t, filepath.Join(opPath, "inputs", "py-reqs", "requirements.txt"), reqs)
+		writeFile(t, filepath.Join(f.wsRoot, "requirements.txt"), reqs)
+		groups = append(groups, removalGroupReader{
+			GroupID: "py-reqs", Adapter: "pip", Root: ".",
+			Outputs:        []string{"vendor"},
+			ReclaimCommand: []string{"python", "-m", "pip", "install", "-r", "requirements.txt"},
+			RecipeInputs: []recipeInputReader{{
+				Path: "requirements.txt", Copy: "inputs/py-reqs/requirements.txt",
+				Digest: digestBytes(reqs),
+			}},
+			Members: []trimMemberReader{{
+				Entry: domain.Entry{Root: domain.RootMain, Path: "vendor/lib.js",
+					Kind: domain.KindFile, LogicalSize: 4, Digest: digestBytes([]byte("lib!")),
+					Ownership: domain.OwnershipOwned, Route: domain.RouteReconstruct},
+				Group: "py-reqs",
+			}},
+		})
+	}
 	plan := trimPlanDocReader{
 		SchemaVersion: schemaVersion,
 		OperationID:   string(f.trimOpID),
 		SnapshotID:    string(f.snapID),
-		Groups: []removalGroupReader{{
-			GroupID: lrGroupName, Adapter: lrGroupAdapter, Root: ".",
-			Outputs:        []string{"node_modules"},
-			ReclaimCommand: []string{"pnpm", "install", "--frozen-lockfile"},
-			RecipeInputs:   inputs,
-			Members:        members,
-		}},
+		Groups:        groups,
 	}
 	if len(spec.recreateLive) > 0 {
 		plan.Groups[0].RecreateLive = spec.recreateLive
+	}
+	if spec.frozenDef != nil {
+		plan.Groups[0].Definition = spec.frozenDef
 	}
 	if patches != nil {
 		plan.Groups[0].OverlayPatches = patches
@@ -289,7 +359,55 @@ func buildTrimFixture(t *testing.T, spec trimFixtureSpec) *trimFixture {
 	if err := f.cat.SetBackendRefs(f.trimOpID, f.payloadID, ""); err != nil {
 		t.Fatalf("fixture backend refs: %v", err)
 	}
+
+	// ---- trim-time approval for the frozen definition (wave-5 D3
+	// simulated): the exact frozen contract, the resolved tool identity
+	// and the digests of the present declared inputs.
+	if spec.frozenDef != nil && !spec.noTrimApproval {
+		def, derr := defrostDefinition(spec.frozenDef)
+		if derr != nil {
+			t.Fatalf("fixture frozen definition invalid: %v", derr)
+		}
+		tool, terr := actions.ResolveTool(def.Argv[0])
+		if terr != nil {
+			t.Fatalf("fixture tool resolution: %v", terr)
+		}
+		digests := make(map[string]string, len(def.Inputs))
+		for _, rel := range def.Inputs {
+			d, derr := actions.DigestFile(filepath.Join(f.wsRoot, filepath.FromSlash(rel)))
+			if derr != nil {
+				t.Fatalf("fixture approval input %s: %v", rel, derr)
+			}
+			digests[rel] = d
+		}
+		if _, aerr := f.approver.Approve(def, tool, digests, "fixture:trim-approval"); aerr != nil {
+			t.Fatalf("fixture trim approval: %v", aerr)
+		}
+	}
 	return f
+}
+
+// fakeToolOnPath writes a resolvable+hashable fake executable named
+// name into a fresh PATH-front directory (pnpm.bat on Windows —
+// LookPath resolves it through PATHEXT — a +x script elsewhere). The
+// fake runner never execs it; the driver's approval pre-pass only
+// resolves and hashes it, exactly as it would a real toolchain.
+func fakeToolOnPath(t *testing.T, name string) string {
+	t.Helper()
+	bin := t.TempDir()
+	full := name
+	if runtime.GOOS == "windows" {
+		full = name + ".bat"
+	}
+	p := filepath.Join(bin, full)
+	writeFile(t, p, []byte("@echo off\r\nrem fixture tool\r\n"))
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return p
 }
 
 func sortOverlayPatches(p []overlayPatchReader) {
@@ -300,13 +418,16 @@ func sortOverlayPatches(p []overlayPatchReader) {
 	}
 }
 
-// newLiveRestorer wires the driver over the fixture. runner may be nil
-// for dry runs.
+// newLiveRestorer wires the driver over the fixture: the REAL approval
+// store built by the fixture plus its resolver (permissive by default;
+// tests override). runner may be nil for dry runs.
 func (f *trimFixture) newLiveRestorer(runner ActionRunner) *LiveRestorer {
 	f.t.Helper()
 	o, err := NewLiveRestorer(LiveDependencies{
 		Store: f.store, Cat: f.cat, Probe: f.probe, CreateLink: platform.CreateLink,
-		Runner: runner,
+		Runner:   runner,
+		Approver: f.approver,
+		Approve:  f.resolver,
 		ObserveGit: func(ctx context.Context, root string) (domain.GitObservation, error) {
 			return f.liveGit, nil
 		},

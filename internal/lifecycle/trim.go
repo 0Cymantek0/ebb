@@ -25,8 +25,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/0Cymantek0/ebb/internal/actions"
 	"github.com/0Cymantek0/ebb/internal/catalog"
 	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/pathcanon"
 	"github.com/0Cymantek0/ebb/internal/policy"
 )
 
@@ -114,6 +116,16 @@ func (c *Coordinator) Trim(ctx context.Context, vault VaultRef, root string, opt
 	// dedicated trim vocabulary immediately (catalog API is untouched).
 	if err := c.advance(st.opID, catalog.PhasePlanned, catalog.PhaseTrimPlanned, st.journal); err != nil {
 		return TrimResult{}, err
+	}
+
+	// ---- working-root escape gate (wave-5 D7) --------------------------
+	// A requested group's declared root is a working-directory contract;
+	// when it resolves (junction/symlink-aware, via pathcanon) OUTSIDE
+	// the workspace root, executing or scanning the group would reach
+	// beyond the sealed boundary. Refused before any scan or removal
+	// effect.
+	if reasons := trimWorkingRootEscapes(st, opts.DoTrim); len(reasons) > 0 {
+		return cancel(&ErrDestructiveBlocked{Reasons: reasons})
 	}
 
 	// ---- Scan + resolve the live root --------------------------------
@@ -293,6 +305,33 @@ func (c *Coordinator) trimRemoval(ctx context.Context, st *captureState) (int, e
 	return gone, nil
 }
 
+// trimWorkingRootEscapes applies the wave-5 D7 gate: every requested
+// group's declared root (the action working directory) must resolve —
+// junction/symlink-aware via pathcanon — inside the live workspace root.
+// A root of "." is the workspace itself and never escapes. A root whose
+// canonical spelling cannot be resolved (it does not exist yet) falls
+// back to its lexical spelling inside the root and passes here; the
+// scan and the runner's own directory checks cover the remaining
+// surface.
+func trimWorkingRootEscapes(st *captureState, groupIDs []string) []string {
+	var reasons []string
+	wsCanonical := pathcanon.CanonicalPath(st.rootAbs)
+	for _, id := range groupIDs {
+		g := policyGroupByID(st.opts.Policy, id)
+		if g.Root == "" || g.Root == "." {
+			continue
+		}
+		abs := filepath.Join(st.rootAbs, filepath.FromSlash(g.Root))
+		resolved := pathcanon.CanonicalPath(abs)
+		if !pathcanon.UnderPath(wsCanonical, resolved) {
+			reasons = append(reasons, fmt.Sprintf(
+				"regenerate group %s declares root %q, which resolves to %s — OUTSIDE the workspace root %s (junction/symlink escape); the group's recipe must never execute beyond the sealed boundary",
+				id, g.Root, resolved, wsCanonical))
+		}
+	}
+	return reasons
+}
+
 // buildTrimPlan freezes the per-group member sets from the resolved
 // inventory. A group with zero members is skipped (returned separately);
 // zero members across ALL requested groups fails the operation (nothing
@@ -418,10 +457,11 @@ func trimScanBlockers(st *captureState, groupIDs []string) []string {
 
 // writeTrimOpDir writes the trim op dir: manifest.json (scope
 // trim-removal-plan), removal-manifest.json (the frozen plan, including
-// any D034 overlay patches and the recreate_live argv), policy.toml and
-// byte-copies of each group's recipe inputs plus each group's carved
-// overlay entries. It contains ONLY these — a trim does not capture the
-// whole workspace (§17.3).
+// any D034 overlay patches and the recreate_live argv, plus the wave-5
+// frozen action `definition` per group), policy.toml and byte-copies of
+// each group's recipe inputs plus each group's carved overlay entries.
+// It contains ONLY these — a trim does not capture the whole workspace
+// (§17.3).
 func (c *Coordinator) writeTrimOpDir(st *captureState) error {
 	if err := os.MkdirAll(st.opDir, 0o700); err != nil {
 		return fmt.Errorf("lifecycle: op dir: %w", err)
@@ -433,6 +473,11 @@ func (c *Coordinator) writeTrimOpDir(st *captureState) error {
 	st.frozenPolicy = frozen
 	if err := os.WriteFile(filepath.Join(st.opDir, policyFrozenName), frozen, 0o600); err != nil {
 		return fmt.Errorf("lifecycle: write frozen policy: %w", err)
+	}
+
+	defByID := make(map[string]actions.Definition, len(st.opts.ActionDefs))
+	for _, d := range st.opts.ActionDefs {
+		defByID[d.ID] = d
 	}
 
 	var groups []removalManifestDoc
@@ -458,12 +503,21 @@ func (c *Coordinator) writeTrimOpDir(st *captureState) error {
 		for _, e := range gp.Members {
 			members = append(members, inventoryRecord{Entry: e, Group: gp.GroupID})
 		}
-		groups = append(groups, removalManifestDoc{
+		// Wave-5 (D1): freeze the EXACT action contract captured at trim
+		// time (the CLI-derived definition the ApprovalReady consent
+		// surface displayed). Groups whose adapter has no runnable recipe
+		// (pip, custom without command) freeze no definition — restore
+		// treats the whole plan as legacy (D5).
+		doc := removalManifestDoc{
 			GroupID: gp.GroupID, Adapter: gp.Adapter, Root: gp.Root,
 			Outputs: gp.Outputs, ReclaimCommand: gp.Reclaim,
 			RecipeInputs: inputs, Members: members,
 			OverlayPatches: overlays, RecreateLive: gp.LiveRecreate,
-		})
+		}
+		if def, ok := defByID[gp.GroupID]; ok {
+			doc.Definition = actionDefWire(def)
+		}
+		groups = append(groups, doc)
 	}
 	doc := trimPlanDoc{
 		SchemaVersion: schemaVersionCurrent,

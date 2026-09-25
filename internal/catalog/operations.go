@@ -108,6 +108,28 @@ func (c *Catalog) FailOperation(id domain.OperationID, phase, errMsg string) err
 	})
 }
 
+// SetForgetTarget records the LOGICAL identity of a forget operation's
+// target (snapshot id) alongside the backend pair (schemaV5): backend
+// ids identify physical objects; the snapshot id identifies the logical
+// recovery obligation whose unpin/retention this operation releases.
+// Rerun adoption compares all three.
+func (c *Catalog) SetForgetTarget(id domain.OperationID, snapID, payload, seal string) error {
+	return withTx(c.db, func(tx *sql.Tx) error {
+		res, err := tx.Exec(`UPDATE operations
+			SET snap_id = ?, payload_snap = ?, seal_snap = ?, updated_at = ?
+			WHERE id = ?`, nullStr(snapID), nullStr(payload), nullStr(seal), domain.FormatTime(time.Now()), string(id))
+		if err != nil {
+			return fmt.Errorf("catalog: set forget target of %s: %w", id, err)
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return fmt.Errorf("catalog: set forget target of %s: rows affected: %w", id, err)
+		} else if n == 0 {
+			return fmt.Errorf("%w: operation %s", ErrNotFound, id)
+		}
+		return nil
+	})
+}
+
 // SetBackendRefs records the committed payload and seal backend
 // snapshot ids on the operation (§12.2 steps 4-5). It does not guard on
 // phase: the P id is recorded right after capture, the S id after the
@@ -211,18 +233,19 @@ func (c *Catalog) ListOperations(ws domain.WorkspaceID) ([]Operation, error) {
 }
 
 const operationSelect = `SELECT id, workspace_id, kind, phase, generation, source_root, source_identity,
-	dest_path, payload_snap, seal_snap, intent_digest, last_error, next_action, started_at, updated_at
+	dest_path, payload_snap, seal_snap, snap_id, intent_digest, last_error, next_action, started_at, updated_at
 	FROM operations`
 
 func scanOperation(r rowScanner) (Operation, error) {
 	var op Operation
 	var workspaceID, sourceRoot, sourceIdentity, destPath, payloadSnap, sealSnap,
-		intentDigest, lastError, nextAction sql.NullString
+		snapID, intentDigest, lastError, nextAction sql.NullString
 	if err := r.Scan(&op.ID, &workspaceID, &op.Kind, &op.Phase, &op.Generation,
-		&sourceRoot, &sourceIdentity, &destPath, &payloadSnap, &sealSnap,
+		&sourceRoot, &sourceIdentity, &destPath, &payloadSnap, &sealSnap, &snapID,
 		&intentDigest, &lastError, &nextAction, &op.StartedAt, &op.UpdatedAt); err != nil {
 		return Operation{}, err
 	}
+	op.SnapID = snapID.String
 	op.WorkspaceID = domain.WorkspaceID(workspaceID.String)
 	op.SourceRoot = sourceRoot.String
 	op.SourceIdentity = sourceIdentity.String

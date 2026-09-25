@@ -26,10 +26,13 @@
 //
 // Target resolution: a 32-hex argument selects that snapshot directly
 // (an operation id under --resume/--cancel); a name selects the
-// workspace's latest sealed park snapshot (falling back to the latest
+// workspace's NEWEST sealed park snapshot (falling back to the newest
 // plain snapshot when no park exists) — never the vault's global latest
-// (§5.3). Destination: --to, else the workspace's recorded original
-// root; a parked/unbound workspace without --to is a usage error.
+// (§5.3). A name matching several workspaces, and a created_at tie
+// inside the winning kind, are ambiguity refusals demanding the explicit
+// snapshot id (Wave 5 E10/E12). Destination: --to, else the workspace's
+// recorded original root; a parked/unbound workspace without --to is a
+// usage error.
 //
 // Exit contract: 0 done (files-only included); 2 usage; 3 blocked
 // (trim/seal-kind snapshot, occupied destination, insufficient space);
@@ -47,6 +50,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/0Cymantek0/ebb/internal/actions"
 	"github.com/0Cymantek0/ebb/internal/actions/approvalstore"
@@ -127,14 +131,18 @@ func originalRootOf(cat *catalog.Catalog, wsID domain.WorkspaceID) string {
 
 // openDetails is the --json payload of a completed open.
 type openDetails struct {
-	Workspace       string            `json:"workspace"`
-	SnapshotID      string            `json:"snapshot_id"`
-	Kind            string            `json:"snapshot_kind"`
-	Destination     string            `json:"destination"`
-	EntriesRestored int64             `json:"entries_restored"`
-	BytesRestored   int64             `json:"bytes_restored"`
-	RebuildHints    []openRebuildHint `json:"rebuild_hints"`
-	Actions         []openActionRun   `json:"actions"`
+	Workspace  string `json:"workspace"`
+	SnapshotID string `json:"snapshot_id"`
+	Kind       string `json:"snapshot_kind"`
+	// SnapshotCreatedAt is the restored snapshot's RFC3339Nano creation
+	// timestamp: the receipt names WHICH state came back (Wave 5 E10),
+	// which matters precisely because recency now decides the target.
+	SnapshotCreatedAt string            `json:"snapshot_created_at,omitempty"`
+	Destination       string            `json:"destination"`
+	EntriesRestored   int64             `json:"entries_restored"`
+	BytesRestored     int64             `json:"bytes_restored"`
+	RebuildHints      []openRebuildHint `json:"rebuild_hints"`
+	Actions           []openActionRun   `json:"actions"`
 }
 
 type openRebuildHint struct {
@@ -594,6 +602,7 @@ func openResultDetails(sess *session, snapID domain.SnapshotID, res restore.Resu
 	snap, _ := sess.cat.GetSnapshot(snapID)
 	details.SnapshotID = string(snapID)
 	details.Kind = snap.Kind
+	details.SnapshotCreatedAt = snap.CreatedAt
 	if ws, err := sess.cat.GetWorkspace(res.WorkspaceID); err == nil {
 		details.Workspace = ws.Name
 	}
@@ -641,10 +650,14 @@ func emitOpenRebuildFailure(env Envelope, jsonOut bool, streams Streams, target 
 
 // resolveOpenTarget maps the CLI argument onto one sealed snapshot and
 // its workspace row. A 32-hex argument addresses the snapshot directly;
-// anything else is a workspace NAME (exact match; when several rows share
-// the name the parked one wins — the recoverable one). Name resolution
-// prefers the latest sealed park snapshot, then the latest sealed plain
-// snapshot; never a trim/seal-only record (§5.3).
+// anything else is a workspace NAME (exact match; several rows sharing
+// the name are an ambiguity refusal naming every candidate — names are
+// labels, not identities, Wave 5 E12). Name resolution prefers the
+// NEWEST sealed park snapshot, then the NEWEST sealed plain snapshot
+// (Wave 5 E10: ListSnapshots is created_at-ascending, so the newest
+// eligible row is the LAST match, never the first); a created_at tie
+// inside the winning kind is itself an ambiguity refusal. Never a
+// trim/seal-only record (§5.3).
 func resolveOpenTarget(sess *session, target string) (domain.SnapshotID, catalog.Workspace, error) {
 	if id, err := domain.ParseID(target); err == nil {
 		snap, gerr := sess.cat.GetSnapshot(domain.SnapshotID(id))
@@ -674,45 +687,94 @@ func resolveOpenTarget(sess *session, target string) (domain.SnapshotID, catalog
 			"%s: no workspace named %q is recorded (and the argument is not a 32-hex snapshot id). Safe action: check `ebb status` for workspace names and snapshot ids",
 			CodeOpenUnknownTarget, target))
 	}
-	ws := candidates[0]
-	for _, c := range candidates {
-		if c.Status == catalog.WorkspaceParked {
-			ws = c
-			break
+	if len(candidates) > 1 {
+		var b strings.Builder
+		for _, c := range candidates {
+			root := c.RootPath
+			if root == "" {
+				root = "(no recorded root)"
+			}
+			fmt.Fprintf(&b, "  - %s (status %s, root %s)\n", c.ID, c.Status, root)
 		}
+		return "", catalog.Workspace{}, blockedError(fmt.Errorf(
+			"%s: the name %q matches %d workspaces; names are labels, not identities:\n%sSafe action: pass the explicit snapshot id of the state to open (`ebb open <snapshot-id>`); `ebb status` lists every workspace's id, status and root",
+			CodeOpenAmbiguousTarget, target, len(candidates), b.String()))
 	}
+	ws := candidates[0]
 	snaps, serr := sess.cat.ListSnapshots(ws.ID)
 	if serr != nil {
 		return "", ws, blockedError(serr)
 	}
-	var latestPark, latestSnap *catalog.Snapshot
+	// E10: any sealed park still beats any plain snapshot (kind
+	// precedence preserved), but WITHIN the winning kind the NEWEST
+	// created_at must win — the ascending list made the old first-match
+	// loop restore the OLDEST state.
+	latest, aerr := newestSealedOfKind(snaps, catalog.SnapshotKindPark)
+	if aerr != nil {
+		return "", ws, aerr
+	}
+	if latest == nil {
+		latest, aerr = newestSealedOfKind(snaps, catalog.SnapshotKindSnapshot)
+		if aerr != nil {
+			return "", ws, aerr
+		}
+	}
+	if latest == nil {
+		return "", ws, blockedError(fmt.Errorf(
+			"%s: workspace %q has no sealed openable snapshot (park or snapshot kind). Safe action: check `ebb status`; a trim snapshot is not a workspace payload and a failed capture may have left an unsealed payload",
+			CodeOpenUnknownTarget, target))
+	}
+	return latest.ID, ws, nil
+}
+
+// newestSealedOfKind returns the newest (max created_at) sealed snapshot
+// of one kind, or nil when the workspace has none of that kind. Two
+// eligible rows sharing the exact same created_at string are refused as
+// ambiguous (Wave 5 E10): recency cannot decide between them, so the
+// caller must pass the explicit snapshot id.
+func newestSealedOfKind(snaps []catalog.Snapshot, kind string) (*catalog.Snapshot, error) {
+	var newest *catalog.Snapshot
+	var newestT time.Time
+	var ties []*catalog.Snapshot
 	for i := range snaps {
-		s := snaps[i]
-		if s.PayloadBackendID == "" || s.SealBackendID == "" {
+		s := &snaps[i]
+		if s.Kind != kind || s.PayloadBackendID == "" || s.SealBackendID == "" {
 			continue // unsealed payloads are never publishable (§11.3)
 		}
-		switch s.Kind {
-		case catalog.SnapshotKindPark:
-			if latestPark == nil {
-				sCopy := s
-				latestPark = &sCopy
-			}
-		case catalog.SnapshotKindSnapshot:
-			if latestSnap == nil {
-				sCopy := s
-				latestSnap = &sCopy
-			}
+		t, terr := time.Parse(time.RFC3339Nano, s.CreatedAt)
+		if terr != nil {
+			// Fail closed on corrupt evidence: an unparseable timestamp
+			// can never justify recency-based selection (and a lexical
+			// fallback would order representations, not instants).
+			return nil, blockedError(fmt.Errorf(
+				"%s: sealed %s snapshot %s has an unparseable creation timestamp %q; recency cannot be decided from corrupt evidence. Safe action: pass the explicit snapshot id (`ebb open <snapshot-id>`, see `ebb status`), or inspect the row with `ebb verify`",
+				CodeOpenTimestampInvalid, kind, s.ID, s.CreatedAt))
+		}
+		switch {
+		case newest == nil || t.After(newestT):
+			newest, newestT = s, t
+			ties = []*catalog.Snapshot{s}
+		case t.Equal(newestT):
+			// Parsed-instant equality, NOT string equality: the same
+			// instant has multiple RFC3339Nano spellings (".123Z" vs
+			// ".123000000Z") and RecordSnapshot does not normalize
+			// supplied timestamps.
+			ties = append(ties, s)
 		}
 	}
-	if latestPark != nil {
-		return latestPark.ID, ws, nil
+	if newest == nil {
+		return nil, nil
 	}
-	if latestSnap != nil {
-		return latestSnap.ID, ws, nil
+	if len(ties) > 1 {
+		ids := make([]string, 0, len(ties))
+		for _, c := range ties {
+			ids = append(ids, string(c.ID))
+		}
+		return nil, blockedError(fmt.Errorf(
+			"%s: %d sealed %s snapshots of this workspace share the same creation instant %s (%s); recency cannot decide. Safe action: pass the explicit snapshot id (`ebb open <snapshot-id>`, see `ebb status`)",
+			CodeOpenAmbiguousTarget, len(ties), kind, newest.CreatedAt, strings.Join(ids, ", ")))
 	}
-	return "", ws, blockedError(fmt.Errorf(
-		"%s: workspace %q has no sealed openable snapshot (park or snapshot kind). Safe action: check `ebb status`; a trim snapshot is not a workspace payload and a failed capture may have left an unsealed payload",
-		CodeOpenUnknownTarget, target))
+	return newest, nil
 }
 
 // renderOpenHuman renders the open report.
@@ -720,7 +782,11 @@ func renderOpenHuman(d openDetails) string {
 	var b strings.Builder
 	line := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
 	line("opened workspace %q at %s\n", d.Workspace, d.Destination)
-	line("  snapshot: %s (kind %s, stays pinned)\n", d.SnapshotID, d.Kind)
+	line("  snapshot: %s (kind %s", d.SnapshotID, d.Kind)
+	if d.SnapshotCreatedAt != "" {
+		line(", created %s", d.SnapshotCreatedAt)
+	}
+	line(", stays pinned)\n")
 	line("  entries restored: %d (%s)\n", d.EntriesRestored, HumanBytes(d.BytesRestored))
 	if len(d.Actions) == 0 {
 		line("  status: files-ready — preserved files are back; no reconstruction actions ran\n")

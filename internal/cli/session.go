@@ -221,27 +221,58 @@ func (s *session) newLifecycle(probe domain.PlatformProbe) (*lifecycle.Coordinat
 // resolveWorkspaceID implements the CLI-owned workspace-name binding
 // documented on lifecycle.CaptureOptions: re-capturing the same root
 // under the same name rebinds the SAME workspace id (stable identity
-// across captures). Match order: exact name AND recorded root path;
-// then exact name AND live status; otherwise a fresh workspace is
-// created (empty id).
+// across captures). Match order: exact name AND recorded root path; then
+// exact name AND live status — but only while the live row's recorded
+// root matches the capture root (see resolveWorkspaceIDRefusing);
+// otherwise a fresh workspace is created (empty id).
+//
+// The signature cannot surface a refusal (every capture command feeds
+// the result straight into CaptureOptions), so a refused match degrades
+// to "" here: the capture enrolls a NEW workspace row and the old row's
+// recorded root is never rewritten. Wave 5 E12's silent identity rebind
+// is therefore unreachable through this wrapper. The capture path
+// itself (openCaptureCommand) resolves STRICTLY via
+// resolveWorkspaceIDRefusing and fails the command with the blocked
+// error; only the post-operation receipt lines still use this lenient
+// wrapper, where the row always resolves by name+root already.
 func (s *session) resolveWorkspaceID(name, rootAbs string) domain.WorkspaceID {
+	id, _ := s.resolveWorkspaceIDRefusing(name, rootAbs)
+	return id
+}
+
+// resolveWorkspaceIDRefusing is resolveWorkspaceID with the Wave 5 E12
+// refusal: the name-only fallback NEVER adopts a live workspace whose
+// recorded root differs from the capture root. That adoption is what let
+// lifecycle.beginOperation silently rewrite the old row's RootPath —
+// identity theft: one project's history re-pointed at a different
+// directory because both were named the same. Same-root recapture stays
+// allowed (the legitimate flow). The refusal is a blocked error naming
+// both paths and demanding either a new workspace for the new path or an
+// explicit workspace id.
+func (s *session) resolveWorkspaceIDRefusing(name, rootAbs string) (domain.WorkspaceID, error) {
 	list, err := s.cat.ListWorkspaces()
 	if err != nil {
-		return ""
+		return "", blockedError(fmt.Errorf("list workspaces: %v", err))
 	}
 	var byLiveName domain.WorkspaceID
+	var liveRow catalog.Workspace
 	for _, w := range list {
 		if w.Name != name {
 			continue
 		}
 		if w.RootPath != "" && filepath.Clean(w.RootPath) == filepath.Clean(rootAbs) {
-			return w.ID
+			return w.ID, nil
 		}
 		if w.Status == catalog.WorkspaceLive && byLiveName == "" {
-			byLiveName = w.ID
+			byLiveName, liveRow = w.ID, w
 		}
 	}
-	return byLiveName
+	if byLiveName != "" && liveRow.RootPath != "" {
+		return "", blockedError(fmt.Errorf(
+			"%s: workspace %q (%s) is recorded at root %s, but the capture root is %s; adopting the name-only match would rewrite the recorded root and silently re-point the workspace's history. Safe action: enroll the new path as a new workspace (a distinct workspace name), or pass the explicit workspace id only when you truly mean the recorded one",
+			CodeWorkspaceIdentityMismatch, name, byLiveName, liveRow.RootPath, rootAbs))
+	}
+	return byLiveName, nil
 }
 
 // ---- writer assertion (Foundation §17.2) --------------------------------

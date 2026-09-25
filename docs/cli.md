@@ -7,6 +7,7 @@ Conventions that hold across the whole CLI:
 - Human-readable output goes to **stderr**. With `--json`, a single result envelope object goes to **stdout** and human output is suppressed. Every controlled exit emits exactly one terminal result.
 - Confirmation prompts are interactive only: a command running without a terminal (CI, scripts) must either pass the corresponding `--yes`-class flag or it is blocked. `--yes` never answers writer assertions or escalation confirmations.
 - Deletion-class actions always show what will happen before asking for confirmation, and the confirmation is typed.
+- Workspace names are labels, not identities. A capture at a root that differs from the recorded root of a same-named workspace never re-points that workspace's history: the path enrolls as a new workspace instead. Re-capturing the same root under the same name keeps the same workspace.
 
 ## Quickstart
 
@@ -23,7 +24,7 @@ ebb stats                             # what you freed, and what you are hoardin
 
 ### `ebb reclaim`
 
-Free space from a live workspace in place. Reclaim plans against the measured workspace, executes the declared reconstructible-output removals under full validation (each preceded by a verified capture of the removal plan), and escalates to a whole-workspace park only when the target cannot be met otherwise. Escalation is a separate typed confirmation plus a writer assertion; `--yes` never answers it. A shortfall is exit 8, never a reason to delete something undeclared.
+Free space from a live workspace in place. Reclaim plans against the measured workspace, executes the declared reconstructible-output removals under full validation (each preceded by a sealed capture of the removal plan, the recipe inputs, and any approved carve-out overlays), and escalates to a whole-workspace park only when the target cannot be met otherwise. Escalation is a separate typed confirmation plus a writer assertion; `--yes` never answers it. A shortfall is exit 8, never a reason to delete something undeclared. A trim does not copy the removed output bytes: recovery is `ebb restore` re-running the sealed recipes, which needs the toolchain, the network, and the registries to work. The byte-backed capture-before-removal path is `ebb park`.
 
 ```
 ebb reclaim [path] [flags]
@@ -53,7 +54,9 @@ reclaim plan for workspace "api" (dry run: nothing will be removed; no captures 
 
 ### `ebb restore`
 
-Recreate trimmed dependencies in place on a live workspace. The direct inverse of `reclaim`/`trim`: it re-executes the recipes sealed at trim time, behind a git pre-flight gate, three-way drift reconciliation, and a post-flight protected-file integrity gate. Restore never needs `--yes`; its only decisions (branch mismatch, drift strategy) are terminal menus that `--json` mode refuses with a typed error instead of prompting.
+Recreate trimmed dependencies in place on a live workspace. The recovery path for `reclaim`/`trim`: it re-runs the recipes sealed at trim time rather than restoring captured bytes, behind a git pre-flight gate, three-way drift reconciliation, and a post-flight protected-file integrity gate. Restore never needs `--yes`; its only decisions (branch mismatch, drift strategy) are terminal menus that `--json` mode refuses with a typed error instead of prompting.
+
+The trim seals each group's exact rebuild action: argv, working root (relative to the workspace), inputs, outputs, env allowlist, network, and timeout. Restore replays that definition verbatim and checks it against the local approval store before anything runs: a recipe whose recorded approval still matches its current tool identity and input digests runs silently; a missing or drifted approval is asked again on a terminal and refuses headless. A trim manifest from before this freeze carries no frozen definitions: such a replay is labeled a legacy recovery attempt, is never claimed to be the previously-approved action, and needs a fresh explicit approval (`--legacy-approve` headless, or the terminal prompt).
 
 ```
 ebb restore [path] [flags]
@@ -63,9 +66,12 @@ ebb restore [path] [flags]
 |---|---|
 | `--strategy merge\|current\|baseline` | Resolve recipe-input drift non-interactively. `merge`: union manifests with a safety backup, live wins, your native tool resolves. `current`: rebuild from the live files. `baseline`: revert inputs to the frozen trim baseline. |
 | `--dry-run` | Report the selected trim, commands, drift table, and overlays without effects |
+| `--legacy-approve` | Record the fresh explicit approval a legacy trim manifest (one without frozen action definitions) needs, without a prompt |
 | `--json` | Machine envelope on stdout |
 
-Exit codes: 0 restored (or previewed); 2 usage; 3 blocked (nothing to restore, in-flight git conflict, unresolved branch mismatch, already restored, drift without a strategy); 6 recipe execution or protected-gate failure (resumable by rerunning); 7 vault; 130 cancelled.
+Restore refuses to run a single recipe while any group's declared output still exists and is non-empty: that is live data a recipe must never run over. When every output is already present the answer is "already restored"; when only some are, the whole restore is refused and both sets are listed. Both refusals are existence-only checks: present means something is there, not that the content is valid or the application healthy. A failed restore's own rerun is the exception: it resumes instead of refusing.
+
+Exit codes: 0 restored (or previewed); 2 usage; 3 blocked (nothing to restore, in-flight git conflict, unresolved branch mismatch, outputs still present, already restored, legacy manifest without approval, approval drift without a terminal, drift without a strategy); 6 recipe execution or protected-gate failure (resumable by rerunning); 7 vault; 130 cancelled.
 
 ### `ebb park`
 
@@ -87,6 +93,8 @@ Exit codes: 0 parked; 2 usage; 3 blocked (missing or declined assertion, destruc
 
 Recover a parked or captured workspace. Files are staged privately, verified against the retained inventory as an independent oracle, then published to the workspace's recorded root (or `--to`). After publishing, open re-runs the recorded, locally-approved reconstruction actions so the workspace comes back working; `--files-only` skips that. A failed rebuild is exit 6 with the files intact and the snapshot pinned, resumable with `ebb open --resume`. Bare `ebb open` on an interactive terminal opens a picker of parked workspaces.
 
+Target resolution: a 32-hex argument opens that exact snapshot. A name must match exactly one workspace: several matches refuse with `EBB_E_OPEN_AMBIGUOUS_TARGET`, listing every candidate. The matched workspace's newest sealed park snapshot is opened, falling back to its newest sealed plain snapshot when no park exists; an exact creation-timestamp tie inside the winning kind is refused too. In every ambiguous case, pass the snapshot id. The report names the state that came back: snapshot id, kind, and creation timestamp.
+
 ```
 ebb open <name | snapshot-id | operation-id> [flags]
 ```
@@ -96,11 +104,11 @@ ebb open <name | snapshot-id | operation-id> [flags]
 | `--to <dir>` | Destination directory (default: the workspace's recorded original root) |
 | `--files-only` | Stop after publishing the preserved files; no reconstruction |
 | `--yes` | Record approvals for not-yet-approved reconstruction actions without a prompt (never covers approval drift) |
-| `--resume` | Resume the rebuild of the workspace's interrupted open operation (positional argument: operation id or workspace; reruns only actions without a recorded success) |
+| `--resume` | Resume the rebuild of the workspace's interrupted open operation (positional argument: operation id or workspace; reruns every action that has no recorded success or whose declared outputs are no longer present, an existence-only check) |
 | `--cancel` | Cancel a `REBUILD_FAILED`/`REBUILDING` open operation (files stay; snapshot stays pinned) |
 | `--json` | Machine envelope on stdout |
 
-Exit codes: 0 done (files-only included); 2 usage; 3 blocked (trim or seal-kind snapshot, occupied destination, insufficient space); 4 seal or document verification failure; 5 publish blocked (staging kept, reconcile with `ebb recover`); 6 rebuild failed or blocked (files intact, resumable); 7 vault; 130 cancelled.
+Exit codes: 0 done (files-only included); 2 usage; 3 blocked (trim or seal-kind snapshot, ambiguous target, occupied destination, insufficient space); 4 seal or document verification failure; 5 publish blocked (staging kept, reconcile with `ebb recover`); 6 rebuild failed or blocked (files intact, resumable); 7 vault; 130 cancelled.
 
 ## Discovery and Docker
 
@@ -250,7 +258,7 @@ ebb recover <operation-id> [--resume-removal] [--cancel] [--json]
 | Option | Description |
 |---|---|
 | `--resume-removal` | Explicitly resume a blocked removal walk (required for `REMOVAL_BLOCKED` after the blocker is resolved and writers are stopped again) |
-| `--cancel` | Abandon an operation whose removal never started, a crashed capsule transport, or a dead restore; retained snapshots stay pinned |
+| `--cancel` | Abandon an operation whose removal never started, a crashed capsule transport, a dead restore, or a forget still before its unpin; retained snapshots stay pinned. A forget past its unpin is refused: rerun `ebb forget` to finish it |
 | `--json` | Machine envelope on stdout |
 
 Exit codes: 0 reconciliation completed; 2 usage (unknown operation id, contradictory flags); 5 journal or evidence mismatch, or a reconciliation that itself got blocked mid-removal; 7 vault; 130 cancelled.
@@ -298,7 +306,7 @@ These commands remain fully functional. They are the layers the daily loop compo
 - `ebb trim [path] --groups a,b`: remove explicitly approved regenerate groups from a live workspace, under the same validation, capture, and carve-out rules reclaim applies.
 - `ebb plan [path] [--target N]`: compute a reclaim plan; preview only, grants no removal authority.
 - `ebb inspect [path]`: explain scope, costs, and blockers without running project code. With a capsule file argument, prints its bounded public metadata (and with `EBB_CAPSULE_PASSWORD` set, runs full verification without registering).
-- `ebb forget <snapshot-id>`: deliberately end one snapshot's recovery obligation behind a typed confirmation. Retention is forget's explicit job, never a prune-side policy.
+- `ebb forget <snapshot-id>`: deliberately end one snapshot's recovery obligation behind a typed confirmation. Retention is forget's explicit job, never a prune-side policy. The last-recovery-copy guard counts only copies a live backend listing still returns: a catalog row is not custody, and replica receipts are informational, never counted. Forget is journaled as a phased operation (`FORGET_PLANNED` → `FORGET_INTENT_RECORDED` → `FORGET_UNPINNED` → `FORGET_BACKEND_FORGOTTEN` → `FORGET_DONE`): an interrupted forget resumes idempotently on rerun, and cancellation is refused once the snapshot is unpinned.
 - `ebb gc <vault> [--dry-run]`: reclaim vault storage no snapshot references anymore (backend prune; verified to never remove retained snapshots). Run it after `delete` or `forget`.
 - `ebb version`: print the ebb version, the restic conformance target, and the Go version.
 

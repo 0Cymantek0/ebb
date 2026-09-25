@@ -4,9 +4,13 @@
 // interactive grouped confirmation (or --yes for an already-decided
 // invocation): it lists each group's outputs and the recreate command
 // derived from the policy (the policy file is the recorded replaceable
-// declaration; approvalstore coupling is future work for rebuild
-// actions). The recorded decision becomes the lifecycle
-// ApprovalReady callback.
+// declaration). Wave 5 (D3) closes the loop that comment used to call
+// "future work": the recorded decision is persisted as a REAL approval
+// in the state dir's approvalstore — the same local trust `ebb open`
+// and `ebb restore` verify against — pinning the exact frozen action
+// definition, the resolved tool identity and the live input digests.
+// The recorded decision also remains the lifecycle ApprovalReady
+// callback.
 //
 // §17.3 requires the same stopped-writer discipline park uses ("an
 // active process using that group requires the same stopped-writer
@@ -26,10 +30,16 @@
 package cli
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/0Cymantek0/ebb/internal/actions"
+	"github.com/0Cymantek0/ebb/internal/actions/approvalstore"
 	"github.com/0Cymantek0/ebb/internal/catalog"
 	"github.com/0Cymantek0/ebb/internal/domain"
 	"github.com/0Cymantek0/ebb/internal/lifecycle"
@@ -186,6 +196,24 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 		return fmt.Errorf("group %s was not part of the confirmed removal set", groupID)
 	}
 
+	// ---- wave-5 (D3): record the REAL approval behind the consent ------
+	// The typed confirmation above is the consent act; here it is
+	// persisted as local trust in the SAME approvalstore `ebb open` and
+	// `ebb restore` consult: the exact frozen definition of the group
+	// (what will run at restore), the resolved tool identity and the
+	// live input digests are pinned. Nothing approval-related is frozen
+	// into the manifest — approvals are local, non-transferable trust
+	// (Foundation §7.3). Resolving the tool here also fails the trim
+	// honestly when the recorded recipe could never run on this host.
+	approvedBy := "flag:--yes"
+	if !*yes {
+		approvedBy = "trim:interactive-confirm"
+	}
+	if err := recordTrimApprovals(sess, disc, groups, approvedBy); err != nil {
+		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
+			fmt.Sprintf("trim %s: %s", disc.Root, codedWithSafeAction(err)))
+	}
+
 	coord, err := sess.newLifecycle(probe)
 	if err != nil {
 		return emitFailure(env, *jsonOut, streams, classifyExitCode(err),
@@ -228,6 +256,67 @@ func cmdTrim(args []string, streams Streams, deps Deps) int {
 	env.Warnings = append(env.Warnings, res.Snapshot.Warnings...)
 	emit(env, *jsonOut, streams, renderTrimHuman(details))
 	return ExitOK
+}
+
+// recordTrimApprovals persists one REAL approval per confirmed group
+// (wave-5 D3): the group's exact frozen action definition (the same
+// deriveGroupDef source the manifest freezes), the PATH-resolved and
+// SHA-256-hashed tool identity, and the digests of the declared inputs
+// that exist right now. `ebb restore` later compares its CURRENT
+// resolution against exactly this record (D4): an exact match replays
+// silently; any drift re-approves. Groups without a runnable recipe
+// (pip, custom without command) record nothing — their restore is the
+// labeled legacy path (D5). A tool that cannot be resolved fails the
+// trim fail-closed: restore could never honestly re-approve it.
+func recordTrimApprovals(sess *session, disc discovery, groups []string, approvedBy string) error {
+	store := approvalstore.New(sess.approvalsPath())
+	for _, id := range groups {
+		var regen policy.Regenerate
+		ok := false
+		for _, r := range disc.Policy.Regenerate {
+			if r.ID == id {
+				regen, ok = r, true
+				break
+			}
+		}
+		if !ok {
+			continue // lifecycle validates the group set independently
+		}
+		def, runnable, err := deriveGroupDef(regen)
+		if err != nil {
+			return err
+		}
+		if !runnable {
+			continue // hint-only group: no executable contract to approve
+		}
+		tool, terr := actions.ResolveTool(def.Argv[0])
+		if terr != nil {
+			return blockedError(fmt.Errorf(
+				"%s: trim group %s records recipe %q, whose tool cannot be resolved on this host, so no honest approval can be recorded: %v. Safe action: install the recipe's toolchain (restore needs it to re-create the group), then rerun `ebb trim`",
+				CodeApprovalRequired, id, strings.Join(def.Argv, " "), terr))
+		}
+		digests := make(map[string]string, len(def.Inputs))
+		for _, rel := range def.Inputs {
+			p := filepath.Join(disc.Root, filepath.FromSlash(rel))
+			d, derr := actions.DigestFile(p)
+			if derr != nil {
+				// An input absent right now is simply not covered by the
+				// approval (the manifest records it missing too); an
+				// UNREADABLE input fails the trim fail-closed.
+				if _, serr := os.Stat(p); serr != nil && !errors.Is(serr, fs.ErrNotExist) {
+					return blockedError(fmt.Errorf(
+						"%s: trim group %s input %s cannot be read for the approval record: %v",
+						CodeApprovalRequired, id, rel, serr))
+				}
+				continue
+			}
+			digests[rel] = d
+		}
+		if _, aerr := store.Approve(def, tool, digests, approvedBy); aerr != nil {
+			return blockedError(fmt.Errorf("recording the %s approval for trim group %s: %w", approvedBy, id, aerr))
+		}
+	}
+	return nil
 }
 
 // trimApprovalText builds the grouped-removal confirmation shared by

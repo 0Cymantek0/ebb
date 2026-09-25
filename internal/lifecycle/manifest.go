@@ -250,6 +250,16 @@ type removalManifestDoc struct {
 	// for custom-command groups and pip: no drift-reconcilable live
 	// variant exists and restore falls back to the frozen recipe.
 	RecreateLive []string `json:"recreate_live,omitempty"`
+	// Definition (wave-5, D1) is the EXACT frozen action contract:
+	// actionDefWire of the actions.Definition derived at trim time from
+	// the ecosystem recipe / custom command — one source of truth for
+	// argv, working root, inputs, outputs, env allowlist, network and
+	// timeout. `ebb restore` replays it verbatim (D2); the older weak
+	// fields above are kept for legacy detection only. Absent (nil) on
+	// trim plans written before this wave (pip and custom-commandless
+	// groups record no definition: they are hint-only) — restore then
+	// refuses normal replay and requires fresh explicit approval (D5).
+	Definition *actionDefDoc `json:"definition,omitempty"`
 }
 
 // overlayPatchRecord is one D034 carve-out entry (FROZEN SCHEMA — the

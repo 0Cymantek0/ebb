@@ -61,6 +61,15 @@ type GroupSuggestion struct {
 	// (manifest, lockfile, conditional configuration), in a
 	// deterministic order.
 	Inputs []string
+	// WorkingRoot is the declared logical working directory for the
+	// recipe, root-relative with '/' separators (the policy group's
+	// `root`; outputs/inputs are NOT interpreted relative to it). ""
+	// or "." means the workspace root — the detected-suggestion shape.
+	// It becomes actions.Definition.WorkingRoot so a frozen recipe
+	// executes inside the group's own directory (wave-5 E04: built-in
+	// recipes must carry the group's declared root exactly like custom
+	// commands do, never a hardcoded ".").
+	WorkingRoot string
 	// HumanReason is the user-facing one-paragraph explanation of what
 	// regeneration means for this group (including what would NOT be
 	// retained).

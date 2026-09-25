@@ -3,7 +3,7 @@ package catalog
 // Forward-only schema migrations. The slice index is the version
 // recorded in schema_migrations; migration N runs inside one transaction
 // together with its version insert (see Catalog.migrate).
-var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4}
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5}
 
 // schemaMigrationsDDL is created separately from any versioned
 // migration so a fresh database can record versions at all.
@@ -185,4 +185,14 @@ CREATE TABLE IF NOT EXISTS stats_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_stats_events_ts ON stats_events(ts);
+`
+
+// schemaV5 (Wave 5, D060) adds operations.snap_id: the LOGICAL snapshot
+// identity of an operation's target. Payload/seal backend ids identify
+// physical backend objects, not logical recovery obligations — two
+// catalog rows can reference the same pair (catalog reconstruction,
+// imports, corruption repair) — so forget's rerun-adoption fingerprint
+// must bind the logical snapshot id alongside the pair.
+const schemaV5 = `
+ALTER TABLE operations ADD COLUMN snap_id TEXT;
 `

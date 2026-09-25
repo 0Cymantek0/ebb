@@ -122,6 +122,17 @@ func (c *Coordinator) Recover(ctx context.Context, vault VaultRef, opID domain.O
 		// dead row so the workspace accepts destructive work again).
 		return c.reportDeadRestore(op, rep)
 
+	case catalog.PhaseForgetPlanned, catalog.PhaseForgetIntentRecorded,
+		catalog.PhaseForgetUnpinned, catalog.PhaseForgetBackendForgotten:
+		// The forget vocabulary (Wave 5): the forget command owns these
+		// phases and its documented resume is the idempotent rerun, which
+		// adopts its own row. Plain Recover stays REPORT-ONLY — the same
+		// discipline every other externally-owned kind gets — and names
+		// the exits: the resuming rerun, and --cancel where that reading
+		// is still valid (only before the unpin; the refusal past it is
+		// wired in CancelOperation).
+		return c.reportForgetOperation(op, rep)
+
 	default:
 		// Terminal (CANCELED/DONE/TRIM_DONE/RESTORE_DONE) or phases owned
 		// by other commands (RESTORING/FILES_READY/REBUILDING/READY/
@@ -218,6 +229,19 @@ func (c *Coordinator) ResumeRemoval(ctx context.Context, vault VaultRef, opID do
 // the replayed trim's retained snapshots stay pinned (I07).
 // RESTORE_DONE is terminal-uncancelable like every DONE phase.
 //
+// Forget operations (Wave 5) get the OPPOSITE treatment on one axis,
+// deliberately: the forget kind DOES destructive work mid-flow, so
+// cancel's "nothing destructive happened" reading holds only BEFORE the
+// unpin (FORGET_PLANNED / FORGET_INTENT_RECORDED — the snapshot is still
+// pinned and the backend pair untouched, plus the idempotent
+// already-CANCELED arm). From FORGET_UNPINNED the row is
+// post-destruction: the recovery obligation was released locally, so
+// cancel is REFUSED (a generic cancel would reason from a false
+// invariant) and the idempotent rerun of `ebb forget` — which adopts its
+// own row — is the only completion path. The retention intent stays the
+// authoritative evidence of the obligation (§16.6); a cancel before the
+// unpin never completes it.
+//
 // Cancel never releases recovery obligations (I07): a sealed P/S pair
 // stays pinned — deliberate release is `ebb forget`, never cancel.
 func (c *Coordinator) CancelOperation(ctx context.Context, vault VaultRef, opID domain.OperationID) (RecoveryReport, error) {
@@ -234,6 +258,17 @@ func (c *Coordinator) CancelOperation(ctx context.Context, vault VaultRef, opID 
 	}
 	rep.PhaseAfter = op.Phase
 	switch {
+	case op.Kind == catalog.OpKindForget && forgetCancelAllowedPhase(op.Phase):
+		// Pre-destruction forget rows (FORGET_PLANNED/FORGET_INTENT_
+		// RECORDED: the snapshot is still pinned and the backend pair
+		// untouched) plus the idempotent already-CANCELED arm.
+		return c.cancelForget(op, rep)
+	case op.Kind == catalog.OpKindForget:
+		// FORGET_UNPINNED / FORGET_BACKEND_FORGOTTEN: post-destruction.
+		// Canceling would reason from a false "nothing destructive
+		// happened" invariant; the idempotent rerun is the completion.
+		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+			"operation %s is a forget in %s: the recovery obligation was already released locally (the snapshot is unpinned), so cancel no longer applies — its \"nothing destructive happened\" reading is false. Rerun `ebb forget` for this row's target snapshot to resume and complete it (the rerun adopts this row)", op.ID, op.Phase)}
 	case capsuleTransportPhase(op.Kind, op.Phase) || (capsuleTransportKind(op.Kind) && op.Phase == catalog.PhaseCanceled):
 		// The already-CANCELED arm keeps the close idempotent (rerunning
 		// --cancel after a crash mid-close must not refuse).
@@ -251,8 +286,146 @@ func (c *Coordinator) CancelOperation(ctx context.Context, vault VaultRef, opID 
 		return c.cancelSealed(op, rep)
 	default:
 		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
-			"operation %s is %s; cancel applies to phases before removal starts (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED), to the capsule transports' EXPORT_*/IMPORT_* phases, or to a dead restore (RESTORE_RUNNING/RESTORE_FAILED) — mid-removal phases require reconciliation (Recover/ResumeRemoval)", opID, op.Phase)}
+			"operation %s is %s; cancel applies to phases before removal starts (PLANNED/CAPTURING/PAYLOAD_COMMITTED/SEALED/TRIM_PLANNED), to the capsule transports' EXPORT_*/IMPORT_* phases, to a dead restore (RESTORE_RUNNING/RESTORE_FAILED), or to a forget still before its unpin (FORGET_PLANNED/FORGET_INTENT_RECORDED) — mid-removal and post-unpin phases require their own commands' reconciliation", opID, op.Phase)}
 	}
+}
+
+// forgetCancelAllowedPhase reports whether a forget operation's phase is
+// still pre-destruction (plus the idempotent already-CANCELED arm):
+// cancel reasons from "nothing destructive happened", which holds only
+// while the snapshot is still pinned and the backend pair intact.
+// FORGET_UNPINNED and later are refused by the CancelOperation switch.
+func forgetCancelAllowedPhase(phase string) bool {
+	switch phase {
+	case catalog.PhaseCanceled, catalog.PhaseForgetPlanned, catalog.PhaseForgetIntentRecorded:
+		return true
+	}
+	return false
+}
+
+// cancelForget closes a pre-destruction forget operation: idempotently
+// to CANCELED. Nothing destructive has happened at these phases — the
+// snapshot is still pinned and the backend pair untouched — so the close
+// performs no backend calls and no removals, and it never completes the
+// pending retention intent (the forget did not complete; §16.6 keeps it
+// visible and a rerun reuses it).
+func (c *Coordinator) cancelForget(op catalog.Operation, rep RecoveryReport) (RecoveryReport, error) {
+	if op.Phase == catalog.PhaseCanceled {
+		// Idempotent rerun (a crash between the CAS commit and the
+		// report): nothing left to do.
+		rep.Actions = append(rep.Actions, "the operation is already CANCELED; nothing to close")
+		rep.NextAction = "the workspace accepts new operations"
+		return rep, nil
+	}
+	if err := c.cat.FailOperation(op.ID, op.Phase, "canceled by user request while "+op.Phase+" (forget; nothing destructive happened: the snapshot is still pinned and the backend pair intact)"); err != nil {
+		// Best effort: the phase advance below is the authority.
+		_ = err
+	}
+	if aerr := c.cat.AdvanceOperation(op.ID, op.Phase, catalog.PhaseCanceled); aerr != nil {
+		return rep, fmt.Errorf("lifecycle: cancel %s: %w", op.ID, aerr)
+	}
+	rep.PhaseAfter = catalog.PhaseCanceled
+	rep.Actions = append(rep.Actions, fmt.Sprintf(
+		"canceled the interrupted forget operation in %s (nothing destructive happened: the snapshot stays pinned and the backend pair untouched)", op.Phase))
+	if op.Phase == catalog.PhaseForgetIntentRecorded {
+		if intent, ok := c.forgetPendingIntent(op); ok {
+			rep.Remaining = append(rep.Remaining, fmt.Sprintf(
+				"retention intent %s for snapshot %s stays pending (the forget did not complete); a rerun of `ebb forget` reuses it, `ebb status` shows it",
+				intent.ID, intent.SnapshotID))
+		}
+	}
+	rep.NextAction = "operation canceled; the workspace accepts new operations (rerun `ebb forget` for the snapshot if the release is still wanted)"
+	return rep, nil
+}
+
+// reportForgetOperation is plain Recover's report-only outcome for an
+// interrupted forget operation (Wave 5): the forget command owns the
+// FORGET_* vocabulary and its idempotent rerun — which adopts its own
+// row — is the resume. The report names the durable state, the pending
+// intent, and BOTH exits: the rerun, and --cancel where that reading is
+// still valid (only before the unpin).
+func (c *Coordinator) reportForgetOperation(op catalog.Operation, rep RecoveryReport) (RecoveryReport, error) {
+	if op.Kind != catalog.OpKindForget {
+		return rep, &ErrJournalMismatch{Detail: fmt.Sprintf(
+			"operation %s is kind %q but its phase %s belongs to the forget vocabulary; durable state diverged — inspect manually", op.ID, op.Kind, op.Phase)}
+	}
+	rep.Actions = append(rep.Actions, fmt.Sprintf(
+		"reported the interrupted forget operation in %s (report-only: the forget command owns this vocabulary and its idempotent rerun is the resume)", op.Phase))
+	switch op.Phase {
+	case catalog.PhaseForgetPlanned:
+		rep.Remaining = append(rep.Remaining, "no durable step had landed: the snapshot is still pinned and the backend pair untouched")
+	case catalog.PhaseForgetIntentRecorded:
+		rep.Remaining = append(rep.Remaining, "the retention intent is recorded; the snapshot is still pinned and the backend pair untouched")
+	case catalog.PhaseForgetUnpinned:
+		rep.Remaining = append(rep.Remaining, "the snapshot is UNPINNED (the obligation was released locally); the backend pair is still present")
+	case catalog.PhaseForgetBackendForgotten:
+		rep.Remaining = append(rep.Remaining, "the backend pair is forgotten and was verified gone; only the intent completion is outstanding")
+	}
+	if intent, ok := c.forgetPendingIntent(op); ok {
+		rep.Remaining = append(rep.Remaining, fmt.Sprintf(
+			"retention intent %s is pending and will be reused by the rerun", intent.ID))
+	}
+	if op.LastError != "" {
+		rep.Remaining = append(rep.Remaining, "last recorded failure: "+op.LastError)
+	}
+	rerun := "rerun `ebb forget` for the target snapshot (see `ebb status`) to resume"
+	if target := c.forgetTargetSnapshotID(op); target != "" {
+		rerun = fmt.Sprintf("rerun `ebb forget %s` to resume", target)
+	}
+	if forgetCancelAllowedPhase(op.Phase) && op.Phase != catalog.PhaseCanceled {
+		rep.NextAction = fmt.Sprintf("%s, or close it with `ebb recover %s --cancel` (valid here: nothing destructive happened)", rerun, op.ID)
+	} else {
+		rep.NextAction = fmt.Sprintf("%s — past the unpin, --cancel is refused (the release already happened locally)", rerun)
+	}
+	return rep, nil
+}
+
+// forgetPendingIntent finds a pending retention intent whose snapshot is
+// this forget operation's target (matched by the row's recorded payload
+// id — the durable fingerprint), if any.
+func (c *Coordinator) forgetPendingIntent(op catalog.Operation) (catalog.RetentionIntent, bool) {
+	pending, err := c.cat.PendingRetentionIntents()
+	if err != nil {
+		return catalog.RetentionIntent{}, false
+	}
+	for _, ri := range pending {
+		snap, err := c.cat.GetSnapshot(ri.SnapshotID)
+		if err != nil {
+			continue
+		}
+		if snap.WorkspaceID == op.WorkspaceID && op.PayloadSnap != "" && snap.PayloadBackendID == op.PayloadSnap {
+			return ri, true
+		}
+	}
+	return catalog.RetentionIntent{}, false
+}
+
+// forgetTargetSnapshotID resolves the forget operation's target snapshot
+// row from the durable fingerprint recorded on the row (payload id, and
+// seal id when present). "" when it cannot be named unambiguously — the
+// caller falls back to pointing at `ebb status` rather than guessing.
+func (c *Coordinator) forgetTargetSnapshotID(op catalog.Operation) string {
+	if op.PayloadSnap == "" {
+		return ""
+	}
+	snaps, err := c.cat.ListSnapshots(op.WorkspaceID)
+	if err != nil {
+		return ""
+	}
+	var id string
+	for _, s := range snaps {
+		if s.PayloadBackendID != op.PayloadSnap {
+			continue
+		}
+		if op.SealSnap != "" && s.SealBackendID != op.SealSnap {
+			continue
+		}
+		if id != "" {
+			return ""
+		}
+		id = string(s.ID)
+	}
+	return id
 }
 
 // deadRestorePhase reports whether phase belongs to the restore kind's

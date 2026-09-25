@@ -2,7 +2,7 @@
 
 Disk space for builders.
 
-Ebb reclaims disk space from development workspaces without making you re-audit every ignored file each time. It frees the gigabytes you can reconstruct, keeps what you cannot, and proves the copy is good before anything is removed. Recovery is a first-class operation, not an afterthought.
+Ebb reclaims disk space from development workspaces without making you re-audit every ignored file each time. It frees the gigabytes you can reconstruct, keeps what you cannot, and verifies every capture before anything is removed. Recovery is a first-class operation, not an afterthought.
 
 ```
 ebb init                              # once: register a local encrypted vault
@@ -25,7 +25,7 @@ Every developer knows the feeling. Fourteen projects, each with `node_modules`, 
 
 The fear is justified: `.gitignore` does not mean disposable. Private notes, `.env` files, local datasets, and uncommitted work are routinely ignored by Git and are exactly the things no one can re-download.
 
-Ebb takes the other default. **Preservation is the default.** Nothing is removed unless it is provably reconstructible or provably captured and verified first. Every claim below is enforced in code, not in prose:
+Ebb takes the other default. **Preservation is the default.** Nothing is removed unless a policy declares it reconstructible, or it is captured and verified first. Every claim below is enforced in code, not in prose:
 
 - **Preservation-first.** Without explicit declarations, everything unknown is preserved. A lockfile alone never marks a tree disposable. Generated output is only removed when a policy declares the group and how to recreate it.
 - **Verified before removed.** A successful backup subprocess exit code is not proof of retained data. Ebb verifies every capture with an exact coverage check plus a full content readback, and `ebb open` verifies restored files against an oracle independent of the encoder.
@@ -47,7 +47,7 @@ reclaim for workspace "api"
   achieved (estimated): 2.4 GiB; measured free-space delta: 2.4 GiB
 ```
 
-Reclaim plans against the measured workspace, removes only declared reconstructible output (`node_modules`, `target`, `.venv`, ...), and leaves the project live. Your `.env`, uncommitted changes, notes, and everything Git-ignored-but-irreplaceable stay exactly where they are. Every removal is preceded by a verified capture of the removal plan, so it can always be undone. If trim alone cannot reach your target, ebb offers escalation to a full park as a separate, explicit confirmation. `--yes` never answers that one. A shortfall is reported as a shortfall (exit 8), never solved by deleting something undeclared.
+Reclaim plans against the measured workspace, removes only declared reconstructible output (`node_modules`, `target`, `.venv`, ...), and leaves the project live. Your `.env`, uncommitted changes, notes, and everything Git-ignored-but-irreplaceable stay exactly where they are. Every removal is preceded by a sealed capture of the removal plan, the recipe inputs, and any approved carve-out overlays. Trim does not copy the removed dependency bytes themselves, so getting them back means re-running the recipes: `ebb restore`, which needs your package manager, the network, and the registries to work. When you want the removed bytes kept, that is what `ebb park` does: a full verified capture before anything is removed. If trim alone cannot reach your target, ebb offers escalation to a full park as a separate, explicit confirmation. `--yes` never answers that one. A shortfall is reported as a shortfall (exit 8), never solved by deleting something undeclared.
 
 Use `--dry-run` to see the staged plan with no effects.
 
@@ -61,7 +61,7 @@ restore for workspace "api"
   protected-file gate: passed
 ```
 
-The direct inverse of reclaim, on a live workspace. It re-executes the exact recipes sealed at trim time. Restore is gated like a landing gear check: it refuses to run inside an in-flight merge or rebase, never auto-decides a branch mismatch, and reconciles drifted recipe inputs (you edited `package.json` while the deps were trimmed) with an explicit three-way strategy: `merge` (union manifests, live wins, your package manager resolves), `current`, or `baseline`. After the recipes run, a post-flight integrity gate re-verifies everything outside the recreated outputs. Your edits inside `node_modules` come back too: carve-out overlays captured at trim time are re-applied on top of the fresh install.
+The recovery path for reclaim, on a live workspace. Restore rebuilds the removed outputs by re-running the exact recipes sealed at trim time; it does not restore captured bytes, so a rebuild needs your package manager, the network, and the registries to work. The trim freezes each recipe's full definition (argv, working root, inputs, outputs, env allowlist, network, timeout) and restore replays it verbatim, running a recipe only behind a local approval that still matches its tool and inputs; anything changed asks for re-approval. Restore refuses to run anything while a group's outputs are still present, so a recipe never runs over live data. Restore is gated like a landing gear check: it refuses to run inside an in-flight merge or rebase, never auto-decides a branch mismatch, and reconciles drifted recipe inputs (you edited `package.json` while the deps were trimmed) with an explicit three-way strategy: `merge` (union manifests, live wins, your package manager resolves), `current`, or `baseline`. After the recipes run, a post-flight integrity gate re-verifies everything outside the recreated outputs. Your edits inside `node_modules` come back too: carve-out overlays captured at trim time are re-applied on top of the fresh install.
 
 ### `ebb park`: shelve the whole project
 
@@ -83,7 +83,7 @@ Park captures the entire workspace to the encrypted vault, verifies it (coverage
 $ ebb open experiment
 ```
 
-Open restores a parked workspace to its recorded root (or `--to <dir>`). Files are staged privately, verified against the retained inventory as an independent oracle, then published. Nothing unrelated is ever overwritten. After the files land, open re-runs the locally-approved reconstruction actions (for example `pnpm install --frozen-lockfile`) so the workspace comes back ready to work in. Bare `ebb open` on a terminal shows an interactive picker of your parked workspaces.
+Open restores a parked workspace to its recorded root (or `--to <dir>`). Given a name, open restores that workspace's newest sealed park (a plain capture only when no park exists); a name shared by several workspaces is refused with the candidates instead of guessed, and the report names the snapshot id, kind, and creation time of the state it brought back. Files are staged privately, verified against the retained inventory as an independent oracle, then published. Nothing unrelated is ever overwritten. After the files land, open re-runs the locally-approved reconstruction actions (for example `pnpm install --frozen-lockfile`) so the workspace comes back ready to work in. Bare `ebb open` on a terminal shows an interactive picker of your parked workspaces.
 
 ## Autonomous discovery
 
@@ -194,7 +194,7 @@ The trust core, each claim enforced in code:
 - **Open verifies with an independent oracle.** Restored files are checked against the retained inventory, not against the component that encoded them. A tampered vault cannot publish forged content.
 - **Git shields.** Analyse batches and worktree pruning refuse shielded projects (unpushed commits, dirty trees, in-flight conflicts). Restore fails closed on in-flight merges and never auto-decides a branch mismatch.
 - **Carve-out overlays.** If you patched a file inside `node_modules` (a hotfix in a dependency, a built artifact), trim notices the preserved entry inside the output, captures it as an overlay patch to the vault with your consent, and restore re-applies it after the recreate recipe. Your edits survive round trips.
-- **Last-copy protection.** Deleting the only remaining snapshot of a parked workspace requires an explicit `--last-of-parked` acknowledgement, on top of the typed confirmation.
+- **Last-copy protection.** Deleting the only remaining snapshot of a parked workspace requires an explicit `--last-of-parked` acknowledgement, on top of the typed confirmation. What counts as a surviving copy is decided by what the vault still lists at that moment, not by catalog rows.
 - **Secrets never on the command line.** Vault passwords live in the OS credential store or `EBB_VAULT_PASSWORD`, and reach restic only through an ephemeral passfile. Capsule passphrases come from `EBB_CAPSULE_PASSWORD` or a terminal prompt, never from argv. Secrets never enter logs or JSON output.
 - **Crash-safe by journal.** Every operation writes a durable journal. If ebb is killed mid-operation, nothing is silently lost: `ebb status` shows the operation, and `ebb recover <operation-id>` reconciles it from durable evidence. Interrupted removals resume where they stopped.
 - **Untrusted input is treated as hostile.** Inspection never runs project code (no hooks, no filters, no lifecycle scripts). Git observation uses a hardened, non-executing recipe. Capsule files are parsed with traversal, duplicate, and NTFS-alias defenses, and extraction respects a verified byte budget. Docker daemon identifiers are validated before they can appear in any copyable command.

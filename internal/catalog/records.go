@@ -227,6 +227,7 @@ type Operation struct {
 	DestPath       string // vault/destination path, "" until chosen
 	PayloadSnap    string // backend id of committed payload P
 	SealSnap       string // backend id of committed seal S
+	SnapID         string // logical snapshot id of the target (schemaV5; forget adoption)
 	IntentDigest   string // policy intent digest (Foundation §7.1)
 	LastError      string // last recorded failure message
 	NextAction     string // next permitted reconciliation step, "" when none recorded

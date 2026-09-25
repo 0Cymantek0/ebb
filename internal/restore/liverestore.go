@@ -49,6 +49,7 @@ import (
 	"github.com/0Cymantek0/ebb/internal/actions"
 	"github.com/0Cymantek0/ebb/internal/catalog"
 	"github.com/0Cymantek0/ebb/internal/domain"
+	"github.com/0Cymantek0/ebb/internal/pathcanon"
 )
 
 // Strategy names a drift-reconciliation strategy (D033 §5). The zero
@@ -155,13 +156,26 @@ type LiveDependencies struct {
 	// Runner executes the recipes (satisfied by *actions.Runner; tests
 	// substitute a fake). Required for every non-dry-run restore.
 	Runner ActionRunner
+	// Approver is the REAL local approval store (approvalstore in the
+	// state dir; wave-5 D4). Every replayed recipe must match its
+	// recorded approval exactly before it may run; the fabricated
+	// "sealed manifest" approval this driver once synthesized is gone.
+	// Required for every non-dry-run restore.
+	Approver actions.Approver
 	// ObserveGit produces the live Git observation for the pre-flight
 	// gate. Required whenever the trim recorded a Git context.
 	ObserveGit func(ctx context.Context, root string) (domain.GitObservation, error)
 	// Prompt is the interactive decision seam; nil = non-interactive
 	// (branch mismatches and unreconciled drift then refuse).
 	Prompt Prompter
-	Clock  func() time.Time // optional; defaults to time.Now
+	// Approve resolves pending approvals (missing/stale/drifted) BEFORE
+	// any recipe runs: it may prompt (grouped, the same interaction
+	// shape open's rebuild uses) and record approvals into the SAME
+	// store backing Approver. Returning nil asserts every listed action
+	// is now approved; returning an error fails the restore as
+	// declined/blocked — nothing has run (wave-5 D4).
+	Approve ApprovalResolver
+	Clock   func() time.Time // optional; defaults to time.Now
 }
 
 // LiveRestorer executes `ebb restore` sequences. Safe for sequential
@@ -172,8 +186,10 @@ type LiveRestorer struct {
 	probe      domain.PlatformProbe
 	createLink LinkCreator
 	runner     ActionRunner
+	approver   actions.Approver
 	observeGit func(ctx context.Context, root string) (domain.GitObservation, error)
 	prompt     Prompter
+	approve    ApprovalResolver
 	now        func() time.Time
 }
 
@@ -196,7 +212,8 @@ func NewLiveRestorer(d LiveDependencies) (*LiveRestorer, error) {
 	}
 	return &LiveRestorer{
 		store: d.Store, cat: d.Cat, probe: d.Probe, createLink: d.CreateLink,
-		runner: d.Runner, observeGit: d.ObserveGit, prompt: d.Prompt, now: d.Clock,
+		runner: d.Runner, approver: d.Approver, observeGit: d.ObserveGit,
+		prompt: d.Prompt, approve: d.Approve, now: d.Clock,
 	}, nil
 }
 
@@ -209,6 +226,14 @@ type LiveRestoreOptions struct {
 	// and overlay list with zero effects (no operation row, no writes,
 	// no prompts).
 	DryRun bool
+	// LegacyApprove (wave-5 D5) is the explicit consent that lets a trim
+	// manifest WITHOUT frozen action definitions replay at all: the
+	// historical approval identity is unavailable for such manifests, so
+	// the recipes are never claimed to be the previously-approved
+	// actions — they run as labeled "legacy recovery attempts" behind a
+	// fresh approval (the flag records it without a prompt; an
+	// interactive terminal confirms instead when the flag is absent).
+	LegacyApprove bool
 }
 
 // RestoredGroup is one group's outcome in the result.
@@ -217,6 +242,11 @@ type RestoredGroup struct {
 	Command  []string
 	Drift    []DriftEntry
 	Overlays []string
+	// Legacy (wave-5 D5) marks a group replayed through the legacy
+	// synthesis path because its trim manifest predates the frozen
+	// action contract. Such a group's recipes were freshly approved at
+	// restore time — they are NOT the previously-approved actions.
+	Legacy bool
 }
 
 // LiveRestoreResult reports a completed (or previewed) restore.
@@ -286,13 +316,26 @@ func (o *LiveRestorer) LiveRestore(ctx context.Context, vault VaultRef, root str
 		return res, err
 	}
 
-	// ---- outputs-present gate -------------------------------------------
+	// ---- outputs-present gate (wave-5 D6: custody preflight) -------------
+	// ANY present-and-non-empty output root in the selected trim refuses
+	// the ENTIRE restore before a single recipe runs (E14: the old gate
+	// only refused when EVERY group was present, so a mixed workspace
+	// had live data re-installed over). A FAILED/RUNNING restore op
+	// still makes the rerun a resume (D033: package managers tolerate
+	// existing partial directories; a full rerun, never a skip).
 	ops, lerr := o.cat.ListOperations(ws.ID)
 	if lerr != nil {
 		return res, fmt.Errorf("restore: list operations of %s: %w", ws.ID, lerr)
 	}
-	if outputsAllPresent(absRoot, docs.plan.Groups) && !hasResumableRestoreOp(ops) {
-		return res, &ErrAlreadyRestored{Root: absRoot, TrimOp: string(trimOp.ID)}
+	presentOut, missingOut := groupOutputPresence(absRoot, docs.plan.Groups)
+	if len(presentOut) > 0 && !hasResumableRestoreOp(ops) {
+		if outputsAllPresent(absRoot, docs.plan.Groups) {
+			return res, &ErrAlreadyRestored{Root: absRoot, TrimOp: string(trimOp.ID)}
+		}
+		return res, &ErrOutputsPresent{
+			Root: absRoot, TrimOp: string(trimOp.ID),
+			Present: presentOut, Missing: missingOut,
+		}
 	}
 
 	// ---- supersede dead restore rows (BEFORE any later refusal) ---------
@@ -360,7 +403,74 @@ func (o *LiveRestorer) LiveRestore(ctx context.Context, vault VaultRef, root str
 
 	// ---- dry run: report and stop ---------------------------------------
 	if opts.DryRun {
+		if trimPlanIsLegacy(docs.plan.Groups) {
+			res.Warnings = append(res.Warnings, legacyRecoveryWarning(docs.plan.Groups))
+		}
 		return res, nil
+	}
+
+	// ---- wave-5 replay definitions (D2: frozen contract verbatim) -------
+	// A plan whose every group carries the frozen `definition` replays
+	// that exact contract (argv, working root, network, env allowlist,
+	// timeout — never re-derived). A plan missing ANY definition is
+	// legacy: it replays through the old synthesis path only behind a
+	// fresh explicit approval (D5).
+	defs, legacy, derr := o.replayDefinitions(absRoot, string(trimOp.ID), docs, drift, strategy, &res.Warnings)
+	if derr != nil {
+		return res, derr
+	}
+	if legacy {
+		for i := range res.Groups {
+			res.Groups[i].Legacy = true
+		}
+		if !opts.LegacyApprove && o.approve == nil {
+			return res, newLegacyTrimManifestError(absRoot, trimOp.ID, docs.plan.Groups)
+		}
+		res.Warnings = append(res.Warnings, legacyRecoveryWarning(docs.plan.Groups))
+	}
+
+	// ---- wave-5 working-root escape gate (D7) ----------------------------
+	// Every replayed working root must resolve (junction/symlink-aware)
+	// inside the CURRENT workspace root; a frozen path that now escapes
+	// the boundary refuses the restore before any effect.
+	if err := refuseWorkingRootEscapes(absRoot, defs); err != nil {
+		return res, err
+	}
+
+	// ---- wave-5 approval pre-pass (D4) ------------------------------------
+	// The CURRENT tool identity and CURRENT input digests are checked
+	// against the REAL recorded approval (the same store park/open
+	// uses). Exact match → the recipes run silently (the D033
+	// no-re-prompt property, preserved for an exact replay). Missing,
+	// stale or drifted → nothing runs until a fresh approval is
+	// recorded through the resolver seam (prompted interactively,
+	// blocked non-interactively).
+	if len(defs) > 0 {
+		if o.approver == nil {
+			return res, &ErrRestoreApprovalRequired{Root: absRoot, Actions: actionIDs(defs),
+				Detail: "no approval store is wired; approvals are mandatory (Foundation §7.3)"}
+		}
+		pending, perr := o.approvalPrepass(absRoot, defs, legacy)
+		if perr != nil {
+			return res, perr
+		}
+		if len(pending) > 0 {
+			if o.approve == nil {
+				return res, approvalRequiredError(absRoot, pending)
+			}
+			if aerr := o.approve(ctx, pending); aerr != nil {
+				return res, &ErrRestoreDeclined{Root: absRoot,
+					Detail: "the approval step was declined or blocked: " + aerr.Error()}
+			}
+			// Re-check: the resolver must have recorded exact approvals.
+			still, rerr := o.approvalPrepass(absRoot, defs, legacy)
+			if rerr != nil {
+				return res, rerr
+			}
+			if len(still) > 0 {
+				return res, approvalRequiredError(absRoot, still)
+			}
+		}
 	}
 
 	// ---- durable restore operation --------------------------------------
@@ -412,18 +522,12 @@ func (o *LiveRestorer) LiveRestore(ctx context.Context, vault VaultRef, root str
 		return fail("", "applying the reconciliation strategy", aerr)
 	}
 
-	// ---- execution: frozen recipes through the actions runner ------------
-	appr := sealedManifestApprover{now: o.now}
-	for i := range docs.plan.Groups {
-		g := docs.plan.Groups[i]
+	// ---- execution: replayed definitions through the actions runner -----
+	for _, def := range defs {
 		if cerr := ctx.Err(); cerr != nil {
 			return fail("", "cancelled", cerr)
 		}
-		def, dwerr := groupDefinition(absRoot, trimOp.ID, g, drift, strategy, &res.Warnings)
-		if dwerr != nil {
-			return fail("", "building the action definition for group "+g.GroupID, dwerr)
-		}
-		rep, rerr := o.runRecipe(ctx, opID, def, absRoot, appr)
+		rep, rerr := o.runRecipe(ctx, opID, def, absRoot, o.approver)
 		res.Actions = append(res.Actions, rep)
 		if rerr != nil {
 			if errors.Is(rerr, context.Canceled) || errors.Is(rerr, context.DeadlineExceeded) {
@@ -709,9 +813,33 @@ func shortCommit(c string) string {
 
 // ---- outputs-present gate ------------------------------------------------------
 
-// outputsAllPresent reports whether every group's every output exists
-// and is non-empty (a directory with at least one child, or a non-empty
-// file).
+// groupOutputPresence classifies EVERY group of the plan for the
+// wave-5 D6 custody preflight: present lists the groups with at least
+// one present-and-non-empty output root (live data the recipes must
+// never run over), missing lists the groups with none. The caller
+// refuses the ENTIRE restore when present is non-empty (outside a
+// resumable-op rerun), listing both sets.
+func groupOutputPresence(root string, groups []removalGroupReader) (present, missing []string) {
+	for _, g := range groups {
+		live := false
+		for _, out := range g.Outputs {
+			if outputPresent(root, out) {
+				live = true
+				break
+			}
+		}
+		if live {
+			present = append(present, fmt.Sprintf("group %s: present/live (outputs: %s)", g.GroupID, strings.Join(g.Outputs, ", ")))
+		} else {
+			missing = append(missing, fmt.Sprintf("group %s: missing (outputs: %s)", g.GroupID, strings.Join(g.Outputs, ", ")))
+		}
+	}
+	return present, missing
+}
+
+// outputsAllPresent reports whether EVERY output root of EVERY group
+// exists and is non-empty (a directory with at least one child, or a
+// non-empty file) — the strict already-restored condition.
 func outputsAllPresent(root string, groups []removalGroupReader) bool {
 	for _, g := range groups {
 		for _, out := range g.Outputs {
@@ -793,29 +921,6 @@ func groupDrifted(drift []DriftEntry, groupID string) bool {
 		}
 	}
 	return false
-}
-
-// groupCommand selects the argv a strategy would run for one group:
-// merge/current execute the non-lockfile recreate_live variant for
-// DRIFTED groups (falling back to the frozen recipe — with an honest
-// warning — when the group recorded none); no-drift and baseline run
-// the frozen lockfile-pinned reclaim_command.
-func groupCommand(g removalGroupReader, strategy Strategy, drifted bool, warnings *[]string) []string {
-	switch strategy {
-	case StrategyMerge, StrategyCurrent:
-		if !drifted {
-			return g.ReclaimCommand
-		}
-		if len(g.RecreateLive) > 0 {
-			return g.RecreateLive
-		}
-		*warnings = append(*warnings, fmt.Sprintf(
-			"group %s drifted but records no recreate_live recipe; running the frozen lockfile-pinned command %q — it may refuse under drift (baseline is the deterministic alternative)",
-			g.GroupID, strings.Join(g.ReclaimCommand, " ")))
-		return g.ReclaimCommand
-	default:
-		return g.ReclaimCommand
-	}
 }
 
 // liveVariantInputs returns the recipe-input paths of every group whose
@@ -1629,38 +1734,175 @@ func unionPyprojectTOML(live, frozen []byte) ([]byte, []string, bool) {
 
 // ---- execution --------------------------------------------------------------------
 
-// sealedManifestApprover is the D033 no-re-approval contract: the recipe
-// was displayed and approved at trim time and is sealed in the removal
-// manifest, so the runner's mandatory approval check is satisfied by an
-// approval synthesized from the definition it was handed (an exact match
-// by construction — it pins exactly what is about to run, including the
-// resolved tool identity and live input digests).
-type sealedManifestApprover struct{ now func() time.Time }
-
-func (a sealedManifestApprover) Matches(def actions.Definition, tool actions.ToolIdentity, inputDigests map[string]string) (*actions.Approval, error) {
-	return &actions.Approval{
-		ID:           domain.ID(domain.NewID()),
-		ActionID:     def.ID,
-		ArgvDigest:   actions.ArgvDigest(def.Argv),
-		Tool:         tool,
-		WorkingRoot:  def.WorkingRoot,
-		Outputs:      actions.CanonicalOutputs(def.Outputs),
-		InputDigests: inputDigests,
-		EnvAllow:     actions.CanonicalEnvAllow(def.EnvAllow),
-		Network:      def.Network,
-		ApprovedBy:   "trim-manifest-seal",
-		ApprovedAt:   domain.FormatTime(a.now()),
-	}, nil
+// defrostDefinition converts one frozen definition doc into its
+// actions.Definition and validates it. Validation reuses the actions
+// package's contract (path rules, network vocabulary, env keys,
+// positive timeout, input/output disjointness), so a hostile frozen
+// document fails here — at read time or replay time — never at exec.
+func defrostDefinition(d *actionDefinitionDoc) (actions.Definition, error) {
+	def := actions.Definition{
+		ID:          d.ID,
+		Argv:        append([]string(nil), d.Argv...),
+		WorkingRoot: d.WorkingRoot,
+		Inputs:      append([]string(nil), d.Inputs...),
+		Outputs:     append([]string(nil), d.Outputs...),
+		EnvAllow:    append([]string(nil), d.EnvAllow...),
+		Network:     actions.Network(d.Network),
+		Timeout:     time.Duration(d.TimeoutNS),
+		DependsOn:   append([]string(nil), d.DependsOn...),
+	}
+	if err := def.Validate(); err != nil {
+		return actions.Definition{}, err
+	}
+	return def, nil
 }
 
-// groupDefinition builds one group's actions.Definition. The argv is
-// the manifest-frozen argv EXACTLY (never reconstructed from policy);
-// inputs are the group's recipe inputs, minus inputs recorded missing
-// at trim time that are still absent (reported, never guessed), and
-// minus inputs whose paths fail the STRICT portable gate (F5: a
-// manifest-derived path Ebb cannot safely touch is fenced out of the
-// runner's contract entirely — reported, never guessed).
-func groupDefinition(root string, trimOpID domain.OperationID, g removalGroupReader, drift []DriftEntry, strategy Strategy, warnings *[]string) (actions.Definition, error) {
+// trimPlanIsLegacy reports whether ANY group of the plan lacks the
+// frozen action definition (wave-5 D5): such a plan predates the exact
+// contract, and its historical approval identity is unavailable.
+func trimPlanIsLegacy(groups []removalGroupReader) bool {
+	for _, g := range groups {
+		if g.Definition == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// legacyRecoveryWarning is the mandatory label for every legacy replay
+// (D5): the recipes about to run are freshly approved reconstructions,
+// NEVER the previously-approved actions (whose identity was not
+// recorded by legacy manifests).
+func legacyRecoveryWarning(groups []removalGroupReader) string {
+	ids := make([]string, 0, len(groups))
+	for _, g := range groups {
+		ids = append(ids, g.GroupID)
+	}
+	return "legacy recovery attempt: this trim manifest predates frozen action definitions, so its historical approval identity is unavailable; the recipes below were freshly approved NOW and are not the previously-approved actions (groups: " +
+		strings.Join(ids, ", ") + ")"
+}
+
+// newLegacyTrimManifestError builds the D5 refusal for a normal
+// (non-consented) replay of a legacy plan: the disclosure lists every
+// group's command, root, inputs and outputs and states that the
+// historical approval identity is unavailable.
+func newLegacyTrimManifestError(root string, trimOpID domain.OperationID, groups []removalGroupReader) error {
+	e := &ErrLegacyTrimManifest{Root: root, TrimOp: string(trimOpID)}
+	for _, g := range groups {
+		d := legacyTrimGroupDisclosure{
+			Group: g.GroupID, Root: g.Root,
+			Command: strings.Join(g.ReclaimCommand, " "),
+			Inputs:  recipeInputPaths(g), Outputs: g.Outputs,
+		}
+		e.Groups = append(e.Groups, d)
+	}
+	return e
+}
+
+// recipeInputPaths lists a group's recorded recipe-input paths.
+func recipeInputPaths(g removalGroupReader) []string {
+	out := make([]string, 0, len(g.RecipeInputs))
+	for _, in := range g.RecipeInputs {
+		out = append(out, in.Path)
+	}
+	return out
+}
+
+// replayDefinitions builds the definitions the driver will execute, in
+// plan order. Frozen plans (every group carries a definition) replay
+// the frozen contract: argv, working root, outputs, env allowlist,
+// network and timeout VERBATIM from the manifest; only the input list
+// is reconciled against the CURRENT workspace root (portability: a
+// non-portable frozen path is fenced out, an input recorded missing at
+// trim time that is still absent stays out — both reported, never
+// guessed). The drift strategies keep their D033 semantics: a drifted
+// group under merge/current runs its FROZEN recreate_live variant (a
+// frozen lockfile replay would refuse or wipe over the unioned
+// manifests), which then differs from the approved argv and asks for a
+// fresh approval — the honest D4 contract. Legacy plans synthesize the
+// definitions exactly as this driver did before the frozen contract
+// existed (D5), under the caller's explicit consent gate.
+func (o *LiveRestorer) replayDefinitions(root string, trimOpID string, docs trimDocs, drift []DriftEntry, strategy Strategy, warnings *[]string) (defs []actions.Definition, legacy bool, err error) {
+	legacy = trimPlanIsLegacy(docs.plan.Groups)
+	for _, g := range docs.plan.Groups {
+		if g.Definition == nil {
+			// Legacy synthesis path (D5): kept verbatim from the
+			// pre-wave driver; labeled legacy recovery attempt.
+			def, derr := groupDefinition(root, trimOpID, g, drift, strategy, warnings)
+			if derr != nil {
+				return nil, legacy, derr
+			}
+			defs = append(defs, def)
+			continue
+		}
+		def, derr := defrostDefinition(g.Definition)
+		if derr != nil {
+			return nil, legacy, fmt.Errorf("restore: group %s frozen definition: %w", g.GroupID, derr)
+		}
+		// Inputs: workspace-relative against the CURRENT root, with the
+		// portability/missing reconciliation (reported, never guessed).
+		def.Inputs = reconcileInputs(root, g, warnings)
+		// Argv: the frozen recipe verbatim, except the D033 drift
+		// strategies swap in the frozen recreate_live variant for a
+		// drifted group (with the same honest fallback warning).
+		def.Argv = frozenGroupArgv(g, def.Argv, strategy, groupDrifted(drift, g.GroupID), warnings)
+		defs = append(defs, def)
+	}
+	return defs, legacy, nil
+}
+
+// frozenGroupArgv selects the argv for a group replayed from its frozen
+// definition — the frozen recipe verbatim, or the FROZEN recreate_live
+// variant when the drift strategies need the drift-reconcilable form
+// (same selection rule and warning text as the legacy groupCommand).
+func frozenGroupArgv(g removalGroupReader, frozenArgv []string, strategy Strategy, drifted bool, warnings *[]string) []string {
+	switch strategy {
+	case StrategyMerge, StrategyCurrent:
+		if !drifted {
+			return frozenArgv
+		}
+		if len(g.RecreateLive) > 0 {
+			return append([]string(nil), g.RecreateLive...)
+		}
+		*warnings = append(*warnings, fmt.Sprintf(
+			"group %s drifted but records no recreate_live recipe; running the frozen lockfile-pinned command %q — it may refuse under drift (baseline is the deterministic alternative)",
+			g.GroupID, strings.Join(frozenArgv, " ")))
+		return frozenArgv
+	default:
+		return frozenArgv
+	}
+}
+
+// groupDefinition is the LEGACY synthesis path (D5): one group's
+// actions.Definition built from the weak manifest fields, exactly as
+// the driver did before the frozen contract existed. Its argv, working
+// root, network and env allowlist are DERIVED (not frozen), so a plan
+// replayed through this path always runs behind a fresh explicit
+// approval and a "legacy recovery attempt" label.
+func groupDefinition(root string, trimOpID string, g removalGroupReader, drift []DriftEntry, strategy Strategy, warnings *[]string) (actions.Definition, error) {
+	inputs := reconcileInputs(root, g, warnings)
+	def := actions.Definition{
+		ID:          fmt.Sprintf("restore-%s-%s", trimOpID, g.GroupID),
+		Argv:        append([]string(nil), groupCommand(g, strategy, groupDrifted(drift, g.GroupID), warnings)...),
+		WorkingRoot: ".",
+		Inputs:      inputs,
+		Outputs:     append([]string(nil), g.Outputs...),
+		Network:     actions.NetworkAllowed,
+		EnvAllow:    envAllowForAdapter(g.Adapter),
+		Timeout:     liveRestoreTimeout,
+	}
+	if err := def.Validate(); err != nil {
+		return actions.Definition{}, err
+	}
+	return def, nil
+}
+
+// reconcileInputs resolves one group's frozen input list against the
+// CURRENT workspace root: inputs whose paths fail the STRICT portable
+// gate are fenced out of the runner's contract entirely (F5), and
+// inputs recorded missing at trim time that are still absent stay out
+// (reported, never guessed).
+func reconcileInputs(root string, g removalGroupReader, warnings *[]string) []string {
 	var inputs []string
 	for _, in := range g.RecipeInputs {
 		if perr := validPortableLivePath(in.Path); perr != nil {
@@ -1682,20 +1924,104 @@ func groupDefinition(root string, trimOpID domain.OperationID, g removalGroupRea
 		*warnings = append(*warnings, fmt.Sprintf(
 			"group %s input %s was absent at trim time and is still absent; excluded from the action's input contract", g.GroupID, in.Path))
 	}
-	def := actions.Definition{
-		ID:          fmt.Sprintf("restore-%s-%s", trimOpID, g.GroupID),
-		Argv:        append([]string(nil), groupCommand(g, strategy, groupDrifted(drift, g.GroupID), warnings)...),
-		WorkingRoot: ".",
-		Inputs:      inputs,
-		Outputs:     append([]string(nil), g.Outputs...),
-		Network:     actions.NetworkAllowed,
-		EnvAllow:    envAllowForAdapter(g.Adapter),
-		Timeout:     liveRestoreTimeout,
+	return inputs
+}
+
+// refuseWorkingRootEscapes is the wave-5 D7 replay gate: every
+// definition's working root must resolve — junction/symlink-aware, via
+// pathcanon — inside the CURRENT workspace root. A frozen relative
+// working root whose target has been replaced by a junction pointing
+// outside the workspace would otherwise execute the approved recipe
+// beyond the sealed boundary.
+func refuseWorkingRootEscapes(root string, defs []actions.Definition) error {
+	wsCanonical := pathcanon.CanonicalPath(root)
+	for _, def := range defs {
+		if def.WorkingRoot == "" || def.WorkingRoot == "." {
+			continue
+		}
+		resolved := pathcanon.CanonicalPath(filepath.Join(root, filepath.FromSlash(def.WorkingRoot)))
+		if !pathcanon.UnderPath(wsCanonical, resolved) {
+			return &ErrWorkingRootEscape{
+				Group: def.ID, WorkingRoot: def.WorkingRoot,
+				Resolved: resolved, Root: wsCanonical,
+			}
+		}
 	}
-	if err := def.Validate(); err != nil {
-		return actions.Definition{}, err
+	return nil
+}
+
+// approvalPrepass resolves the CURRENT tool identity and input digests
+// for every definition and classifies each against the recorded local
+// approval (the same discipline open's rebuild pre-pass applies). An
+// unresolvable tool refuses the whole restore (F14): nothing runs when
+// a pinned toolchain is unavailable. legacy marks plan-wide actions
+// synthesized from a manifest without frozen definitions (D5): their
+// pendings carry the Legacy marker so resolvers present the legacy
+// disclosure and refuse headless consent.
+func (o *LiveRestorer) approvalPrepass(root string, defs []actions.Definition, legacy bool) ([]PendingApproval, error) {
+	var pending []PendingApproval
+	for _, def := range defs {
+		tool, terr := actions.ResolveTool(def.Argv[0])
+		if terr != nil {
+			return nil, &ErrToolUnavailable{ActionID: def.ID, Argv0: def.Argv[0], Err: terr}
+		}
+		digests := make(map[string]string, len(def.Inputs))
+		for _, rel := range def.Inputs {
+			d, derr := actions.DigestFile(filepath.Join(root, filepath.FromSlash(rel)))
+			if derr != nil {
+				return nil, fmt.Errorf("restore: action %s declared input %s is not available for approval: %w", def.ID, rel, derr)
+			}
+			digests[rel] = d
+		}
+		if _, merr := o.approver.Matches(def, tool, digests); merr != nil {
+			if isApprovalError(merr) {
+				pending = append(pending, PendingApproval{Def: def, Tool: tool, InputDigests: digests, Cause: merr, Legacy: legacy})
+				continue
+			}
+			return nil, fmt.Errorf("restore: reading the approval store: %w", merr)
+		}
 	}
-	return def, nil
+	return pending, nil
+}
+
+// approvalRequiredError builds the D4 blocked error for pendings that
+// cannot be asked (non-interactive mode).
+func approvalRequiredError(root string, pending []PendingApproval) error {
+	e := &ErrRestoreApprovalRequired{Root: root}
+	for _, p := range pending {
+		e.Actions = append(e.Actions, p.Def.ID)
+		e.Causes = append(e.Causes, p.Cause.Error())
+	}
+	return e
+}
+
+// groupCommand selects the argv a strategy would run for one group:
+// merge/current execute the non-lockfile recreate_live variant for
+// DRIFTED groups (falling back to the frozen recipe — with an honest
+// warning — when the group recorded none); no-drift and baseline run
+// the frozen lockfile-pinned reclaim_command. For a group replayed
+// from its frozen definition, the frozen definition's argv IS the
+// frozen recipe (both were frozen from the same source at trim time).
+func groupCommand(g removalGroupReader, strategy Strategy, drifted bool, warnings *[]string) []string {
+	base := g.ReclaimCommand
+	if g.Definition != nil {
+		base = g.Definition.Argv
+	}
+	switch strategy {
+	case StrategyMerge, StrategyCurrent:
+		if !drifted {
+			return base
+		}
+		if len(g.RecreateLive) > 0 {
+			return g.RecreateLive
+		}
+		*warnings = append(*warnings, fmt.Sprintf(
+			"group %s drifted but records no recreate_live recipe; running the frozen lockfile-pinned command %q — it may refuse under drift (baseline is the deterministic alternative)",
+			g.GroupID, strings.Join(base, " ")))
+		return base
+	default:
+		return base
+	}
 }
 
 // envAllowForAdapter derives the env allowlist from the frozen adapter
@@ -1975,3 +2301,137 @@ func liveRestoreIntentDigest(trimOpID string, strategy Strategy, root string) st
 	h.Write([]byte(root))
 	return hex.EncodeToString(h.Sum(nil))
 }
+
+// ---- wave-5 custody typed errors -----------------------------------------------
+//
+// The new preflight gates (D4/D5/D6/D7) are blocks: nothing ran and no
+// restore operation was opened. They live here (not errors.go) so the
+// gate and its refusal stay one readable unit; each carries a stable
+// EBB_E_ code and its own Safe-action guidance.
+
+// Stable blocker codes for the wave-5 custody gates.
+const (
+	CodeOutputsPresent   = "EBB_E_OUTPUTS_PRESENT"
+	CodeLegacyManifest   = "EBB_E_LEGACY_TRIM_MANIFEST"
+	CodeWorkingRootEsc   = "EBB_E_WORKING_ROOT_ESCAPE"
+	CodeApprovalRequired = "EBB_E_RESTORE_APPROVAL_REQUIRED"
+	CodeToolUnavailable  = "EBB_E_TOOL_UNAVAILABLE"
+)
+
+// ErrOutputsPresent is the wave-5 D6 custody preflight: at least one
+// group of the selected trim still has a present-and-non-empty output
+// root in the live workspace, so the ENTIRE restore is refused before
+// any recipe runs (running an install recipe over live output data is
+// the E14 hazard). Present/Missing carry the per-group listing.
+type ErrOutputsPresent struct {
+	Root    string
+	TrimOp  string
+	Present []string
+	Missing []string
+}
+
+func (e *ErrOutputsPresent) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "restore: %s still carries live output content of trim %s; refusing the ENTIRE restore because a recipe must never run over live data. Groups present/live: %s. Groups missing: %s. Safe action: verify the listed content is genuinely regenerable, remove the output directories yourself (e.g. node_modules), then rerun `ebb restore`",
+		e.Root, e.TrimOp,
+		strings.Join(e.Present, "; "), strings.Join(e.Missing, "; "))
+	return b.String()
+}
+
+func (e *ErrOutputsPresent) Code() string { return CodeOutputsPresent }
+
+// ErrLegacyTrimManifest is the wave-5 D5 refusal: the selected trim
+// manifest predates frozen action definitions, so normal replay is
+// refused — the exact command that ran at trim time is not on record
+// and the historical approval identity is unavailable. Groups carry the
+// per-group disclosure (command, root, inputs, outputs).
+type ErrLegacyTrimManifest struct {
+	Root   string
+	TrimOp string
+	Groups []legacyTrimGroupDisclosure
+}
+
+type legacyTrimGroupDisclosure struct {
+	Group   string
+	Command string
+	Root    string
+	Inputs  []string
+	Outputs []string
+}
+
+func (e *ErrLegacyTrimManifest) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "restore: trim %s has no frozen action definitions, so normal replay is refused: the exact previously-approved action is not on record and its historical approval identity is unavailable. Recorded recipe data:\n", e.TrimOp)
+	for _, g := range e.Groups {
+		fmt.Fprintf(&b, "  group %s\n    command: %s\n    root: %s\n    inputs: %s\n    outputs: %s\n",
+			g.Group, g.Command, g.Root, strings.Join(g.Inputs, ", "), strings.Join(g.Outputs, ", "))
+	}
+	fmt.Fprintf(&b, "Safe action: rerun in a terminal to review the recorded recipes and give a fresh explicit approval, or rerun with --legacy-approve to record it headless (a legacy replay is labeled a 'legacy recovery attempt' and is never claimed to be the previously-approved action)")
+	return b.String()
+}
+
+func (e *ErrLegacyTrimManifest) Code() string { return CodeLegacyManifest }
+
+// ErrWorkingRootEscape is the wave-5 D7 gate: a replayed (or trim-time)
+// working root resolves — junction/symlink-aware — outside the
+// workspace root, so the approved recipe would execute beyond the
+// sealed boundary. Refused before any effect.
+type ErrWorkingRootEscape struct {
+	Group       string
+	WorkingRoot string
+	Resolved    string
+	Root        string
+}
+
+func (e *ErrWorkingRootEscape) Error() string {
+	return fmt.Sprintf("restore: action %s declares working root %q, which resolves to %s — OUTSIDE the workspace root %s (junction/symlink escape); a frozen recipe must never execute beyond the sealed boundary. Safe action: inspect the junction/symlink at the working-root path, remove or repair it, then rerun `ebb restore`",
+		e.Group, e.WorkingRoot, e.Resolved, e.Root)
+}
+
+func (e *ErrWorkingRootEscape) Code() string { return CodeWorkingRootEsc }
+
+// ErrRestoreApprovalRequired is the wave-5 D4 blocked error: a recipe's
+// recorded approval is missing, stale or drifted and no approval
+// resolver is available (non-interactive mode), so nothing ran.
+type ErrRestoreApprovalRequired struct {
+	Root    string
+	Actions []string
+	Causes  []string
+	// Detail carries a pre-pass refusal that is not per-action (e.g. no
+	// approval store wired).
+	Detail string
+}
+
+func (e *ErrRestoreApprovalRequired) Error() string {
+	var b strings.Builder
+	if e.Detail != "" {
+		fmt.Fprintf(&b, "restore: %s: %s", e.Root, e.Detail)
+	} else {
+		fmt.Fprintf(&b, "restore: %s: %d recorded approval(s) are missing, stale or drifted and stdin is not a terminal, so the required re-approval cannot be asked; nothing ran", e.Root, len(e.Actions))
+		for i, a := range e.Actions {
+			fmt.Fprintf(&b, "\n  action %s: %s", a, e.Causes[i])
+		}
+	}
+	fmt.Fprintf(&b, ". Safe action: rerun `ebb restore` in a terminal to review the drift and re-approve after comparing the recorded and current actions")
+	return b.String()
+}
+
+func (e *ErrRestoreApprovalRequired) Code() string { return CodeApprovalRequired }
+
+// ErrToolUnavailable is the F14 pre-pass refusal on the live-restore
+// path: a pinned recipe's tool cannot be resolved on this host, so
+// nothing runs.
+type ErrToolUnavailable struct {
+	ActionID string
+	Argv0    string
+	Err      error
+}
+
+func (e *ErrToolUnavailable) Error() string {
+	return fmt.Sprintf("restore: action %s requires tool %q, which is not resolvable on this host (F14): %v; nothing ran. Safe action: install the pinned toolchain (or adjust the recorded recipe's program) and rerun `ebb restore`",
+		e.ActionID, e.Argv0, e.Err)
+}
+
+func (e *ErrToolUnavailable) Unwrap() error { return e.Err }
+
+func (e *ErrToolUnavailable) Code() string { return CodeToolUnavailable }

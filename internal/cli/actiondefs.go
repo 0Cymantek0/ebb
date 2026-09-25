@@ -53,13 +53,16 @@ func deriveActionDefs(pol policy.Policy) ([]actions.Definition, error) {
 // deriveGroupDef derives one group's definition; ok is false for groups
 // that stay hint-only.
 func deriveGroupDef(g policy.Regenerate) (def actions.Definition, ok bool, err error) {
+	// The group's DECLARED logical root is the working directory for
+	// every runnable form ("" normalizes to "." — the Parse-level
+	// default, re-applied here for hand-built policies).
+	root := g.Root
+	if root == "" {
+		root = "."
+	}
 	if len(g.Command) > 0 {
 		// Custom command: literal argv (shell argv[0]s already carry the
 		// standard shell-warning treatment inside the actions package).
-		root := g.Root
-		if root == "" {
-			root = "."
-		}
 		def = actions.Definition{
 			ID:          g.ID,
 			Argv:        append([]string(nil), g.Command...),
@@ -76,12 +79,17 @@ func deriveGroupDef(g policy.Regenerate) (def actions.Definition, ok bool, err e
 	case policy.AdapterPNPM, policy.AdapterNPM, policy.AdapterUV:
 		// Pinned ecosystem recipe; wsRoot "" skips the input-existence
 		// pre-check (the capture's own scan is the authority here, and
-		// the runner re-digests inputs immediately before execution).
+		// the runner re-digests inputs immediately before execution). The
+		// group's DECLARED logical root rides along as the working root
+		// (wave-5 E04: built-in recipes carry it exactly like custom
+		// commands, so the frozen definition names one execution
+		// directory for both trim and restore).
 		def, err = ecosystem.Recipe(ecosystem.GroupSuggestion{
-			GroupID: g.ID,
-			Adapter: string(g.Adapter),
-			Outputs: append([]string(nil), g.Outputs...),
-			Inputs:  append([]string(nil), g.Inputs...),
+			GroupID:     g.ID,
+			Adapter:     string(g.Adapter),
+			Outputs:     append([]string(nil), g.Outputs...),
+			Inputs:      append([]string(nil), g.Inputs...),
+			WorkingRoot: root,
 		}, "")
 		if err != nil {
 			return actions.Definition{}, false, err

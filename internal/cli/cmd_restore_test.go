@@ -237,6 +237,13 @@ func TestRestoreMergeStrategyUnionsAndBacksUp(t *testing.T) {
 	if err := os.WriteFile(pkg, live, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Wave-5 (D4): the drifted input makes the trim-time approval stale,
+	// and merge runs the recreate_live argv — a DIFFERENT command than
+	// the approved one. The replay therefore asks for a fresh approval
+	// interactively (headless refuses; the approvalstore contract) and
+	// the queued "yes" records it before the recipe runs.
+	h.tty = true
+	h.lines = []string{"yes"}
 	code, _, stderr := h.run("restore", "--strategy", "merge", h.wsRoot)
 	if code != ExitOK {
 		t.Fatalf("merge code = %d, stderr = %s", code, stderr)
@@ -355,7 +362,10 @@ func TestRestoreInteractiveStrategyMenu(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.tty = true
-	h.lines = []string{"3"} // revert to baseline
+	// Wave-5 (D4): after the baseline strategy choice, the drifted input
+	// digests make the trim-time approval stale — the approval prompt
+	// follows the strategy menu and the queued "yes" re-approves.
+	h.lines = []string{"3", "yes"} // revert to baseline, then re-approve
 	code, _, stderr := h.run("restore", h.wsRoot)
 	if code != ExitOK {
 		t.Fatalf("baseline menu choice code = %d, stderr = %s", code, stderr)
@@ -495,5 +505,177 @@ func TestRestoreHeadlessRefusalUnwedgesDeadRowForLaterTrim(t *testing.T) {
 	// The workspace is un-wedged: a later trim proceeds.
 	if code, _, stderr := h.run("trim", "--groups", "deps", "--yes", h.wsRoot); code != ExitOK {
 		t.Fatalf("trim after the un-wedging rerun must proceed: code=%d stderr=%s", code, stderr)
+	}
+}
+
+// ---- wave-5 D3/D5 CLI-surface regressions ---------------------------------
+
+// TestReclaimTrimRecordsRestoreApproval (wave-5 D3): a trim performed
+// through reclaim's trim stage records the REAL approval behind its
+// consent — the same approvalstore `ebb restore` verifies — so a later
+// restore replays the exact recipe silently, headless, with no
+// re-approval (the D033 no-re-prompt property survives reclaim).
+func TestReclaimTrimRecordsRestoreApproval(t *testing.T) {
+	h := newEHarness(t)
+	if code, _, stderr := h.run("reclaim", "--target", "1", "--yes", h.wsRoot); code != ExitOK {
+		t.Fatalf("reclaim code = %d, stderr = %s", code, stderr)
+	}
+	// Direct evidence: the state dir's approval store pins the deps
+	// action, recorded by the --yes flag.
+	raw, err := os.ReadFile(filepath.Join(h.stateDir, approvalsFile))
+	if err != nil {
+		t.Fatalf("approval store document: %v", err)
+	}
+	var doc struct {
+		Approvals []struct {
+			ActionID   string `json:"action_id"`
+			ApprovedBy string `json:"approved_by"`
+		} `json:"approvals"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("approval store parse: %v", err)
+	}
+	found := false
+	for _, a := range doc.Approvals {
+		if a.ActionID != "deps" {
+			continue
+		}
+		found = true
+		if a.ApprovedBy != "flag:--yes" {
+			t.Errorf("approved_by = %q, want flag:--yes", a.ApprovedBy)
+		}
+	}
+	if !found {
+		t.Fatalf("reclaim's trim recorded NO approval for deps: %s", raw)
+	}
+
+	// Restore replays silently: headless (no tty), no flags — an exact
+	// match must never reach the approval resolver.
+	r := &gRunner{}
+	h.deps.NewActionRunner = func() restore.ActionRunner { return r }
+	code, stdout, stderr := h.run("restore", "--json", h.wsRoot)
+	if code != ExitOK {
+		t.Fatalf("restore after reclaim code = %d, stderr = %s", code, stderr)
+	}
+	env := envelopeOf(t, stdout)
+	if got := envString(t, env, "outcome"); got != "ok" {
+		t.Fatalf("outcome = %q (stderr %s)", got, stderr)
+	}
+	if r.count() != 1 {
+		t.Fatalf("runner calls = %d, want 1", r.count())
+	}
+}
+
+// legacyPending builds one legacy-marked pending approval (the shape the
+// driver's pre-pass emits for an action synthesized from a trim manifest
+// without frozen definitions).
+func legacyPending() restore.PendingApproval {
+	return restore.PendingApproval{
+		Def: actions.Definition{
+			ID:          "deps",
+			Argv:        []string{"pnpm", "install", "--frozen-lockfile"},
+			WorkingRoot: ".",
+			Inputs:      []string{"package.json", "pnpm-lock.yaml"},
+			Outputs:     []string{"node_modules"},
+		},
+		Cause:  &actions.ErrApprovalRequired{ActionID: "deps"},
+		Legacy: true,
+	}
+}
+
+// TestRestoreLegacyHeadlessRefusalNamesLegacyApprove (wave-5 D5): a
+// non-terminal asked to approve a legacy-manifest action refuses with
+// the EBB_E_LEGACY_TRIM_MANIFEST disclosure (command, root, inputs,
+// outputs; historical approval identity unavailable) and names the
+// --legacy-approve flag — NOT open's --yes, which restore does not have.
+func TestRestoreLegacyHeadlessRefusalNamesLegacyApprove(t *testing.T) {
+	baseCalled := false
+	base := func(ctx context.Context, pending []restore.PendingApproval) error {
+		baseCalled = true
+		return nil
+	}
+	deps := Deps{StdinIsTerminal: func() bool { return false }}
+	resolver := restoreLegacyApprovalResolver(deps, Streams{Err: &strings.Builder{}}, false, base)
+
+	err := resolver(context.Background(), []restore.PendingApproval{legacyPending()})
+	if err == nil {
+		t.Fatal("headless legacy consent must refuse (D5)")
+	}
+	if baseCalled {
+		t.Fatal("the grouped resolver must not run for a refused legacy consent")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		restore.CodeLegacyManifest,
+		"--legacy-approve",
+		"historical approval identity is unavailable",
+		"pnpm install --frozen-lockfile",
+		"package.json", "pnpm-lock.yaml",
+		"node_modules",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("headless refusal lacks %q:\n%s", want, msg)
+		}
+	}
+	if code := classifyExitCode(err); code != ExitBlocked {
+		t.Errorf("exit code = %d, want blocked (3)", code)
+	}
+}
+
+// TestRestoreLegacyResolverDisclosesBeforeConfirm (wave-5 D5): on a
+// terminal the legacy disclosure prints BEFORE the grouped confirm, and
+// non-legacy pendings bypass the banner entirely; --legacy-approve
+// headless prints the banner and resolves without a refusal.
+func TestRestoreLegacyResolverDisclosesBeforeConfirm(t *testing.T) {
+	newBase := func(called *bool) restore.ApprovalResolver {
+		return func(ctx context.Context, pending []restore.PendingApproval) error {
+			*called = true
+			return nil
+		}
+	}
+
+	// (a) Interactive: banner, then the grouped resolver.
+	called := false
+	errb := &strings.Builder{}
+	deps := Deps{StdinIsTerminal: func() bool { return true }}
+	resolver := restoreLegacyApprovalResolver(deps, Streams{Err: errb}, false, newBase(&called))
+	if err := resolver(context.Background(), []restore.PendingApproval{legacyPending()}); err != nil {
+		t.Fatalf("interactive legacy consent must reach the confirm: %v", err)
+	}
+	if !called {
+		t.Fatal("the grouped resolver must run after the disclosure")
+	}
+	if msg := errb.String(); !strings.Contains(msg, "legacy recovery attempt") ||
+		!strings.Contains(msg, "freshly approved NOW") ||
+		!strings.Contains(msg, "not the previously-approved actions") ||
+		!strings.Contains(msg, "pnpm install --frozen-lockfile") {
+		t.Errorf("disclosure banner incomplete:\n%s", msg)
+	}
+
+	// (b) Exact-shape pendings without the legacy marker bypass the
+	// banner entirely (open's resolver handles them untouched).
+	called2, errb2 := false, &strings.Builder{}
+	resolver2 := restoreLegacyApprovalResolver(deps, Streams{Err: errb2}, false, newBase(&called2))
+	fresh := legacyPending()
+	fresh.Legacy = false
+	if err := resolver2(context.Background(), []restore.PendingApproval{fresh}); err != nil {
+		t.Fatalf("non-legacy pending: %v", err)
+	}
+	if !called2 || errb2.String() != "" {
+		t.Errorf("non-legacy pendings must bypass the legacy banner (called=%v stderr=%q)", called2, errb2.String())
+	}
+
+	// (c) --legacy-approve headless: consent recorded, banner printed.
+	called3, errb3 := false, &strings.Builder{}
+	depsHeadless := Deps{StdinIsTerminal: func() bool { return false }}
+	resolver3 := restoreLegacyApprovalResolver(depsHeadless, Streams{Err: errb3}, true, newBase(&called3))
+	if err := resolver3(context.Background(), []restore.PendingApproval{legacyPending()}); err != nil {
+		t.Fatalf("consented headless legacy replay must resolve: %v", err)
+	}
+	if !called3 {
+		t.Fatal("the grouped resolver must record the consented legacy approval")
+	}
+	if msg := errb3.String(); !strings.Contains(msg, "legacy recovery attempt") {
+		t.Errorf("consented headless legacy replay must print the honest label:\n%s", msg)
 	}
 }
